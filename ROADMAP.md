@@ -45,13 +45,13 @@ Acceptance met: `tests/broker.rs` covers socketpair and real-binary transports, 
 
 ## M5 — v0.1.0
 
-- [ ] API review pass against RFC 0001; deviations folded back into the RFC
-- [ ] Docs: every public item documented, README examples compile as doctests
+- [x] API review pass against RFC 0001; deviations folded back into the RFC ([PR #1](https://github.com/farming-labs/fsgate/pull/1), `168ae27`)
+- [x] Docs: every public item documented, README examples compile as doctests ([PR #1](https://github.com/farming-labs/fsgate/pull/1), `168ae27`)
 - [ ] Release v0.1.0 (signed tag). Publishing to crates.io is a separate, explicit maintainer decision.
 
-Preparation: the local branch folds `LockStatus`, `create` rights, audit delivery, broker client types, and containment limits into RFC 0001. It requires public documentation, compiles the README as a doctest, and adds a CI check that tests the unpacked crate. Audit regression coverage checks the actual matched grant ID for duplicate and nested grants, revocation, and broker requests. These items remain unchecked until merged; no signed release tag exists yet.
+Preparation merged in PR #1: `LockStatus`, `create` rights, audit delivery, broker client types, and containment limits are folded into RFC 0001. Public documentation is required, the README compiles as a doctest, and CI tests the unpacked crate. Audit regression coverage checks the actual matched grant ID for duplicate and nested grants, revocation, and broker requests. The signed release remains pending; follow [the release procedure](docs/RELEASING.md).
 
-Local verification on macOS (Rust 1.99.1): `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, and `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps` passed. `cargo test --locked` passed 32 runtime tests and two compile-only doctests. `cargo package --locked` succeeded; the same 34 tests passed against the archive extracted outside the repository. `cargo deny check` passed with warnings for duplicate dependencies and unused license allowances. The duplicate-grant audit tests and packaged README doctest failed before their fixes. Rust 1.85.0 also passed all 34 tests in both the checkout and the unpacked crate. CI now runs the suite on Linux with stable Rust and Rust 1.85.0; Linux enforcement remains pending CI verification.
+Verification for PR #1: macOS formatting, clippy, rustdoc, and cargo-deny checks passed. The 32 runtime tests and two compile-only doctests passed from both the checkout and the unpacked crate on Rust 1.99.1 and 1.85.0. The duplicate-grant audit tests and packaged README doctest failed before their fixes. [Linux CI](https://github.com/farming-labs/fsgate/actions/runs/42288527953) passed `check`, `msrv`, and `deny` on head `c5d2f7c`: the kernel bypass-denial test passed on stable Rust and Rust 1.85.0, and the stable job tested the unpacked crate. The automated reviewer was skipped; this is not an independent security review.
 
 ## Out of scope for v1
 
