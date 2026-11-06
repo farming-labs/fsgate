@@ -10,6 +10,7 @@ repository = "https://github.com/farming-labs/fsgate"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+missing_docs = "deny"
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"

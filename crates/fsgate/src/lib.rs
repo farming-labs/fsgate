@@ -455,25 +455,35 @@ impl Gate {
         needed: Rights,
         run: impl FnOnce(&GrantEntry, &Path) -> io::Result<T>,
     ) -> Result<T, GateError> {
-        let (index, entry, rel, full) = match self.resolve(path, needed, op) {
+        let (index, entry, rel, full) = match self.resolve(path) {
             Ok(resolved) => resolved,
             Err(err) => {
-                let (reason, grant) = match &err {
-                    GateError::NotAbsolute { .. } => (AuditReason::NotAbsolute, None),
-                    GateError::NoGrant { .. } => (AuditReason::NoGrant, None),
-                    GateError::RightsExceeded { grant_path, .. } => (
-                        AuditReason::RightsExceeded,
-                        self.grants.iter().position(|slot| {
-                            slot.as_ref().is_some_and(|entry| &entry.path == grant_path)
-                        }),
-                    ),
+                let reason = match &err {
+                    GateError::NotAbsolute { .. } => AuditReason::NotAbsolute,
+                    GateError::NoGrant { .. } => AuditReason::NoGrant,
                     // resolve() returns no other variants.
-                    _ => (AuditReason::Ok, None),
+                    _ => AuditReason::Ok,
                 };
-                self.emit(op, Some(path), grant, AuditDecision::Deny, reason, None);
+                self.emit(op, Some(path), None, AuditDecision::Deny, reason, None);
                 return Err(err);
             }
         };
+        if !entry.rights.contains(needed) {
+            self.emit(
+                op,
+                Some(&full),
+                Some(index),
+                AuditDecision::Deny,
+                AuditReason::RightsExceeded,
+                None,
+            );
+            return Err(GateError::RightsExceeded {
+                path: full,
+                grant_path: entry.path.clone(),
+                missing: needed.missing_from(entry.rights),
+                op: op.as_str().to_string(),
+            });
+        }
         match run(entry, &rel) {
             Ok(value) => {
                 self.emit(
@@ -500,17 +510,12 @@ impl Gate {
         }
     }
 
-    /// Routes a path to the longest covering grant and checks rights.
+    /// Routes a path to the longest covering grant.
     ///
     /// This match is routing, not the security boundary: the subsequent
     /// cap-std call opens beneath the grant's held descriptor, and the
     /// kernel rejects anything (symlinks, races) that would leave it.
-    fn resolve(
-        &self,
-        path: &Path,
-        needed: Rights,
-        op: AuditOp,
-    ) -> Result<(usize, &GrantEntry, PathBuf, PathBuf), GateError> {
+    fn resolve(&self, path: &Path) -> Result<(usize, &GrantEntry, PathBuf, PathBuf), GateError> {
         let full = normalize(path)?;
         let (index, entry) = self
             .grants
@@ -520,14 +525,6 @@ impl Gate {
             .filter(|(_, entry)| full.starts_with(&entry.path))
             .max_by_key(|(_, entry)| entry.path.components().count())
             .ok_or_else(|| GateError::NoGrant { path: full.clone() })?;
-        if !entry.rights.contains(needed) {
-            return Err(GateError::RightsExceeded {
-                path: full,
-                grant_path: entry.path.clone(),
-                missing: needed.missing_from(entry.rights),
-                op: op.as_str().to_string(),
-            });
-        }
         let rel = full
             .strip_prefix(&entry.path)
             .expect("grant path was verified as a prefix above");
@@ -588,4 +585,11 @@ fn normalize(path: &Path) -> Result<PathBuf, GateError> {
         }
     }
     Ok(out)
+}
+
+/// The README's example must keep compiling; this pulls it into the
+/// doctest suite without shipping it in the crate docs.
+#[cfg(doctest)]
+mod readme_doctest {
+    #![doc = include_str!("../README.md")]
 }

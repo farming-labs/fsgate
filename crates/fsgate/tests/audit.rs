@@ -5,7 +5,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use fsgate::{AuditDecision, AuditEvent, AuditOp, AuditReason, AuditSink, Gate, Rights};
+use fsgate::{AuditDecision, AuditEvent, AuditOp, AuditReason, AuditSink, Gate, GateError, Rights};
 use tempfile::TempDir;
 
 #[derive(Default)]
@@ -76,15 +76,70 @@ fn swallowed_denial_is_still_observed() {
 #[test]
 fn rights_exceeded_names_the_matched_grant() {
     let (_root, granted, _) = setup();
-    let (gate, sink) = audited_gate(&granted, Rights::READ);
+    let (mut gate, sink) = audited_gate(&granted, Rights::READ | Rights::WRITE | Rights::CREATE);
+    gate.grant(&granted, Rights::READ).unwrap();
 
-    let _ = gate.create(granted.join("new.txt"));
+    for name in ["new.txt", "a.txt"] {
+        let path = granted.join(name);
+        let err = gate.create(granted.join("sub/..").join(name)).unwrap_err();
+        assert!(matches!(err, GateError::RightsExceeded { .. }), "{err:?}");
 
+        let last = sink.events().pop().unwrap();
+        assert_eq!(last.op, AuditOp::Create);
+        assert_eq!(last.decision, AuditDecision::Deny);
+        assert_eq!(last.reason, AuditReason::RightsExceeded);
+        assert_eq!(last.grant, Some(1));
+        assert_eq!(last.path.as_deref(), Some(path.as_path()));
+        assert_eq!(last.errno, None);
+    }
+    assert_eq!(sink.events().len(), 4);
+    assert!(!granted.join("new.txt").exists());
+    assert_eq!(fs::read(granted.join("a.txt")).unwrap(), b"inside");
+}
+
+#[test]
+fn rights_denials_follow_routing_and_revocation_for_every_operation() {
+    let (_root, granted, _) = setup();
+    let (mut gate, sink) = audited_gate(
+        &granted,
+        Rights::READ | Rights::WRITE | Rights::CREATE | Rights::LIST,
+    );
+    let sub = granted.join("sub");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("a.txt"), b"inside").unwrap();
+    let restricted = gate.grant(&sub, Rights::from_bits_truncate(0)).unwrap();
+    let path = sub.join("a.txt");
+
+    let results = [
+        gate.open(&path).map(|_| ()),
+        gate.create(&path).map(|_| ()),
+        gate.metadata(&path).map(|_| ()),
+        gate.read_dir(&sub).map(|_| ()),
+    ];
+    for result in results {
+        assert!(matches!(result, Err(GateError::RightsExceeded { .. })));
+    }
+    let events = sink.events();
+    assert_eq!(events.len(), 6);
+    for (event, op) in events[2..].iter().zip([
+        AuditOp::Open,
+        AuditOp::Create,
+        AuditOp::Metadata,
+        AuditOp::ReadDir,
+    ]) {
+        assert_eq!(event.op, op);
+        assert_eq!(event.decision, AuditDecision::Deny);
+        assert_eq!(event.reason, AuditReason::RightsExceeded);
+        assert_eq!(event.grant, Some(1));
+        assert_eq!(event.errno, None);
+    }
+    assert_eq!(fs::read(&path).unwrap(), b"inside");
+
+    gate.revoke(restricted).unwrap();
+    gate.open(&path).unwrap();
     let last = sink.events().pop().unwrap();
-    assert_eq!(last.op, AuditOp::Create);
-    assert_eq!(last.decision, AuditDecision::Deny);
-    assert_eq!(last.reason, AuditReason::RightsExceeded);
     assert_eq!(last.grant, Some(0));
+    assert_eq!(last.decision, AuditDecision::Allow);
 }
 
 #[test]
@@ -158,7 +213,8 @@ fn broker_decisions_are_audited_server_side() {
     use fsgate::{Broker, BrokerGate};
 
     let (_root, granted, outside) = setup();
-    let (gate, sink) = audited_gate(&granted, Rights::READ);
+    let (mut gate, sink) = audited_gate(&granted, Rights::READ | Rights::WRITE | Rights::CREATE);
+    gate.grant(&granted, Rights::READ).unwrap();
 
     let (client, server) = UnixStream::pair().unwrap();
     let handle = std::thread::spawn(move || {
@@ -169,6 +225,8 @@ fn broker_decisions_are_audited_server_side() {
 
     client.open(granted.join("a.txt")).unwrap();
     let _ = client.open(outside.join("secret.txt"));
+    let err = client.create(granted.join("new.txt")).unwrap_err();
+    assert!(matches!(err, GateError::RightsExceeded { .. }));
     drop(client);
     handle.join().unwrap();
 
@@ -185,4 +243,11 @@ fn broker_decisions_are_audited_server_side() {
             (AuditDecision::Deny, AuditReason::NoGrant),
         ]
     );
+    let last = sink.events().pop().unwrap();
+    assert_eq!(last.op, AuditOp::Create);
+    assert_eq!(last.decision, AuditDecision::Deny);
+    assert_eq!(last.reason, AuditReason::RightsExceeded);
+    assert_eq!(last.grant, Some(1));
+    assert_eq!(sink.events().len(), 5);
+    assert!(!granted.join("new.txt").exists());
 }
