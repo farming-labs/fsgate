@@ -4,10 +4,10 @@ This file owns task status. A box is checked only when the acceptance criteria a
 
 ## M0 — foundation
 
-- [x] Scaffold workspace, roadmap, and core design RFC (this commit)
-- [ ] Pin dependency decisions: `cap-std` version, Landlock crate (`landlock`), seccomp crate (`seccompiler` vs raw `libseccomp`), MSRV
-- [ ] Add `cargo-deny` config and wire it into CI
-- [ ] Decide and document the audit event format (RFC 0002)
+- [x] Scaffold workspace, roadmap, and core design RFC (dec192b)
+- [x] Pin dependency decisions: `cap-std` version, Landlock crate (`landlock`), seccomp crate (`seccompiler` vs raw `libseccomp`), MSRV ([ADR 0001](docs/decisions/0001-dependency-pins.md))
+- [x] Add `cargo-deny` config and wire it into CI
+- [x] Decide and document the audit event format ([RFC 0002](docs/rfcs/0002-audit-events.md))
 
 Acceptance: decisions recorded as RFCs or ADRs with the rejected alternatives named; CI runs fmt, clippy `-D warnings`, test `--locked`, and deny on every PR.
 
