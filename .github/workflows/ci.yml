@@ -27,6 +27,7 @@ jobs:
           package_dir=$(mktemp -d)
           trap 'rm -rf "$package_dir"' EXIT
           tar -xzf target/package/fsgate-*.crate -C "$package_dir"
+          test -f "$package_dir"/fsgate-*/LICENSE
           cargo test --locked --manifest-path "$package_dir"/fsgate-*/Cargo.toml
 
   msrv:
