@@ -13,10 +13,12 @@ Acceptance: decisions recorded as RFCs or ADRs with the rejected alternatives na
 
 ## M1 — handle layer and resolver (Linux first)
 
-- [ ] `Gate::new`, `grant(path, Rights) -> Grant`, `Rights` (READ, WRITE, CREATE, LIST)
-- [ ] Resolver: longest-grant match, then open beneath the handle via `openat2` + `RESOLVE_BENEATH`
-- [ ] `open`, `read`, `write`, `metadata`, `read_dir` through the gate
-- [ ] Fail-closed errors: `NoGrant`, `RightsExceeded`, each naming the path and the missing right
+- [x] `Gate::new`, `grant(path, Rights) -> Grant`, `Rights` (READ, WRITE, CREATE, LIST)
+- [x] Resolver: longest-grant match, then open beneath the handle via `openat2` + `RESOLVE_BENEATH` (cap-std; component walk on macOS)
+- [x] `open`, `create`, `metadata`, `read_dir` through the gate (`read`/`write` happen on the returned `File`)
+- [x] Fail-closed errors: `NoGrant`, `RightsExceeded`, each naming the path and the missing right
+
+M1 note: `revoke` landed here with its tests (it fell out of the grant table design); M4 keeps the audit half.
 
 Acceptance: tests cover allowed operations, denied operations, symlink escape attempts, `..` traversal, and absolute-path symlink targets — and the denial tests assert the side effect did not happen. No name/string-prefix check anywhere in the enforcement path.
 
