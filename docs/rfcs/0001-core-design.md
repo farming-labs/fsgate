@@ -49,7 +49,7 @@ Step 2 is routing, not security. If it routes to the wrong grant, the worst outc
 
 ### Containment (`lock()`)
 
-Linux: build a Landlock ruleset from the grants (same directories, mapped rights) and load a seccomp filter that denies path-taking syscalls (`open`, `openat` without `RESOLVE_BENEATH` is not distinguishable, so the filter denies the path families wholesale and the library uses `openat2` through its own held descriptors). Exact syscall list is an M2 deliverable with tests.
+Linux: build a Landlock ruleset from the grants (same directories, mapped rights; rules are bound to the held descriptors, not path names). Landlock alone mediates filesystem paths — seccomp cannot inspect path arguments and was dropped from this role; see ADR 0002. seccomp remains reserved for shrinking the non-filesystem syscall surface in later milestones.
 
 macOS: no Landlock equivalent, so containment is structural — a broker process (M3) holds the grants and the worker process holds nothing. The library API is identical; the transport differs.
 
@@ -76,6 +76,6 @@ LD_PRELOAD interposition, Windows, quotas, network capabilities, in-process mult
 
 ## Open questions
 
-- seccomp filter scope vs. real-world libraries that legitimately `openat` relative descriptors (tracked for M2).
+- ~~seccomp filter scope vs. real-world libraries that legitimately `openat` relative descriptors~~ — resolved by ADR 0002: Landlock alone mediates paths.
 - Whether `Grant` should be cloneable with attenuated rights (`grant.narrow(Rights::READ)`) in v1 or later.
 - Audit sink backpressure: drop, block, or count-and-flag (RFC 0002).

@@ -18,7 +18,7 @@ gate.open("/etc/passwd")?;            // Err(GateError::NoGrant) — always
 Two layers, both required:
 
 1. **Handle resolution.** Paths are matched to a granted directory handle and opened relative to it with `openat2(2)` + `RESOLVE_BENEATH` on Linux (component-walk fallback elsewhere), building on `cap-std`. No string-prefix checks; symlinks and `..` cannot escape a grant.
-2. **Process containment.** `lock()` applies Landlock rules and a seccomp filter on Linux so even native code that bypasses the library cannot reach ungated paths. On macOS the same guarantee comes from a broker process that holds the grants and passes descriptors over a socket.
+2. **Process containment.** `lock()` loads a Landlock ruleset built from the grants on Linux, so even native code that bypasses the library cannot reach ungated paths (why Landlock and not seccomp: ADR 0002). On platforms without Landlock a strict `lock()` fails closed; on macOS the same guarantee will come from a broker process (M3) that holds the grants and passes descriptors over a socket.
 
 ## What fsgate does not do
 
@@ -29,7 +29,7 @@ Two layers, both required:
 
 ## Status
 
-Design phase. There is no published crate, no test suite, and no security guarantee yet. The design is in [docs/rfcs/0001-core-design.md](docs/rfcs/0001-core-design.md) and the plan in [ROADMAP.md](ROADMAP.md). Claims are labeled: nothing here is "tested" or "reviewed" until the roadmap says so with evidence.
+Early implementation, not yet released or independently reviewed. The handle layer (M1) and Linux kernel containment via `lock()` (M2) are implemented and tested, including denial tests that assert the forbidden side effect did not happen and a child-process test proving a raw `std::fs` call fails at the kernel. The macOS broker (M3) and audit sink (M4) are not built yet, so on macOS a `Gate` currently constrains code that goes through it, not code that bypasses it. Design: [docs/rfcs/0001-core-design.md](docs/rfcs/0001-core-design.md); plan and evidence: [ROADMAP.md](ROADMAP.md).
 
 ## Prior art
 

@@ -22,9 +22,13 @@
 //! # }
 //! ```
 //!
-//! Process-level containment (`lock()` with Landlock and seccomp, and the
-//! broker for macOS) is specified in RFC 0001 and lands in M2/M3; until
-//! then a `Gate` constrains code that uses it, not code that bypasses it.
+//! [`Gate::lock`] ends the granting phase and applies kernel containment:
+//! on Linux, a Landlock ruleset built from the grants, so even code that
+//! bypasses the `Gate` entirely cannot reach ungated paths. On platforms
+//! without Landlock a strict lock fails closed; the broker process (M3)
+//! will carry the same guarantee to macOS.
+
+mod containment;
 
 use std::fmt;
 use std::fs::File;
@@ -131,6 +135,22 @@ pub enum GateError {
     /// The [`Grant`] was already revoked or belongs to another gate.
     #[error("grant was already revoked or does not belong to this gate")]
     UnknownGrant,
+    /// The gate is locked; the granting phase is over.
+    #[error("gate is locked; create every grant before calling `lock()`")]
+    Locked,
+    /// A strict lock cannot be fully enforced on this platform or kernel.
+    #[error("kernel containment unavailable: {reason}")]
+    LockUnsupported {
+        /// Why enforcement is unavailable, and what to do instead.
+        reason: String,
+    },
+    /// Building or applying the kernel ruleset failed.
+    #[error("applying kernel containment failed: {source}")]
+    LockFailed {
+        /// The underlying error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     /// Policy allowed the operation but the filesystem refused it. Escape
     /// attempts the kernel blocks (`RESOLVE_BENEATH`) surface here.
     #[error("filesystem operation on `{path}` failed: {source}")]
@@ -141,6 +161,27 @@ pub enum GateError {
         #[source]
         source: io::Error,
     },
+}
+
+/// How strictly [`Gate::lock`] treats missing kernel support.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockPolicy {
+    /// Fail unless the kernel fully enforces the containment rules.
+    Strict,
+    /// Apply whatever the platform supports and report what was achieved.
+    /// Choosing this is an explicit decision to accept weaker containment.
+    BestEffort,
+}
+
+/// What a successful lock actually achieved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockStatus {
+    /// The kernel enforces the grants against all code in the thread family.
+    FullyEnforced,
+    /// The kernel enforces part of the rules (older Landlock ABI).
+    PartiallyEnforced,
+    /// Only the library's own checks apply; the kernel enforces nothing.
+    LibraryOnly,
 }
 
 /// Handle to one grant inside a [`Gate`], used to revoke it.
@@ -158,13 +199,17 @@ struct GrantEntry {
 /// A set of granted directories and the only way through them.
 pub struct Gate {
     grants: Vec<Option<GrantEntry>>,
+    locked: bool,
 }
 
 impl Gate {
     /// Creates a gate with no grants. Every operation fails until
     /// [`grant`](Gate::grant) is called.
     pub fn new() -> Gate {
-        Gate { grants: Vec::new() }
+        Gate {
+            grants: Vec::new(),
+            locked: false,
+        }
     }
 
     /// Grants access to `path` with `rights`.
@@ -173,6 +218,9 @@ impl Gate {
     /// change what the grant reaches (protection is by the descriptor's
     /// identity, not the name).
     pub fn grant(&mut self, path: impl AsRef<Path>, rights: Rights) -> Result<Grant, GateError> {
+        if self.locked {
+            return Err(GateError::Locked);
+        }
         let path = normalize(path.as_ref())?;
         let dir =
             Dir::open_ambient_dir(&path, ambient_authority()).map_err(|source| GateError::Io {
@@ -185,8 +233,45 @@ impl Gate {
         })
     }
 
+    /// Ends the granting phase and applies kernel containment, strictly:
+    /// equivalent to [`lock_with(LockPolicy::Strict)`](Gate::lock_with).
+    ///
+    /// Irreversible. After a successful lock, [`grant`](Gate::grant) and a
+    /// second `lock` fail with [`GateError::Locked`].
+    ///
+    /// On Linux this loads a Landlock ruleset covering every live grant
+    /// (bound to the held descriptors, not path names), so filesystem
+    /// access outside the grants fails at the kernel even for code that
+    /// never touches this `Gate`. Landlock applies to the calling thread
+    /// and everything it spawns afterwards — call `lock` on the main
+    /// thread before spawning threads. On platforms without Landlock a
+    /// strict lock fails with [`GateError::LockUnsupported`].
+    pub fn lock(&mut self) -> Result<LockStatus, GateError> {
+        self.lock_with(LockPolicy::Strict)
+    }
+
+    /// Ends the granting phase with an explicit [`LockPolicy`].
+    ///
+    /// `BestEffort` applies whatever the platform supports and reports the
+    /// achieved level as a [`LockStatus`]; it never fails just because the
+    /// kernel cannot enforce. The library-level lock (no new grants) is
+    /// applied in every case.
+    pub fn lock_with(&mut self, policy: LockPolicy) -> Result<LockStatus, GateError> {
+        if self.locked {
+            return Err(GateError::Locked);
+        }
+        let status = containment::apply(self.grants.iter().flatten(), policy)?;
+        self.locked = true;
+        Ok(status)
+    }
+
     /// Revokes a grant. Subsequent operations under it fail with
     /// [`GateError::NoGrant`] unless another grant also covers them.
+    ///
+    /// Allowed after [`lock`](Gate::lock) — revocation only narrows. Note
+    /// that after a lock the kernel rules are fixed: revoking then stops
+    /// this `Gate` from using the grant, but code bypassing the gate keeps
+    /// whatever the kernel ruleset allowed until the process exits.
     pub fn revoke(&mut self, grant: Grant) -> Result<(), GateError> {
         match self.grants.get_mut(grant.index) {
             Some(slot @ Some(_)) => {

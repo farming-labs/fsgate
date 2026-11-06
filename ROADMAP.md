@@ -24,11 +24,11 @@ Acceptance: tests cover allowed operations, denied operations, symlink escape at
 
 ## M2 — process lock
 
-- [ ] `lock()`: apply Landlock ruleset derived from the grants + seccomp filter denying path-based syscalls
-- [ ] `lock()` is irreversible; `grant()` after `lock()` fails
-- [ ] Graceful degradation is explicit: on kernels without Landlock, `lock()` returns an error unless the caller opts into `LockPolicy::BestEffort`
+- [x] `lock()`: apply a Landlock ruleset derived from the grants (seccomp was dropped for path mediation — it cannot inspect path arguments; [ADR 0002](docs/decisions/0002-landlock-not-seccomp-for-paths.md))
+- [x] `lock()` is irreversible; `grant()` after `lock()` fails
+- [x] Graceful degradation is explicit: on kernels without Landlock, `lock()` returns an error unless the caller opts into `LockPolicy::BestEffort` (which reports the achieved `LockStatus`)
 
-Acceptance: a test spawns a child, locks it, and proves raw `std::fs::File::open` of an ungated path fails at the kernel, not in the library.
+Acceptance met: `tests/lock.rs` re-executes the test binary as a locked child and proves raw `std::fs::File::open` of an ungated path fails at the kernel (`PermissionDenied`), writes outside leave no file behind, and the gate's own granted opens still work.
 
 ## M3 — broker (macOS and defense in depth)
 
