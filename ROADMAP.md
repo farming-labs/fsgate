@@ -40,8 +40,8 @@ Acceptance met: `tests/broker.rs` covers socketpair and real-binary transports, 
 
 ## M4 — revocation and audit
 
-- [ ] `revoke(grant)` takes effect for subsequent operations and is covered by tests
-- [ ] Every allow/deny decision emits a structured audit event (format from RFC 0002)
+- [x] `revoke(grant)` takes effect for subsequent operations and is covered by tests (landed early, in M1)
+- [x] Every allow/deny decision emits a structured audit event (format from [RFC 0002](docs/rfcs/0002-audit-events.md)): `AuditSink` on the gate, events for grant/revoke/lock and all four operations, kernel refusals recorded as allow + errno, broker decisions audited server-side, denials observed even when the caller swallows the error
 
 ## M5 — v0.1.0
 

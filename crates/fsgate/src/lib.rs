@@ -30,10 +30,12 @@
 //! worker that holds no filesystem authority of its own, passing
 //! descriptors over a Unix socket to a [`BrokerGate`].
 
+mod audit;
 #[cfg(unix)]
 mod broker;
 mod containment;
 
+pub use audit::{AuditDecision, AuditEvent, AuditOp, AuditReason, AuditSink};
 #[cfg(unix)]
 pub use broker::{Broker, BrokerGate, FileStat};
 
@@ -42,6 +44,8 @@ use std::fs::File;
 use std::io;
 use std::ops::BitOr;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::time::SystemTime;
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
@@ -224,6 +228,7 @@ struct GrantEntry {
 pub struct Gate {
     grants: Vec<Option<GrantEntry>>,
     locked: bool,
+    audit: Option<Arc<dyn AuditSink>>,
 }
 
 impl Gate {
@@ -233,7 +238,15 @@ impl Gate {
         Gate {
             grants: Vec::new(),
             locked: false,
+            audit: None,
         }
+    }
+
+    /// Installs an [`AuditSink`] that receives every allow/deny decision
+    /// (RFC 0002). The default is no sink, which costs one branch.
+    /// Observation only — a sink cannot veto or alter decisions.
+    pub fn set_audit_sink(&mut self, sink: Arc<dyn AuditSink>) {
+        self.audit = Some(sink);
     }
 
     /// Grants access to `path` with `rights`.
@@ -242,19 +255,60 @@ impl Gate {
     /// change what the grant reaches (protection is by the descriptor's
     /// identity, not the name).
     pub fn grant(&mut self, path: impl AsRef<Path>, rights: Rights) -> Result<Grant, GateError> {
+        let requested = path.as_ref();
         if self.locked {
+            self.emit(
+                AuditOp::Grant,
+                Some(requested),
+                None,
+                AuditDecision::Deny,
+                AuditReason::Locked,
+                None,
+            );
             return Err(GateError::Locked);
         }
-        let path = normalize(path.as_ref())?;
-        let dir =
-            Dir::open_ambient_dir(&path, ambient_authority()).map_err(|source| GateError::Io {
-                path: path.clone(),
-                source,
-            })?;
+        let path = match normalize(requested) {
+            Ok(path) => path,
+            Err(err) => {
+                self.emit(
+                    AuditOp::Grant,
+                    Some(requested),
+                    None,
+                    AuditDecision::Deny,
+                    AuditReason::NotAbsolute,
+                    None,
+                );
+                return Err(err);
+            }
+        };
+        let dir = match Dir::open_ambient_dir(&path, ambient_authority()) {
+            Ok(dir) => dir,
+            Err(source) => {
+                self.emit(
+                    AuditOp::Grant,
+                    Some(&path),
+                    None,
+                    AuditDecision::Allow,
+                    AuditReason::Ok,
+                    source.raw_os_error(),
+                );
+                return Err(GateError::Io { path, source });
+            }
+        };
         self.grants.push(Some(GrantEntry { path, dir, rights }));
-        Ok(Grant {
-            index: self.grants.len() - 1,
-        })
+        let index = self.grants.len() - 1;
+        self.emit(
+            AuditOp::Grant,
+            self.grants[index]
+                .as_ref()
+                .map(|entry| entry.path.clone())
+                .as_deref(),
+            Some(index),
+            AuditDecision::Allow,
+            AuditReason::Ok,
+            None,
+        );
+        Ok(Grant { index })
     }
 
     /// Ends the granting phase and applies kernel containment, strictly:
@@ -282,10 +336,39 @@ impl Gate {
     /// applied in every case.
     pub fn lock_with(&mut self, policy: LockPolicy) -> Result<LockStatus, GateError> {
         if self.locked {
+            self.emit(
+                AuditOp::Lock,
+                None,
+                None,
+                AuditDecision::Deny,
+                AuditReason::Locked,
+                None,
+            );
             return Err(GateError::Locked);
         }
-        let status = containment::apply(self.grants.iter().flatten(), policy)?;
+        let status = match containment::apply(self.grants.iter().flatten(), policy) {
+            Ok(status) => status,
+            Err(err) => {
+                self.emit(
+                    AuditOp::Lock,
+                    None,
+                    None,
+                    AuditDecision::Deny,
+                    AuditReason::Unsupported,
+                    None,
+                );
+                return Err(err);
+            }
+        };
         self.locked = true;
+        self.emit(
+            AuditOp::Lock,
+            None,
+            None,
+            AuditDecision::Allow,
+            AuditReason::Ok,
+            None,
+        );
         Ok(status)
     }
 
@@ -299,51 +382,122 @@ impl Gate {
     pub fn revoke(&mut self, grant: Grant) -> Result<(), GateError> {
         match self.grants.get_mut(grant.index) {
             Some(slot @ Some(_)) => {
-                *slot = None;
+                let path = slot.take().map(|entry| entry.path);
+                self.emit(
+                    AuditOp::Revoke,
+                    path.as_deref(),
+                    Some(grant.index),
+                    AuditDecision::Allow,
+                    AuditReason::Ok,
+                    None,
+                );
                 Ok(())
             }
-            _ => Err(GateError::UnknownGrant),
+            _ => {
+                self.emit(
+                    AuditOp::Revoke,
+                    None,
+                    Some(grant.index),
+                    AuditDecision::Deny,
+                    AuditReason::UnknownGrant,
+                    None,
+                );
+                Err(GateError::UnknownGrant)
+            }
         }
     }
 
     /// Opens an existing file for reading. Needs [`Rights::READ`].
     pub fn open(&self, path: impl AsRef<Path>) -> Result<File, GateError> {
-        let (entry, rel, full) = self.resolve(path.as_ref(), Rights::READ, "open")?;
-        entry
-            .dir
-            .open(&rel)
-            .map(cap_std::fs::File::into_std)
-            .map_err(|source| GateError::Io { path: full, source })
+        self.gated(AuditOp::Open, path.as_ref(), Rights::READ, |entry, rel| {
+            entry.dir.open(rel).map(cap_std::fs::File::into_std)
+        })
     }
 
     /// Creates (or truncates) a file for writing. Needs [`Rights::CREATE`]
     /// and [`Rights::WRITE`], because the returned handle writes data.
     pub fn create(&self, path: impl AsRef<Path>) -> Result<File, GateError> {
-        let (entry, rel, full) =
-            self.resolve(path.as_ref(), Rights::CREATE | Rights::WRITE, "create")?;
-        entry
-            .dir
-            .create(&rel)
-            .map(cap_std::fs::File::into_std)
-            .map_err(|source| GateError::Io { path: full, source })
+        self.gated(
+            AuditOp::Create,
+            path.as_ref(),
+            Rights::CREATE | Rights::WRITE,
+            |entry, rel| entry.dir.create(rel).map(cap_std::fs::File::into_std),
+        )
     }
 
     /// Reads metadata. Needs [`Rights::READ`].
     pub fn metadata(&self, path: impl AsRef<Path>) -> Result<Metadata, GateError> {
-        let (entry, rel, full) = self.resolve(path.as_ref(), Rights::READ, "stat")?;
-        entry
-            .dir
-            .metadata(&rel)
-            .map_err(|source| GateError::Io { path: full, source })
+        self.gated(
+            AuditOp::Metadata,
+            path.as_ref(),
+            Rights::READ,
+            |entry, rel| entry.dir.metadata(rel),
+        )
     }
 
     /// Lists a directory. Needs [`Rights::LIST`].
     pub fn read_dir(&self, path: impl AsRef<Path>) -> Result<ReadDir, GateError> {
-        let (entry, rel, full) = self.resolve(path.as_ref(), Rights::LIST, "list")?;
-        entry
-            .dir
-            .read_dir(&rel)
-            .map_err(|source| GateError::Io { path: full, source })
+        self.gated(
+            AuditOp::ReadDir,
+            path.as_ref(),
+            Rights::LIST,
+            |entry, rel| entry.dir.read_dir(rel),
+        )
+    }
+
+    /// Resolves, runs the operation, and emits exactly one audit event:
+    /// a deny for policy refusals, or an allow (with `errno` when the
+    /// filesystem then refused) once policy is satisfied.
+    fn gated<T>(
+        &self,
+        op: AuditOp,
+        path: &Path,
+        needed: Rights,
+        run: impl FnOnce(&GrantEntry, &Path) -> io::Result<T>,
+    ) -> Result<T, GateError> {
+        let (index, entry, rel, full) = match self.resolve(path, needed, op) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let (reason, grant) = match &err {
+                    GateError::NotAbsolute { .. } => (AuditReason::NotAbsolute, None),
+                    GateError::NoGrant { .. } => (AuditReason::NoGrant, None),
+                    GateError::RightsExceeded { grant_path, .. } => (
+                        AuditReason::RightsExceeded,
+                        self.grants.iter().position(|slot| {
+                            slot.as_ref().is_some_and(|entry| &entry.path == grant_path)
+                        }),
+                    ),
+                    // resolve() returns no other variants.
+                    _ => (AuditReason::Ok, None),
+                };
+                self.emit(op, Some(path), grant, AuditDecision::Deny, reason, None);
+                return Err(err);
+            }
+        };
+        match run(entry, &rel) {
+            Ok(value) => {
+                self.emit(
+                    op,
+                    Some(&full),
+                    Some(index),
+                    AuditDecision::Allow,
+                    AuditReason::Ok,
+                    None,
+                );
+                Ok(value)
+            }
+            Err(source) => {
+                self.emit(
+                    op,
+                    Some(&full),
+                    Some(index),
+                    AuditDecision::Allow,
+                    AuditReason::Ok,
+                    source.raw_os_error(),
+                );
+                Err(GateError::Io { path: full, source })
+            }
+        }
     }
 
     /// Routes a path to the longest covering grant and checks rights.
@@ -355,22 +509,23 @@ impl Gate {
         &self,
         path: &Path,
         needed: Rights,
-        op: &'static str,
-    ) -> Result<(&GrantEntry, PathBuf, PathBuf), GateError> {
+        op: AuditOp,
+    ) -> Result<(usize, &GrantEntry, PathBuf, PathBuf), GateError> {
         let full = normalize(path)?;
-        let entry = self
+        let (index, entry) = self
             .grants
             .iter()
-            .flatten()
-            .filter(|entry| full.starts_with(&entry.path))
-            .max_by_key(|entry| entry.path.components().count())
+            .enumerate()
+            .filter_map(|(index, slot)| slot.as_ref().map(|entry| (index, entry)))
+            .filter(|(_, entry)| full.starts_with(&entry.path))
+            .max_by_key(|(_, entry)| entry.path.components().count())
             .ok_or_else(|| GateError::NoGrant { path: full.clone() })?;
         if !entry.rights.contains(needed) {
             return Err(GateError::RightsExceeded {
                 path: full,
                 grant_path: entry.path.clone(),
                 missing: needed.missing_from(entry.rights),
-                op: op.to_string(),
+                op: op.as_str().to_string(),
             });
         }
         let rel = full
@@ -381,7 +536,29 @@ impl Gate {
         } else {
             rel.to_path_buf()
         };
-        Ok((entry, rel, full))
+        Ok((index, entry, rel, full))
+    }
+
+    fn emit(
+        &self,
+        op: AuditOp,
+        path: Option<&Path>,
+        grant: Option<usize>,
+        decision: AuditDecision,
+        reason: AuditReason,
+        errno: Option<i32>,
+    ) {
+        if let Some(sink) = &self.audit {
+            sink.event(&AuditEvent {
+                ts: SystemTime::now(),
+                op,
+                path: path.map(Path::to_path_buf),
+                grant,
+                decision,
+                reason,
+                errno,
+            });
+        }
     }
 }
 
