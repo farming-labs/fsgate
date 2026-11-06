@@ -20,11 +20,11 @@ Fields:
 
 - `v` — format version, starts at 1. The contract is versioned and only gains keys within a version; removing or retyping a key bumps `v`.
 - `ts` — RFC 3339 UTC with milliseconds.
-- `op` — `grant`, `revoke`, `lock`, `open`, `create`, `metadata`, `read_dir` (grows with the API).
-- `path` — the normalized requested path. For `grant`/`revoke`, the grant's path. `null` for `lock`, which has no path.
+- `op` — `grant`, `revoke`, `narrow` (RFC 0005), `lock`, `open`, `create`, `metadata`, `read_dir` (grows with the API).
+- `path` — the normalized requested path. For `grant`/`revoke`/`narrow`, the grant's path. `null` for `lock`, which has no path.
 - `grant` — the matched grant's id, or `null` when none matched.
 - `decision` — `allow` or `deny`. An operation that passed policy but failed at the kernel is `allow` with a non-null `errno`: policy said yes, the OS said no, and both facts are recorded.
-- `reason` — `ok`, `no_grant`, `rights_exceeded`, `not_absolute`, `locked`, `unsupported` (a lock the kernel could not enforce), `unknown_grant` (revoking a grant that does not exist).
+- `reason` — `ok`, `no_grant`, `rights_exceeded` (for `narrow`: the requested set names a right the grant does not hold), `not_absolute`, `locked`, `unsupported` (a lock the kernel could not enforce), `unknown_grant` (revoking or narrowing a grant that does not exist).
 - `errno` — OS error number when the underlying syscall failed, else `null`.
 
 ## Delivery
