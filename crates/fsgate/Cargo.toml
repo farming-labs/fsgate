@@ -1,0 +1,12 @@
+[package]
+name = "fsgate"
+version = "0.0.0"
+description = "Filesystem authority as directory handles granted up front, enforced by the kernel."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
