@@ -53,6 +53,19 @@ Preparation: the local branch folds `LockStatus`, `create` rights, audit deliver
 
 Local verification on macOS (Rust 1.99.1): `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, and `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps` passed. `cargo test --locked` passed 32 runtime tests and two compile-only doctests. `cargo package --locked` succeeded; the same 34 tests passed against the archive extracted outside the repository. `cargo deny check` passed with warnings for duplicate dependencies and unused license allowances. The duplicate-grant audit tests and packaged README doctest failed before their fixes. Rust 1.85.0 also passed all 34 tests in both the checkout and the unpacked crate. CI now runs the suite on Linux with stable Rust and Rust 1.85.0; Linux enforcement remains pending CI verification.
 
+## M6 — Linux filesystem interception (experimental)
+
+Proposed after M5 / v0.1.0; not implemented and not assigned a release version. Design: [RFC 0004](docs/rfcs/0004-filesystem-interception.md). M2 already enforces Linux filesystem rules in the kernel. M6 would let a supported binary's ordinary file-open syscalls reach the broker without linking fsgate or calling `BrokerGate`.
+
+- [ ] Settle the authority boundary and backend in RFC 0004: evaluate seccomp user notifications with broker-side opens; distinguish this from a preload shim and privileged eBPF LSM hooks. Acceptance: record the supported kernel/architecture, syscall and flag coverage, bootstrap authority, and bypass analysis before runtime implementation.
+- [ ] Add an opt-in experimental launcher using the existing grant resolver and audit sink. Acceptance: the worker starts only after required kernel support, containment, descriptor cleanup, and supervisor readiness are confirmed; unsupported hosts fail before executing the target.
+- [ ] Intercept the supported `open` / `openat` / `openat2` calls, initially read-only regular files named by absolute paths. Acceptance: standalone libc and direct-syscall fixtures read granted bytes without a fsgate dependency, and unsupported arguments return documented errors without ambient fallback.
+- [ ] Enforce broker-side authorization and descriptor delivery. Acceptance: denied opens and attempted writes leave protected files unchanged, symlink and argument races cannot escape a grant, and mediated decisions reach the audit sink.
+- [ ] Handle shutdown, cancellation, and revocation. Acceptance: supervisor death prevents new brokered opens, interrupted requests leak no descriptors, descendants retain restrictions, and revocation denies subsequent brokered opens. Document that already-delivered file descriptors remain usable.
+- [ ] Verify and document the supported subset from a release build and unpacked crate on Linux. Acceptance: real-filesystem denial and bypass tests pass on the declared kernels and architectures, unsupported-host startup tests pass, and the README and example state the remaining compatibility limits.
+
+M6 does not promise every filesystem syscall or arbitrary binary compatibility. Relative paths and directory descriptors, writes and creation, metadata, and directory enumeration need explicit semantics and coverage before support expands. macOS interception, a preload shim, and a custom eBPF LSM backend are not part of the proposed first implementation.
+
 ## Out of scope for v1
 
 Preload shim for unmodified binaries, Windows, quotas and rate budgets, network or non-filesystem capabilities.
