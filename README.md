@@ -4,13 +4,18 @@
 
 fsgate is a Rust library for programs that run untrusted or compromise-prone code. You grant a small set of directories while the process is still trusted, then lock the process. After the lock, every path lookup resolves beneath one of those grants and everything else fails. There is no fallback path.
 
-```rust
-let mut gate = Gate::new();
-let data = gate.grant("/srv/data", Rights::READ | Rights::WRITE)?;
-gate.lock()?; // kernel enforcement on; no new filesystem authority after this
+```rust,no_run
+use fsgate::{Gate, Rights};
 
-gate.open("/srv/data/users/1.json")?; // resolves beneath the /srv/data grant
-gate.open("/etc/passwd")?;            // Err(GateError::NoGrant) — always
+fn main() -> Result<(), fsgate::GateError> {
+    let mut gate = Gate::new();
+    gate.grant("/srv/data", Rights::READ | Rights::WRITE | Rights::CREATE)?;
+    gate.lock()?; // kernel enforcement on; no new filesystem authority after this
+
+    let file = gate.open("/srv/data/users/1.json")?; // beneath the /srv/data grant
+    assert!(gate.open("/etc/passwd").is_err()); // no grant: always an error
+    Ok(())
+}
 ```
 
 ## How it enforces

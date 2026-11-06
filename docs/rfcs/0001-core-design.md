@@ -25,8 +25,10 @@ pub struct Gate { /* grants, locked flag, audit sink */ }
 
 impl Gate {
     pub fn new() -> Gate;
+    pub fn set_audit_sink(&mut self, sink: Arc<dyn AuditSink>);
     pub fn grant(&mut self, path: impl AsRef<Path>, rights: Rights) -> Result<Grant, GateError>;
-    pub fn lock(&mut self) -> Result<(), GateError>;              // irreversible
+    pub fn lock(&mut self) -> Result<LockStatus, GateError>;      // irreversible; strict
+    pub fn lock_with(&mut self, policy: LockPolicy) -> Result<LockStatus, GateError>;
     pub fn revoke(&mut self, grant: Grant) -> Result<(), GateError>;
 
     pub fn open(&self, path: impl AsRef<Path>) -> Result<File, GateError>;
@@ -35,6 +37,8 @@ impl Gate {
     pub fn read_dir(&self, path: impl AsRef<Path>) -> Result<ReadDir, GateError>;
 }
 ```
+
+As implemented (v0.1.0): `lock` reports the achieved [`LockStatus`] (`FullyEnforced` / `PartiallyEnforced` / `LibraryOnly`) because a best-effort lock that enforced nothing must say so; `create` requires `CREATE | WRITE`, since the returned handle writes data; the broker client (`BrokerGate`, RFC 0003) carries the same verbs with serializable result types.
 
 Naming follows fixed verb jobs: `grant` confers authority, `lock` applies containment, `revoke` is the reverse of `grant`. Every registration has its reverse; `lock()` is the one deliberate exception and is documented as irreversible.
 
@@ -77,5 +81,5 @@ LD_PRELOAD interposition, Windows, quotas, network capabilities, in-process mult
 ## Open questions
 
 - ~~seccomp filter scope vs. real-world libraries that legitimately `openat` relative descriptors~~ — resolved by ADR 0002: Landlock alone mediates paths.
-- Whether `Grant` should be cloneable with attenuated rights (`grant.narrow(Rights::READ)`) in v1 or later.
-- Audit sink backpressure: drop, block, or count-and-flag (RFC 0002).
+- ~~Audit sink backpressure: drop, block, or count-and-flag~~ — resolved in RFC 0002: delivery is synchronous and the embedder owns buffering; fsgate never drops an event itself.
+- Whether `Grant` should be cloneable with attenuated rights (`grant.narrow(Rights::READ)`) — deferred past v0.1.0.

@@ -589,3 +589,10 @@ fn normalize(path: &Path) -> Result<PathBuf, GateError> {
     }
     Ok(out)
 }
+
+/// The README's example must keep compiling; this pulls it into the
+/// doctest suite without shipping it in the crate docs.
+#[cfg(doctest)]
+mod readme_doctest {
+    #![doc = include_str!("../../../README.md")]
+}
