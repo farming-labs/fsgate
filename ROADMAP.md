@@ -32,11 +32,11 @@ Acceptance met: `tests/lock.rs` re-executes the test binary as a locked child an
 
 ## M3 — broker (macOS and defense in depth)
 
-- [ ] `fsgate-broker` binary: parent holds grants, child requests opens over a Unix socket, descriptors passed via `SCM_RIGHTS`
-- [ ] Same `Gate` API in the child, backed by the broker transport
-- [ ] Broker applies the same rights checks server-side; the child is never trusted
+- [x] `fsgate-broker` binary: parent holds grants, child requests opens over a Unix socket, descriptors passed via `SCM_RIGHTS` (protocol: [RFC 0003](docs/rfcs/0003-broker-protocol.md))
+- [x] Same verbs in the child via `BrokerGate` (`open`/`create`/`metadata`/`read_dir`; `metadata` returns the serializable `FileStat` and `read_dir` returns names, since results cross a process boundary)
+- [x] Broker applies the same rights checks server-side; the child is never trusted (requests feed the broker's own `Gate` — same resolution code as in-process)
 
-Acceptance: broker-backed tests pass on macOS and Linux; killing the broker fails all child filesystem operations closed.
+Acceptance met: `tests/broker.rs` covers socketpair and real-binary transports, typed denials crossing the wire with no side effects, and the kill test — after `fsgate-broker` dies, every client operation returns `GateError::Broker`. Verified on macOS and Linux (CI).
 
 ## M4 — revocation and audit
 

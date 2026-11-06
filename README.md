@@ -18,7 +18,12 @@ gate.open("/etc/passwd")?;            // Err(GateError::NoGrant) — always
 Two layers, both required:
 
 1. **Handle resolution.** Paths are matched to a granted directory handle and opened relative to it with `openat2(2)` + `RESOLVE_BENEATH` on Linux (component-walk fallback elsewhere), building on `cap-std`. No string-prefix checks; symlinks and `..` cannot escape a grant.
-2. **Process containment.** `lock()` loads a Landlock ruleset built from the grants on Linux, so even native code that bypasses the library cannot reach ungated paths (why Landlock and not seccomp: ADR 0002). On platforms without Landlock a strict `lock()` fails closed; on macOS the same guarantee will come from a broker process (M3) that holds the grants and passes descriptors over a socket.
+2. **Process containment.** `lock()` loads a Landlock ruleset built from the grants on Linux, so even native code that bypasses the library cannot reach ungated paths (why Landlock and not seccomp: ADR 0002). On platforms without Landlock a strict `lock()` fails closed, and containment is structural instead: `fsgate-broker` holds the grants in a trusted parent process and serves a worker over a Unix socket, passing descriptors back with `SCM_RIGHTS` (protocol: RFC 0003). Every rights decision runs broker-side; when the broker dies, the worker's filesystem operations fail closed.
+
+```text
+fsgate-broker --grant /srv/data:rl --socket /tmp/app.sock -- ./worker
+# worker: BrokerGate::connect(env FSGATE_BROKER_SOCKET) → open/create/metadata/read_dir
+```
 
 ## What fsgate does not do
 
@@ -29,7 +34,7 @@ Two layers, both required:
 
 ## Status
 
-Early implementation, not yet released or independently reviewed. The handle layer (M1) and Linux kernel containment via `lock()` (M2) are implemented and tested, including denial tests that assert the forbidden side effect did not happen and a child-process test proving a raw `std::fs` call fails at the kernel. The macOS broker (M3) and audit sink (M4) are not built yet, so on macOS a `Gate` currently constrains code that goes through it, not code that bypasses it. Design: [docs/rfcs/0001-core-design.md](docs/rfcs/0001-core-design.md); plan and evidence: [ROADMAP.md](ROADMAP.md).
+Early implementation, not yet released or independently reviewed. The handle layer (M1), Linux kernel containment via `lock()` (M2), and the broker (M3) are implemented and tested — denial tests assert the forbidden side effect did not happen, a child-process test proves a raw `std::fs` call fails at the kernel on Linux, and a binary end-to-end test proves a killed broker fails the worker closed. The audit sink (M4) is not built yet. Note the honest macOS limit: the broker contains a worker that has no other filesystem authority; fsgate does not yet strip a macOS process of its ambient authority for you. Design: [docs/rfcs/0001-core-design.md](docs/rfcs/0001-core-design.md); plan and evidence: [ROADMAP.md](ROADMAP.md).
 
 ## Prior art
 

@@ -24,11 +24,18 @@
 //!
 //! [`Gate::lock`] ends the granting phase and applies kernel containment:
 //! on Linux, a Landlock ruleset built from the grants, so even code that
-//! bypasses the `Gate` entirely cannot reach ungated paths. On platforms
-//! without Landlock a strict lock fails closed; the broker process (M3)
-//! will carry the same guarantee to macOS.
+//! bypasses the `Gate` entirely cannot reach ungated paths. Where Landlock
+//! does not exist a strict lock fails closed, and containment is
+//! structural instead: a [`Broker`] process holds the gate and serves a
+//! worker that holds no filesystem authority of its own, passing
+//! descriptors over a Unix socket to a [`BrokerGate`].
 
+#[cfg(unix)]
+mod broker;
 mod containment;
+
+#[cfg(unix)]
+pub use broker::{Broker, BrokerGate, FileStat};
 
 use std::fmt;
 use std::fs::File;
@@ -66,6 +73,16 @@ impl Rights {
     /// Returns the rights in `self` that `held` is missing.
     pub const fn missing_from(self, held: Rights) -> Rights {
         Rights(self.0 & !held.0)
+    }
+
+    /// Returns the raw bit representation, for serialization.
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Rebuilds a set from raw bits, dropping unknown bits.
+    pub const fn from_bits_truncate(bits: u8) -> Rights {
+        Rights(bits & 0b1111)
     }
 }
 
@@ -130,7 +147,7 @@ pub enum GateError {
         /// The rights the operation needs but the grant does not hold.
         missing: Rights,
         /// The attempted operation.
-        op: &'static str,
+        op: String,
     },
     /// The [`Grant`] was already revoked or belongs to another gate.
     #[error("grant was already revoked or does not belong to this gate")]
@@ -150,6 +167,13 @@ pub enum GateError {
         /// The underlying error.
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    /// The broker transport failed or refused. The connection being gone
+    /// means every operation fails: closed, with no fallback.
+    #[error("broker error: {message}")]
+    Broker {
+        /// What went wrong, and the consequence.
+        message: String,
     },
     /// Policy allowed the operation but the filesystem refused it. Escape
     /// attempts the kernel blocks (`RESOLVE_BENEATH`) surface here.
@@ -346,7 +370,7 @@ impl Gate {
                 path: full,
                 grant_path: entry.path.clone(),
                 missing: needed.missing_from(entry.rights),
-                op,
+                op: op.to_string(),
             });
         }
         let rel = full
