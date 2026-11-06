@@ -49,6 +49,10 @@ Acceptance met: `tests/broker.rs` covers socketpair and real-binary transports, 
 - [ ] Docs: every public item documented, README examples compile as doctests
 - [ ] Release v0.1.0 (signed tag). Publishing to crates.io is a separate, explicit maintainer decision.
 
+Preparation: the local branch folds `LockStatus`, `create` rights, audit delivery, broker client types, and containment limits into RFC 0001. It requires public documentation, compiles the README as a doctest, and adds a CI check that tests the unpacked crate. Audit regression coverage checks the actual matched grant ID for duplicate and nested grants, revocation, and broker requests. These items remain unchecked until merged; no signed release tag exists yet.
+
+Local verification on macOS (Rust 1.99.1): `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, and `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps` passed. `cargo test --locked` passed 32 runtime tests and two compile-only doctests. `cargo package --locked --allow-dirty` succeeded; the same 34 tests passed against the archive extracted outside the repository. `cargo deny check` passed with warnings for duplicate dependencies and unused license allowances. The duplicate-grant audit tests and packaged README doctest failed before their fixes. Linux enforcement and Rust 1.85 were not rerun locally; they are not covered by this verification.
+
 ## Out of scope for v1
 
 Preload shim for unmodified binaries, Windows, quotas and rate budgets, network or non-filesystem capabilities.

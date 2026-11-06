@@ -591,5 +591,5 @@ fn normalize(path: &Path) -> Result<PathBuf, GateError> {
 /// doctest suite without shipping it in the crate docs.
 #[cfg(doctest)]
 mod readme_doctest {
-    #![doc = include_str!("../../../README.md")]
+    #![doc = include_str!("../README.md")]
 }

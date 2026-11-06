@@ -38,7 +38,7 @@ impl Gate {
 }
 ```
 
-As implemented (v0.1.0): `lock` reports the achieved [`LockStatus`] (`FullyEnforced` / `PartiallyEnforced` / `LibraryOnly`) because a best-effort lock that enforced nothing must say so; `create` requires `CREATE | WRITE`, since the returned handle writes data; the broker client (`BrokerGate`, RFC 0003) carries the same verbs with serializable result types.
+As implemented for the planned v0.1.0: `lock` reports the achieved `LockStatus` (`FullyEnforced` / `PartiallyEnforced` / `LibraryOnly`) because a best-effort lock that enforced nothing must say so; `create` requires `CREATE | WRITE`, since the returned handle writes data. The broker client (`BrokerGate`, RFC 0003) exposes `open`, `create`, `metadata`, and `read_dir` with serializable result types where needed. Granting, locking, and revocation belong to the server's `Gate`, not the worker client.
 
 Naming follows fixed verb jobs: `grant` confers authority, `lock` applies containment, `revoke` is the reverse of `grant`. Every registration has its reverse; `lock()` is the one deliberate exception and is documented as irreversible.
 
@@ -55,13 +55,15 @@ Step 2 is routing, not security. If it routes to the wrong grant, the worst outc
 
 Linux: build a Landlock ruleset from the grants (same directories, mapped rights; rules are bound to the held descriptors, not path names). Landlock alone mediates filesystem paths — seccomp cannot inspect path arguments and was dropped from this role; see ADR 0002. seccomp remains reserved for shrinking the non-filesystem syscall surface in later milestones.
 
-macOS: no Landlock equivalent, so containment is structural — a broker process (M3) holds the grants and the worker process holds nothing. The library API is identical; the transport differs.
+Landlock applies to the calling thread and its future descendants; call `lock()` before spawning threads. Revocation removes authority from subsequent gate operations, but cannot revoke already opened files or alter an installed Landlock ruleset.
+
+macOS: no Landlock equivalent, so a broker process (M3) holds the grants and authorizes the worker's requests. The broker does not strip a worker's ambient filesystem authority; the embedder must provide that isolation separately. The client exposes the four filesystem operations above; the transport differs.
 
 `lock()` fails closed: if the kernel lacks Landlock ABI support, it returns an error. Callers may opt into `LockPolicy::BestEffort` explicitly; the default never degrades silently.
 
 ### Errors
 
-One `GateError` enum with stable variants. Messages are full sentences naming the path, the missing right or grant, and the fix. Denials are reported with the same detail to the audit sink but a configurable, reduced detail to the caller if the embedder wants to avoid oracle leaks.
+One `GateError` enum with stable variants. Errors name the path, the missing right or grant, and the fix where applicable. The audit sink receives structured decision details. Configurable reduction of caller-facing error detail is not implemented for v0.1.0; embedders must redact errors at their own boundary.
 
 ### Auditing
 

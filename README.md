@@ -2,7 +2,7 @@
 
 **Filesystem authority as directory handles you grant up front, enforced by the kernel.**
 
-fsgate is a Rust library for programs that run untrusted or compromise-prone code. You grant a small set of directories while the process is still trusted, then lock the process. After the lock, every path lookup resolves beneath one of those grants and everything else fails. There is no fallback path.
+fsgate is a Rust library for programs that run untrusted or compromise-prone code. You grant a small set of directories while the process is still trusted, then lock the process. Gate operations resolve beneath those held directory handles; paths with no grant fail. On Linux, a strict lock also restricts raw filesystem opens by the calling thread and its future descendants. There is no fallback to ambient access.
 
 ```rust,no_run
 use fsgate::{Gate, Rights};
@@ -12,7 +12,7 @@ fn main() -> Result<(), fsgate::GateError> {
     gate.grant("/srv/data", Rights::READ | Rights::WRITE | Rights::CREATE)?;
     gate.lock()?; // kernel enforcement on; no new filesystem authority after this
 
-    let file = gate.open("/srv/data/users/1.json")?; // beneath the /srv/data grant
+    let _file = gate.open("/srv/data/users/1.json")?; // beneath the /srv/data grant
     assert!(gate.open("/etc/passwd").is_err()); // no grant: always an error
     Ok(())
 }
@@ -20,10 +20,12 @@ fn main() -> Result<(), fsgate::GateError> {
 
 ## How it enforces
 
-Two layers, both required:
+Two layers:
 
-1. **Handle resolution.** Paths are matched to a granted directory handle and opened relative to it with `openat2(2)` + `RESOLVE_BENEATH` on Linux (component-walk fallback elsewhere), building on `cap-std`. No string-prefix checks; symlinks and `..` cannot escape a grant.
-2. **Process containment.** `lock()` loads a Landlock ruleset built from the grants on Linux, so even native code that bypasses the library cannot reach ungated paths (why Landlock and not seccomp: ADR 0002). On platforms without Landlock a strict `lock()` fails closed, and containment is structural instead: `fsgate-broker` holds the grants in a trusted parent process and serves a worker over a Unix socket, passing descriptors back with `SCM_RIGHTS` (protocol: RFC 0003). Every rights decision runs broker-side; when the broker dies, the worker's filesystem operations fail closed.
+1. **Handle resolution.** Paths route to the longest covering grant and open relative to its held directory handle with `openat2(2)` + `RESOLVE_BENEATH` on Linux (component walk elsewhere), building on `cap-std`. Prefix matching selects the grant; beneath-handle resolution enforces the boundary.
+2. **Process containment.** `lock()` loads a Landlock ruleset built from the grants on Linux, restricting raw opens even when native code bypasses the library (why Landlock and not seccomp: [ADR 0002](docs/decisions/0002-landlock-not-seccomp-for-paths.md)). Call it before spawning threads: existing sibling threads are not restricted. On platforms without Landlock a strict `lock()` fails closed. `fsgate-broker` can hold the grants in a trusted parent process and serve a worker over a Unix socket, passing descriptors back with `SCM_RIGHTS` ([RFC 0003](docs/rfcs/0003-broker-protocol.md)). Every broker request is authorized server-side; when the broker dies, subsequent `BrokerGate` requests fail closed. The embedder must separately remove the worker's ambient filesystem authority.
+
+`lock_with(LockPolicy::BestEffort)` explicitly permits weaker containment and returns the achieved `LockStatus`: `FullyEnforced`, `PartiallyEnforced`, or `LibraryOnly`. `revoke(grant)` affects future gate operations; it does not invalidate files already opened or change the kernel rules installed by `lock()`.
 
 ```text
 fsgate-broker --grant /srv/data:rl --socket /tmp/app.sock -- ./worker
@@ -39,7 +41,9 @@ fsgate-broker --grant /srv/data:rl --socket /tmp/app.sock -- ./worker
 
 ## Status
 
-Early implementation, not yet released or independently reviewed. The handle layer (M1), Linux kernel containment via `lock()` (M2), and the broker (M3) are implemented and tested — denial tests assert the forbidden side effect did not happen, a child-process test proves a raw `std::fs` call fails at the kernel on Linux, and a binary end-to-end test proves a killed broker fails the worker closed. The audit sink (M4) is not built yet. Note the honest macOS limit: the broker contains a worker that has no other filesystem authority; fsgate does not yet strip a macOS process of its ambient authority for you. Design: [docs/rfcs/0001-core-design.md](docs/rfcs/0001-core-design.md); plan and evidence: [ROADMAP.md](ROADMAP.md).
+Early implementation, not yet released or independently reviewed. The handle layer (M1), Linux containment (M2), broker (M3), and audit sink (M4) are implemented. Tests cover denied operations without side effects, Linux kernel enforcement in a child process, and broker failure. `Gate::set_audit_sink` observes authority decisions synchronously, including denials the caller discards and requests served by the broker. A rights denial carries the matched grant's ID; a kernel refusal after a policy allow carries an errno.
+
+M5 release preparation is in progress. The README example compiles as a doctest, public documentation is required by `missing_docs = "deny"`, and CI tests the packaged crate as well as the checkout. The crate remains `publish = false`; a signed v0.1.0 tag and publication require explicit maintainer actions. Design: [RFC 0001](docs/rfcs/0001-core-design.md); plan and evidence: [ROADMAP.md](ROADMAP.md).
 
 ## Prior art
 
