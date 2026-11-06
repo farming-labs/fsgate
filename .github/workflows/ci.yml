@@ -29,6 +29,15 @@ jobs:
           tar -xzf target/package/fsgate-*.crate -C "$package_dir"
           cargo test --locked --manifest-path "$package_dir"/fsgate-*/Cargo.toml
 
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.85.0
+      - run: cargo test --locked
+
   deny:
     runs-on: ubuntu-latest
     steps:
