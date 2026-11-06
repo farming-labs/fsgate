@@ -2,7 +2,9 @@
 
 ## Unreleased
 
-Preparation for v0.1.0. Not yet tagged or published to crates.io.
+## 0.1.0 (unreleased)
+
+Prepared for the initial signed-tag release. Not yet tagged or published to crates.io.
 
 ### Added
 
@@ -12,10 +14,11 @@ Preparation for v0.1.0. Not yet tagged or published to crates.io.
 - `Broker` serves a gate over a Unix socket with `SCM_RIGHTS` descriptor passing. `BrokerGate` is the worker client; `fsgate-broker` starts a command with `FSGATE_BROKER_SOCKET`. A lost broker connection makes subsequent client requests fail closed.
 - `Gate::set_audit_sink` delivers one structured event per authority decision, including broker requests and denials the caller discards. Kernel refusals after policy allows are recorded as allow plus errno.
 - Public documentation is required, and the README example is compiled as a doctest in both the checkout and the packaged crate.
+- The crate archive includes the README and MIT license; CI checks the license and tests the unpacked package.
 
 ### Fixed
 
-- Rights denials report the grant selected by routing, including when multiple grants name the same directory, and record the normalized requested path.
+- Rights denials report the grant selected by routing, including when multiple grants name the same directory, and record the normalized requested path ([PR #1](https://github.com/farming-labs/fsgate/pull/1)).
 
 ### Limits
 
