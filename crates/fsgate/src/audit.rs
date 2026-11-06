@@ -25,6 +25,8 @@ pub enum AuditOp {
     Grant,
     /// A grant was revoked.
     Revoke,
+    /// A grant's rights were narrowed (RFC 0005).
+    Narrow,
     /// The gate was locked.
     Lock,
     /// A file open for reading.
@@ -43,6 +45,7 @@ impl AuditOp {
         match self {
             AuditOp::Grant => "grant",
             AuditOp::Revoke => "revoke",
+            AuditOp::Narrow => "narrow",
             AuditOp::Lock => "lock",
             AuditOp::Open => "open",
             AuditOp::Create => "create",
@@ -79,7 +82,8 @@ pub enum AuditReason {
     Ok,
     /// No grant covered the path.
     NoGrant,
-    /// The covering grant lacked a needed right.
+    /// The covering grant lacked a needed right. For `narrow`, the
+    /// requested set named a right the grant does not hold.
     RightsExceeded,
     /// The requested path was not absolute.
     NotAbsolute,
@@ -87,7 +91,7 @@ pub enum AuditReason {
     Locked,
     /// Kernel containment was unavailable or failed to apply.
     Unsupported,
-    /// The revoked grant did not exist.
+    /// The revoked or narrowed grant did not exist.
     UnknownGrant,
 }
 
@@ -114,7 +118,7 @@ pub struct AuditEvent {
     /// The operation.
     pub op: AuditOp,
     /// The normalized requested path; the grant's path for
-    /// `grant`/`revoke`; `None` for `lock`.
+    /// `grant`/`revoke`/`narrow`; `None` for `lock`.
     pub path: Option<PathBuf>,
     /// The matched grant's id, when one matched.
     pub grant: Option<usize>,

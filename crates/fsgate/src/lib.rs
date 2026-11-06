@@ -54,8 +54,8 @@ pub use cap_std::fs::{Metadata, ReadDir};
 
 /// A set of rights attached to a grant.
 ///
-/// Rights only narrow: a grant is created with a fixed set and nothing can
-/// widen it afterwards.
+/// Rights only narrow: nothing widens a grant after it is created, and
+/// [`Gate::narrow`] removes rights from a live grant.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Rights(u8);
 
@@ -153,6 +153,20 @@ pub enum GateError {
         /// The attempted operation.
         op: String,
     },
+    /// [`Gate::narrow`] named a right the grant does not hold. Narrowing
+    /// never adds rights; the grant is unchanged.
+    #[error(
+        "grant for `{grant_path}` holds {held:?}, not {extra:?}; \
+         narrow it to a subset of its current rights"
+    )]
+    WouldWiden {
+        /// The path of the grant.
+        grant_path: PathBuf,
+        /// The rights the grant holds.
+        held: Rights,
+        /// The requested rights the grant does not hold.
+        extra: Rights,
+    },
     /// The [`Grant`] was already revoked or belongs to another gate.
     #[error("grant was already revoked or does not belong to this gate")]
     UnknownGrant,
@@ -212,7 +226,7 @@ pub enum LockStatus {
     LibraryOnly,
 }
 
-/// Handle to one grant inside a [`Gate`], used to revoke it.
+/// Handle to one grant inside a [`Gate`], used to narrow or revoke it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Grant {
     index: usize,
@@ -405,6 +419,61 @@ impl Gate {
                 Err(GateError::UnknownGrant)
             }
         }
+    }
+
+    /// Narrows a grant to `rights`, which must be a subset of the rights it
+    /// holds (RFC 0005). The grant keeps its id and its held descriptor;
+    /// nothing re-resolves its path.
+    ///
+    /// Allowed after [`lock`](Gate::lock), because narrowing only removes
+    /// authority. A grant narrowed before the lock is enforced by the kernel
+    /// at its narrowed rights. After the lock the kernel rules are fixed:
+    /// narrowing then binds operations through this `Gate`, but code
+    /// bypassing the gate keeps whatever the kernel ruleset allowed, as with
+    /// [`revoke`](Gate::revoke).
+    ///
+    /// Fails with [`GateError::WouldWiden`] if `rights` names a right the
+    /// grant does not hold, and with [`GateError::UnknownGrant`] if the grant
+    /// was revoked. Either way the grant is unchanged.
+    pub fn narrow(&mut self, grant: Grant, rights: Rights) -> Result<(), GateError> {
+        let Some(Some(entry)) = self.grants.get_mut(grant.index) else {
+            self.emit(
+                AuditOp::Narrow,
+                None,
+                Some(grant.index),
+                AuditDecision::Deny,
+                AuditReason::UnknownGrant,
+                None,
+            );
+            return Err(GateError::UnknownGrant);
+        };
+        let held = entry.rights;
+        let path = entry.path.clone();
+        if !held.contains(rights) {
+            self.emit(
+                AuditOp::Narrow,
+                Some(&path),
+                Some(grant.index),
+                AuditDecision::Deny,
+                AuditReason::RightsExceeded,
+                None,
+            );
+            return Err(GateError::WouldWiden {
+                grant_path: path,
+                held,
+                extra: rights.missing_from(held),
+            });
+        }
+        entry.rights = rights;
+        self.emit(
+            AuditOp::Narrow,
+            Some(&path),
+            Some(grant.index),
+            AuditDecision::Allow,
+            AuditReason::Ok,
+            None,
+        );
+        Ok(())
     }
 
     /// Opens an existing file for reading. Needs [`Rights::READ`].
