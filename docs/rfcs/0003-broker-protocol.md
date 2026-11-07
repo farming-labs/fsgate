@@ -25,6 +25,11 @@ Every message is a 4-byte little-endian length followed by that many
 bytes of JSON. Frames above 1 MiB are a protocol violation; the receiver
 fails the connection closed. A response that carries a file descriptor
 attaches exactly one via `SCM_RIGHTS` ancillary data on the same message.
+The receiver marks every received descriptor close-on-exec, so a
+delivered file does not leak into programs the worker starts. Linux
+does this atomically with `MSG_CMSG_CLOEXEC`; other platforms set
+`FD_CLOEXEC` right after `recvmsg`, so a thread that forks and execs in
+that window can still inherit the descriptor.
 The client is strictly lockstep: one request, then its response.
 
 ### Messages
