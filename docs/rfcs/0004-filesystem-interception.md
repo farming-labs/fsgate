@@ -301,12 +301,12 @@ to unsandboxed execution.
 Use the existing `seccompiler` decision for filter construction and safe
 `rustix` operations where available. As of `seccompiler` 0.5.0 it cannot
 express `SECCOMP_RET_USER_NOTIF` or install a filter with
-`SECCOMP_FILTER_FLAG_NEW_LISTENER`, so the step 1 probe writes its
+`SECCOMP_FILTER_FLAG_NEW_LISTENER`, so the step 1 probe wrote its
 notification filter by hand; settle the filter builder before the launcher.
 The allowlist needs a per-syscall errno as well (`ENOSYS` for `clone3`, so
 libc falls back to the checked `clone`), which `seccompiler` cannot express
-either, so the probe builds both filters itself and checks them with a BPF
-evaluator in its unit tests. Static glibc reads limits with `prlimit64` and
+either, so the launcher (`fsgate::intercept`, formerly the probe) builds
+both filters itself and checks them with a BPF evaluator in its unit tests. Static glibc reads limits with `prlimit64` and
 `fstat`s with `newfstatat`, which are not on the list above; both fail with
 `EOPNOTSUPP` and glibc falls back to its defaults. The profile's strict `O_PATH` resolver
 is a deliberate extension of ADR 0001: the current public cap-std open

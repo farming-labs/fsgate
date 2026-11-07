@@ -1,4 +1,4 @@
-//! Raw Linux interfaces for the probe: seccomp user notifications, the
+//! Raw Linux interfaces for the launcher: seccomp user notifications, the
 //! Landlock ruleset syscalls, and the setup that runs in the forked child
 //! before exec.
 //!
@@ -31,7 +31,7 @@ use std::ptr;
 
 use libc::{c_long, c_ulong};
 
-use crate::filters::RESERVED_IMAGE_FD;
+use super::filters::RESERVED_IMAGE_FD;
 
 /// Byte the child writes once both filters are installed.
 pub(crate) const RESTRICTED_BYTE: u8 = b'r';

@@ -35,9 +35,10 @@ only with merged PR evidence.
 
 ## Verify the candidate
 
-Run from the workspace root. The workspace also holds `intercept-probe`,
-an unpublished Linux test crate, so packaging and publishing name
-`-p fsgate` explicitly; the checks below cover both crates.
+Run from the workspace root. Packaging and publishing name `-p fsgate`
+explicitly. The experimental interception code builds only with
+`--features experimental-intercept`, so CI also checks that feature on
+Linux; run its tests on Linux x86_64 with a C compiler and static libc.
 
 ```sh
 cargo fmt --all --check

@@ -12,6 +12,11 @@
 //! and emits exactly one audit event, including for requests refused
 //! before any grant is matched.
 //!
+//! [`Launch`] (x86_64 only) is the launcher and supervisor that does all of
+//! this for a static worker binary: it checks the image, starts the worker
+//! under Landlock and two seccomp filters, copies each notified request,
+//! and answers it through `open_intercepted`.
+//!
 //! The strict open never opens anything for I/O until it knows the object
 //! is a regular file outside procfs and sysfs, and what it opens is the
 //! object it checked: it resolves an `O_PATH` handle beneath the grant with
@@ -31,6 +36,17 @@ use rustix::io::Errno;
 use rustix::path::DecInt;
 
 use crate::AuditReason;
+
+#[cfg(target_arch = "x86_64")]
+mod filters;
+#[cfg(target_arch = "x86_64")]
+mod launch;
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_code)]
+mod sys;
+
+#[cfg(target_arch = "x86_64")]
+pub use launch::{Launch, Outcome};
 
 /// `SYSFS_MAGIC` from `linux/magic.h`.
 const SYSFS_MAGIC: FsWord = 0x6265_6572;

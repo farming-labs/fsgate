@@ -1,5 +1,5 @@
 /*
- * Worker fixture for the RFC 0004 probe. Built with `cc -static`, so it has
+ * Worker fixture for the RFC 0004 launcher tests. Built with `cc -static`, so it has
  * no PT_INTERP and does not link fsgate: every open below is an ordinary libc
  * call or a raw syscall that the supervisor sees only through seccomp.
  *
@@ -23,13 +23,13 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-/* The probe moves the worker image to this descriptor number before the
+/* The launcher moves the worker image to this descriptor number before the
  * allowlist; tests aim reused descriptors and paths at it. */
 #define RESERVED_IMAGE_FD 1000
 
 /* `struct open_how` from linux/openat2.h, redeclared to avoid clashing
  * with libc headers that define it too. */
-struct probe_open_how {
+struct worker_open_how {
     uint64_t flags;
     uint64_t mode;
     uint64_t resolve;
@@ -87,7 +87,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (strcmp(op, "openat2") == 0) {
-        struct probe_open_how how = {0};
+        struct worker_open_how how = {0};
         how.flags = O_RDONLY;
         how.resolve = argc > 3 ? strtoull(argv[3], NULL, 0) : 0;
         long fd = syscall(SYS_openat2, AT_FDCWD, path, &how, sizeof how);

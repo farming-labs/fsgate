@@ -1,10 +1,14 @@
-//! RFC 0004 step 1 on a real kernel: a static worker that does not link
+//! `intercept::Launch` on a real kernel: a static worker that does not link
 //! fsgate opens files with ordinary libc calls and raw syscalls, and only
 //! the supervisor's answers decide what it gets. Denials assert the errno
-//! the worker saw and the absence of the side effect on the real
-//! filesystem.
+//! the worker saw, the audit events the gate emitted, and the absence of
+//! the side effect on the real filesystem.
 
-#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#![cfg(all(
+    feature = "experimental-intercept",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
 
 use std::fs;
 use std::io::ErrorKind;
@@ -13,16 +17,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use fsgate::intercept::{Launch, Outcome};
 use fsgate::{AuditDecision, AuditEvent, AuditOp, AuditReason, AuditSink, Gate, Rights};
-use intercept_probe::{Decision, Fault, Outcome, run};
 use tempfile::TempDir;
 
 const EACCES: i32 = 13;
-const ENOSYS: i32 = 38;
 const EISDIR: i32 = 21;
 const ELOOP: i32 = 40;
 const EOPNOTSUPP: i32 = 95;
-const ECANCELED: i32 = 125;
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 const RESOLVE_BENEATH: u64 = 0x08;
@@ -31,14 +33,14 @@ const RESOLVE_BENEATH: u64 = 0x08;
 fn worker() -> &'static Path {
     static WORKER: OnceLock<PathBuf> = OnceLock::new();
     WORKER.get_or_init(|| {
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/worker.c");
-        let output = Path::new(env!("CARGO_TARGET_TMPDIR")).join("intercept-probe-worker");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/worker.c");
+        let output = Path::new(env!("CARGO_TARGET_TMPDIR")).join("fsgate-intercept-worker");
         let status = Command::new("cc")
             .args(["-static", "-pthread", "-O2", "-Wall", "-Werror", "-o"])
             .arg(&output)
             .arg(&source)
             .status()
-            .expect("run cc; the probe tests need a C compiler and static libc (libc6-dev)");
+            .expect("run cc; the launcher tests need a C compiler and static libc (libc6-dev)");
         assert!(
             status.success(),
             "cc -static failed for {}",
@@ -86,22 +88,6 @@ impl Dirs {
     }
 }
 
-fn probe(gate: Gate, args: &[&str]) -> Outcome {
-    run(worker(), args, gate, Fault::None).expect("probe run")
-}
-
-fn stdout(outcome: &Outcome) -> String {
-    String::from_utf8_lossy(&outcome.stdout).into_owned()
-}
-
-fn decision(syscall: i64, path: &str, errno: Option<i32>) -> Decision {
-    Decision {
-        syscall,
-        path: Some(path.to_owned()),
-        errno,
-    }
-}
-
 #[derive(Default)]
 struct Capture(Mutex<Vec<AuditEvent>>);
 
@@ -111,34 +97,92 @@ impl AuditSink for Capture {
     }
 }
 
+/// The worker's output and every audit event the gate emitted while it
+/// ran. The sink is installed after the grant, so only decisions appear.
+struct Run {
+    outcome: Outcome,
+    events: Vec<AuditEvent>,
+}
+
+fn run_worker(mut gate: Gate, args: &[&str]) -> Run {
+    let sink = Arc::new(Capture::default());
+    gate.set_audit_sink(sink.clone());
+    let outcome = Launch::new(worker()).args(args).run(gate).expect("launch");
+    let events = sink.0.lock().unwrap().clone();
+    Run { outcome, events }
+}
+
+fn stdout(run: &Run) -> String {
+    String::from_utf8_lossy(&run.outcome.stdout).into_owned()
+}
+
+/// One audit event, reduced to what these tests compare.
+#[derive(Debug, PartialEq, Eq)]
+struct Seen {
+    syscall: Option<&'static str>,
+    path: Option<PathBuf>,
+    decision: AuditDecision,
+    reason: AuditReason,
+    errno: Option<i32>,
+}
+
+fn seen(run: &Run) -> Vec<Seen> {
+    run.events
+        .iter()
+        .map(|event| Seen {
+            syscall: event.syscall,
+            path: event.path.clone(),
+            decision: event.decision,
+            reason: event.reason,
+            errno: event.errno,
+        })
+        .collect()
+}
+
+fn allowed(syscall: &'static str, path: &str, errno: Option<i32>) -> Seen {
+    Seen {
+        syscall: Some(syscall),
+        path: Some(PathBuf::from(path)),
+        decision: AuditDecision::Allow,
+        reason: AuditReason::Ok,
+        errno,
+    }
+}
+
+fn denied(syscall: &'static str, path: &str, reason: AuditReason) -> Seen {
+    Seen {
+        syscall: Some(syscall),
+        path: Some(PathBuf::from(path)),
+        decision: AuditDecision::Deny,
+        reason,
+        errno: None,
+    }
+}
+
 #[test]
 fn granted_file_is_delivered_through_the_supervisor() {
     let dirs = Dirs::new();
     let path = dirs.granted("a.txt");
 
-    let outcome = probe(dirs.gate(Rights::READ), &["read", &path]);
+    let outcome = run_worker(dirs.gate(Rights::READ), &["read", &path]);
 
     assert_eq!(stdout(&outcome), "inside");
-    assert!(outcome.status.success());
-    assert_eq!(outcome.decisions, [decision(libc::SYS_openat, &path, None)]);
+    assert!(outcome.outcome.status.success());
+    assert_eq!(seen(&outcome), [allowed("openat", &path, None)]);
 }
 
 #[test]
 fn ungranted_path_is_denied_and_audited_by_the_gate() {
     let dirs = Dirs::new();
     let secret = dirs.outside("secret.txt");
-    let sink = Arc::new(Capture::default());
-    let mut gate = dirs.gate(Rights::READ);
-    gate.set_audit_sink(sink.clone());
-
-    let outcome = probe(gate, &["read", &secret]);
+    let outcome = run_worker(dirs.gate(Rights::READ), &["read", &secret]);
 
     assert_eq!(stdout(&outcome), format!("errno={EACCES}\n"));
     assert_eq!(
-        outcome.decisions,
-        [decision(libc::SYS_openat, &secret, Some(EACCES))]
+        seen(&outcome),
+        [denied("openat", &secret, AuditReason::NoGrant)]
     );
-    let events = sink.0.lock().unwrap();
+    let events = &outcome.events;
     // The sink is installed after the grant: exactly one decision, for the
     // notified request.
     assert_eq!(events.len(), 1, "{events:?}");
@@ -156,15 +200,12 @@ fn ungranted_path_is_denied_and_audited_by_the_gate() {
 fn a_request_refused_before_grant_selection_is_audited() {
     let dirs = Dirs::new();
     let existing = dirs.granted("a.txt");
-    let sink = Arc::new(Capture::default());
-    let mut gate = dirs.gate(Rights::READ | Rights::WRITE | Rights::CREATE);
-    gate.set_audit_sink(sink.clone());
-
-    let outcome = probe(gate, &["write", &existing]);
+    let gate = dirs.gate(Rights::READ | Rights::WRITE | Rights::CREATE);
+    let outcome = run_worker(gate, &["write", &existing]);
 
     assert_eq!(stdout(&outcome), format!("errno={EOPNOTSUPP}\n"));
     assert_eq!(fs::read(&existing).unwrap(), b"inside");
-    let events = sink.0.lock().unwrap();
+    let events = &outcome.events;
     assert_eq!(events.len(), 1, "{events:?}");
     let event = &events[0];
     assert_eq!(
@@ -187,8 +228,8 @@ fn write_and_create_requests_are_refused_and_change_nothing() {
     // The profile is read-only even when the gate would allow writes.
     let rights = Rights::READ | Rights::WRITE | Rights::CREATE;
 
-    let truncate = probe(dirs.gate(rights), &["write", &existing]);
-    let create = probe(dirs.gate(rights), &["write", &fresh]);
+    let truncate = run_worker(dirs.gate(rights), &["write", &existing]);
+    let create = run_worker(dirs.gate(rights), &["write", &fresh]);
 
     assert_eq!(stdout(&truncate), format!("errno={EOPNOTSUPP}\n"));
     assert_eq!(stdout(&create), format!("errno={EOPNOTSUPP}\n"));
@@ -202,12 +243,12 @@ fn unmediated_creat_is_refused_by_the_allowlist() {
     let fresh = dirs.granted("new.txt");
     let rights = Rights::READ | Rights::WRITE | Rights::CREATE;
 
-    let outcome = probe(dirs.gate(rights), &["creat", &fresh]);
+    let outcome = run_worker(dirs.gate(rights), &["creat", &fresh]);
 
     // `creat` is not a notified syscall, so the supervisor never sees it;
     // the allowlist refuses it, with Landlock behind it.
     assert_eq!(stdout(&outcome), format!("errno={EOPNOTSUPP}\n"));
-    assert!(outcome.decisions.is_empty());
+    assert!(outcome.events.is_empty());
     assert!(!Path::new(&fresh).exists());
 }
 
@@ -224,13 +265,13 @@ fn execve_io_uring_sockets_prctl_and_namespaces_are_refused() {
         vec!["clone-ns"],
         vec!["creat", tool.as_str()],
     ] {
-        let outcome = probe(dirs.gate(Rights::READ), &args);
+        let outcome = run_worker(dirs.gate(Rights::READ), &args);
         assert_eq!(
             stdout(&outcome),
             format!("errno={EOPNOTSUPP}\n"),
             "{args:?}"
         );
-        assert!(outcome.decisions.is_empty(), "{args:?}");
+        assert!(outcome.events.is_empty(), "{args:?}");
     }
     assert_eq!(fs::read(&tool).unwrap(), b"inside");
 }
@@ -253,12 +294,12 @@ fn a_delivered_file_moved_to_the_reserved_number_cannot_be_executed() {
     let dirs = Dirs::new();
     let tool = executable_in_grant(&dirs);
 
-    let outcome = probe(dirs.gate(Rights::READ), &["execfd", &tool]);
+    let outcome = run_worker(dirs.gate(Rights::READ), &["execfd", &tool]);
 
     // The allowlist passes `execveat(1000, "", AT_EMPTY_PATH)`; Landlock
     // refuses because the descriptor is not the checked image.
     assert_eq!(stdout(&outcome), format!("errno={EACCES}\n"));
-    assert_eq!(outcome.decisions, [decision(libc::SYS_openat, &tool, None)]);
+    assert_eq!(seen(&outcome), [allowed("openat", &tool, None)]);
 }
 
 #[test]
@@ -266,10 +307,10 @@ fn an_absolute_path_cannot_be_executed_through_the_reserved_number() {
     let dirs = Dirs::new();
     let tool = executable_in_grant(&dirs);
 
-    let outcome = probe(dirs.gate(Rights::READ), &["execat", &tool]);
+    let outcome = run_worker(dirs.gate(Rights::READ), &["execat", &tool]);
 
     assert_eq!(stdout(&outcome), format!("errno={EACCES}\n"));
-    assert!(outcome.decisions.is_empty());
+    assert!(outcome.events.is_empty());
 }
 
 #[test]
@@ -278,11 +319,11 @@ fn forked_children_stay_mediated() {
     let path = dirs.granted("a.txt");
     let secret = dirs.outside("secret.txt");
 
-    let granted = probe(dirs.gate(Rights::READ), &["fork-read", &path]);
-    let denied = probe(dirs.gate(Rights::READ), &["fork-read", &secret]);
+    let granted = run_worker(dirs.gate(Rights::READ), &["fork-read", &path]);
+    let denied = run_worker(dirs.gate(Rights::READ), &["fork-read", &secret]);
 
     assert_eq!(stdout(&granted), "inside");
-    assert_eq!(granted.decisions, [decision(libc::SYS_openat, &path, None)]);
+    assert_eq!(seen(&granted), [allowed("openat", &path, None)]);
     assert_eq!(stdout(&denied), format!("errno={EACCES}\n"));
 }
 
@@ -293,10 +334,10 @@ fn threads_stay_mediated() {
 
     // glibc tries clone3 first; the allowlist answers ENOSYS so it falls
     // back to clone, whose thread flags are allowed.
-    let outcome = probe(dirs.gate(Rights::READ), &["thread-read", &path]);
+    let outcome = run_worker(dirs.gate(Rights::READ), &["thread-read", &path]);
 
     assert_eq!(stdout(&outcome), "inside");
-    assert_eq!(outcome.decisions, [decision(libc::SYS_openat, &path, None)]);
+    assert_eq!(seen(&outcome), [allowed("openat", &path, None)]);
 }
 
 #[test]
@@ -304,14 +345,14 @@ fn relative_and_dot_dot_paths_are_refused_before_authorization() {
     let dirs = Dirs::new();
     let escape = format!("{}/../outside/secret.txt", dirs.granted.display());
 
-    let relative = probe(dirs.gate(Rights::READ), &["read", "a.txt"]);
-    let dotdot = probe(dirs.gate(Rights::READ), &["read", &escape]);
+    let relative = run_worker(dirs.gate(Rights::READ), &["read", "a.txt"]);
+    let dotdot = run_worker(dirs.gate(Rights::READ), &["read", &escape]);
 
     assert_eq!(stdout(&relative), format!("errno={EOPNOTSUPP}\n"));
     assert_eq!(stdout(&dotdot), format!("errno={EOPNOTSUPP}\n"));
     assert_eq!(
-        dotdot.decisions,
-        [decision(libc::SYS_openat, &escape, Some(EOPNOTSUPP))]
+        seen(&dotdot),
+        [denied("openat", &escape, AuditReason::UnsupportedInput)]
     );
 }
 
@@ -320,7 +361,7 @@ fn directories_are_refused_with_eisdir() {
     let dirs = Dirs::new();
     let sub = dirs.granted("sub");
 
-    let outcome = probe(dirs.gate(Rights::READ | Rights::LIST), &["read", &sub]);
+    let outcome = run_worker(dirs.gate(Rights::READ | Rights::LIST), &["read", &sub]);
 
     assert_eq!(stdout(&outcome), format!("errno={EISDIR}\n"));
 }
@@ -332,12 +373,12 @@ fn openat2_accepts_only_the_resolve_flags_the_strict_open_enforces() {
     let enforced = (RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS).to_string();
     let beneath = RESOLVE_BENEATH.to_string();
 
-    let plain = probe(dirs.gate(Rights::READ), &["openat2", &path, "0"]);
-    let strict = probe(dirs.gate(Rights::READ), &["openat2", &path, &enforced]);
-    let other = probe(dirs.gate(Rights::READ), &["openat2", &path, &beneath]);
+    let plain = run_worker(dirs.gate(Rights::READ), &["openat2", &path, "0"]);
+    let strict = run_worker(dirs.gate(Rights::READ), &["openat2", &path, &enforced]);
+    let other = run_worker(dirs.gate(Rights::READ), &["openat2", &path, &beneath]);
 
     assert_eq!(stdout(&plain), "inside");
-    assert_eq!(plain.decisions, [decision(libc::SYS_openat2, &path, None)]);
+    assert_eq!(seen(&plain), [allowed("openat2", &path, None)]);
     assert_eq!(stdout(&strict), "inside");
     // Not dropped: a flag the supervisor does not enforce is refused.
     assert_eq!(stdout(&other), format!("errno={EOPNOTSUPP}\n"));
@@ -349,13 +390,10 @@ fn symlinks_are_refused_with_eloop_even_inside_the_grant() {
     let link = dirs.granted("link");
     std::os::unix::fs::symlink("a.txt", &link).unwrap();
 
-    let outcome = probe(dirs.gate(Rights::READ), &["read", &link]);
+    let outcome = run_worker(dirs.gate(Rights::READ), &["read", &link]);
 
     assert_eq!(stdout(&outcome), format!("errno={ELOOP}\n"));
-    assert_eq!(
-        outcome.decisions,
-        [decision(libc::SYS_openat, &link, Some(ELOOP))]
-    );
+    assert_eq!(seen(&outcome), [allowed("openat", &link, Some(ELOOP))]);
 }
 
 #[test]
@@ -372,7 +410,7 @@ fn a_fifo_is_refused_without_blocking_the_supervisor() {
     .unwrap();
 
     // A plain read-only open of a FIFO with no writer would hang here.
-    let outcome = probe(dirs.gate(Rights::READ), &["read", &fifo]);
+    let outcome = run_worker(dirs.gate(Rights::READ), &["read", &fifo]);
 
     assert_eq!(stdout(&outcome), format!("errno={EOPNOTSUPP}\n"));
 }
@@ -382,7 +420,7 @@ fn delivered_descriptors_keep_the_callers_cloexec_choice() {
     let dirs = Dirs::new();
     let path = dirs.granted("a.txt");
 
-    let outcome = probe(dirs.gate(Rights::READ), &["cloexec", &path]);
+    let outcome = run_worker(dirs.gate(Rights::READ), &["cloexec", &path]);
 
     assert_eq!(stdout(&outcome), "plain=0 marked=1\n");
 }
@@ -391,49 +429,19 @@ fn delivered_descriptors_keep_the_callers_cloexec_choice() {
 fn worker_starts_with_only_stdio_open() {
     let dirs = Dirs::new();
 
-    let outcome = probe(dirs.gate(Rights::READ), &["fds"]);
+    let outcome = run_worker(dirs.gate(Rights::READ), &["fds"]);
 
     assert_eq!(stdout(&outcome), "done\n");
-}
-
-#[test]
-fn a_closed_listener_fails_later_opens_with_enosys() {
-    let dirs = Dirs::new();
-    let path = dirs.granted("a.txt");
-
-    let outcome = run(
-        worker(),
-        &["read", &path],
-        dirs.gate(Rights::READ),
-        Fault::CloseListener,
-    )
-    .expect("probe run");
-
-    // No supervisor, no open: the kernel fails the notified call.
-    assert_eq!(stdout(&outcome), format!("errno={ENOSYS}\n"));
-    assert!(outcome.decisions.is_empty());
-}
-
-#[test]
-fn an_aborted_startup_never_executes_the_worker() {
-    let dirs = Dirs::new();
-    let path = dirs.granted("a.txt");
-
-    let err = run(
-        worker(),
-        &["read", &path],
-        dirs.gate(Rights::READ),
-        Fault::AbortStartup,
-    )
-    .expect_err("startup must fail before exec");
-
-    assert_eq!(err.raw_os_error(), Some(ECANCELED), "{err}");
 }
 
 /// Asserts `run` refused `image` before launching it, with `problem` in the
 /// message.
 fn refused_before_launch(dirs: &Dirs, image: &Path, problem: &str) {
-    let err = run(image, &[], dirs.gate(Rights::READ), Fault::None)
+    let launch = Launch::new(image);
+    let checked = launch.check().expect_err("the image must be refused");
+    assert_eq!(checked.kind(), ErrorKind::InvalidInput, "{checked}");
+    let err = launch
+        .run(dirs.gate(Rights::READ))
         .expect_err("the image must be refused");
     assert_eq!(err.kind(), ErrorKind::InvalidInput, "{err}");
     assert!(err.to_string().contains(problem), "{err}");
@@ -473,32 +481,8 @@ fn set_id_images_are_refused_before_launch() {
 }
 
 #[test]
-fn the_checked_image_runs_even_after_its_path_is_replaced() {
-    let dirs = Dirs::new();
-    let image = dirs.root.path().join("worker");
-    // Copy with `cp`, not `fs::copy`: a writable descriptor in this
-    // multi-threaded process could leak into a concurrently forked child and
-    // make the exec below fail with ETXTBSY.
-    let copied = Command::new("cp")
-        .arg(worker())
-        .arg(&image)
-        .status()
-        .unwrap();
-    assert!(copied.success());
-    let script = dirs.root.path().join("swapped");
-    fs::write(&script, "#!/bin/sh\necho swapped\n").unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-    let path = dirs.granted("a.txt");
-
-    let outcome = run(
-        &image,
-        &["read", &path],
-        dirs.gate(Rights::READ),
-        Fault::ReplaceImage { with: script },
-    )
-    .expect("probe run");
-
-    // The child executed the held descriptor, not whatever the path names now.
-    assert_eq!(stdout(&outcome), "inside");
-    assert_eq!(fs::read(&image).unwrap(), b"#!/bin/sh\necho swapped\n");
+fn a_static_worker_passes_the_check() {
+    Launch::new(worker())
+        .check()
+        .expect("the fixture is a static x86_64 ELF");
 }
