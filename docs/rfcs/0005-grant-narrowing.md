@@ -75,15 +75,17 @@ narrow, just as it cannot revoke. Narrow the gate before passing it to
 One event per decision ([RFC 0002](0002-audit-events.md)), with the new
 op `narrow`:
 
-| Outcome | `path` | `grant` | `decision` | `reason` |
-|---|---|---|---|---|
-| Narrowed | the grant's path | its id | `allow` | `ok` |
-| Set names a right the grant lacks | the grant's path | its id | `deny` | `rights_exceeded` |
-| Grant already revoked | `null` | the requested id | `deny` | `unknown_grant` |
-| Grant from another gate | `null` | `null` | `deny` | `unknown_grant` |
+| Outcome | `path` | `grant` | `rights` | `decision` | `reason` |
+|---|---|---|---|---|---|
+| Narrowed | the grant's path | its id | the narrowed set | `allow` | `ok` |
+| Set names a right the grant lacks | the grant's path | its id | the unchanged set | `deny` | `rights_exceeded` |
+| Grant already revoked | `null` | the requested id | `null` | `deny` | `unknown_grant` |
+| Grant from another gate | `null` | `null` | `null` | `deny` | `unknown_grant` |
 
-Format v1 has no rights key, so the event records that a narrowing
-happened, not the resulting set. `grant` events have the same gap.
+The `rights` key is additive within format v1. `grant` events carry it
+too, so a sink can follow a grant's rights from creation through every
+narrowing. The refused set itself is not recorded; `GateError::WouldWiden`
+returns it to the caller.
 
 ### Compatibility
 
@@ -119,8 +121,9 @@ additive for callers.
 
 ## Open questions
 
-- Recording the resulting rights in `grant` and `narrow` audit events.
-  A `rights` key would be additive within format v1.
+- ~~Recording the resulting rights in `grant` and `narrow` audit
+  events.~~ Resolved: both carry a `rights` key, additive within format v1
+  ([RFC 0002](0002-audit-events.md)).
 - ~~`Grant` holds only an index, so a grant from one gate passed to
   another gate's `revoke` or `narrow` acts on whichever grant holds that
   index there.~~ Fixed: each `Grant` records the gate that created it, and

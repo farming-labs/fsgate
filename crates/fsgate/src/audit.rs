@@ -9,6 +9,8 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::Rights;
+
 /// Receives every allow/deny decision a [`Gate`](crate::Gate) makes.
 ///
 /// The embedder owns buffering and backpressure; fsgate calls `event`
@@ -135,6 +137,10 @@ pub struct AuditEvent {
     pub path: Option<PathBuf>,
     /// The matched grant's id, when one matched.
     pub grant: Option<usize>,
+    /// For `grant` and `narrow`, the rights the grant holds after the
+    /// decision; `None` when no grant was created or matched, and for
+    /// every other operation.
+    pub rights: Option<Rights>,
     /// Allow or deny.
     pub decision: AuditDecision,
     /// Why.
@@ -155,6 +161,7 @@ impl AuditEvent {
             "op": self.op.as_str(),
             "path": self.path.as_ref().map(|path| path.to_string_lossy()),
             "grant": self.grant,
+            "rights": self.rights.map(right_names),
             "decision": self.decision.as_str(),
             "reason": self.reason.as_str(),
             "errno": self.errno,
@@ -207,19 +214,33 @@ impl AuditEvent {
 ///
 /// ```
 /// fn fields(event: &fsgate::AuditEvent) {
-///     let fsgate::AuditEvent { ts, op, path, grant, decision, reason, errno, .. } = event;
-///     let _ = (ts, op, path, grant, decision, reason, errno);
+///     let fsgate::AuditEvent { ts, op, path, grant, rights, decision, reason, errno, .. } = event;
+///     let _ = (ts, op, path, grant, rights, decision, reason, errno);
 /// }
 /// ```
 ///
 /// ```compile_fail
 /// fn fields(event: &fsgate::AuditEvent) {
-///     let fsgate::AuditEvent { ts, op, path, grant, decision, reason, errno } = event;
-///     let _ = (ts, op, path, grant, decision, reason, errno);
+///     let fsgate::AuditEvent { ts, op, path, grant, rights, decision, reason, errno } = event;
+///     let _ = (ts, op, path, grant, rights, decision, reason, errno);
 /// }
 /// ```
 #[cfg(doctest)]
 struct ExtensibleTypesDoctest;
+
+/// The RFC 0002 wire names of `rights`, in a fixed order.
+fn right_names(rights: Rights) -> Vec<&'static str> {
+    [
+        (Rights::READ, "read"),
+        (Rights::WRITE, "write"),
+        (Rights::CREATE, "create"),
+        (Rights::LIST, "list"),
+    ]
+    .into_iter()
+    .filter(|(right, _)| rights.contains(*right))
+    .map(|(_, name)| name)
+    .collect()
+}
 
 /// RFC 3339 UTC with milliseconds, from civil-date arithmetic — no
 /// clock/calendar dependency for one format.

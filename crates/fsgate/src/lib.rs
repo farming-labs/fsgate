@@ -327,16 +327,16 @@ impl Gate {
         };
         self.grants.push(Some(GrantEntry { path, dir, rights }));
         let index = self.grants.len() - 1;
-        self.emit(
+        self.emit_rights(
             AuditOp::Grant,
             self.grants[index]
                 .as_ref()
                 .map(|entry| entry.path.clone())
                 .as_deref(),
             Some(index),
+            rights,
             AuditDecision::Allow,
             AuditReason::Ok,
-            None,
         );
         Ok(Grant {
             gate: self.id,
@@ -474,13 +474,13 @@ impl Gate {
         let held = entry.rights;
         let path = entry.path.clone();
         if !held.contains(rights) {
-            self.emit(
+            self.emit_rights(
                 AuditOp::Narrow,
                 Some(&path),
                 index,
+                held,
                 AuditDecision::Deny,
                 AuditReason::RightsExceeded,
-                None,
             );
             return Err(GateError::WouldWiden {
                 grant_path: path,
@@ -489,13 +489,13 @@ impl Gate {
             });
         }
         entry.rights = rights;
-        self.emit(
+        self.emit_rights(
             AuditOp::Narrow,
             Some(&path),
             index,
+            rights,
             AuditDecision::Allow,
             AuditReason::Ok,
-            None,
         );
         Ok(())
     }
@@ -650,9 +650,35 @@ impl Gate {
                 op,
                 path: path.map(Path::to_path_buf),
                 grant,
+                rights: None,
                 decision,
                 reason,
                 errno,
+            });
+        }
+    }
+
+    /// [`emit`](Gate::emit) for a `grant` or `narrow` decision that leaves
+    /// the grant holding `rights`. These decisions never carry an errno.
+    fn emit_rights(
+        &self,
+        op: AuditOp,
+        path: Option<&Path>,
+        grant: Option<usize>,
+        rights: Rights,
+        decision: AuditDecision,
+        reason: AuditReason,
+    ) {
+        if let Some(sink) = &self.audit {
+            sink.event(&AuditEvent {
+                ts: SystemTime::now(),
+                op,
+                path: path.map(Path::to_path_buf),
+                grant,
+                rights: Some(rights),
+                decision,
+                reason,
+                errno: None,
             });
         }
     }
