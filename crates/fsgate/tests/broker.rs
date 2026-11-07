@@ -200,3 +200,58 @@ fn broker_binary_serves_and_dies_closed() {
     let err = client.open(granted.join("a.txt")).unwrap_err();
     assert!(matches!(err, GateError::Broker { .. }), "got {err:?}");
 }
+
+fn broker_usage(args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_fsgate-broker"))
+        .args(args)
+        .output()
+        .expect("run fsgate-broker")
+}
+
+#[test]
+fn interception_flags_do_not_mix_with_socket_mode() {
+    let both = broker_usage(&[
+        "--experimental-intercept",
+        "--socket",
+        "/tmp/unused.sock",
+        "--grant",
+        "/tmp:r",
+        "--",
+        "/bin/true",
+    ]);
+    let stray = broker_usage(&[
+        "--apply",
+        "--socket",
+        "/tmp/unused.sock",
+        "--grant",
+        "/tmp:r",
+        "--",
+        "/bin/true",
+    ]);
+
+    assert_eq!(both.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&both.stderr).contains("separate modes"));
+    assert_eq!(stray.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&stray.stderr).contains("need `--experimental-intercept`"));
+}
+
+#[cfg(not(all(
+    feature = "experimental-intercept",
+    target_os = "linux",
+    target_arch = "x86_64"
+)))]
+#[test]
+fn interception_mode_is_a_usage_error_without_the_feature() {
+    let output = broker_usage(&[
+        "--experimental-intercept",
+        "--grant",
+        "/tmp:r",
+        "--apply",
+        "--",
+        "/bin/true",
+    ]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("interception mode"));
+    assert!(output.stdout.is_empty());
+}
