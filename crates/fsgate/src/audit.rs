@@ -19,7 +19,11 @@ pub trait AuditSink: Send + Sync {
 }
 
 /// The operation an event describes.
+///
+/// Operations grow with the API, so a `match` outside fsgate needs a
+/// wildcard arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AuditOp {
     /// A grant was requested.
     Grant,
@@ -73,7 +77,11 @@ impl AuditDecision {
 }
 
 /// Why the decision came out the way it did.
+///
+/// Reasons grow with the API, so a `match` outside fsgate needs a
+/// wildcard arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AuditReason {
     /// Policy was satisfied.
     Ok,
@@ -107,7 +115,12 @@ impl AuditReason {
 }
 
 /// One authority decision (RFC 0002, format version 1).
+///
+/// Fields may be added without a breaking release, so code outside
+/// fsgate reads fields or destructures with `..`; only a
+/// [`Gate`](crate::Gate) creates events.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct AuditEvent {
     /// When the decision was made.
     pub ts: SystemTime,
@@ -145,6 +158,64 @@ impl AuditEvent {
         value.to_string()
     }
 }
+
+/// Compile checks from outside the crate. Each `compile_fail` block has a
+/// passing twin that differs only by the wildcard or `..`, so an unrelated
+/// compile error cannot satisfy it.
+///
+/// ```
+/// fn op(op: fsgate::AuditOp) {
+///     use fsgate::AuditOp::*;
+///     match op {
+///         Grant | Revoke | Lock | Open | Create | Metadata | ReadDir => {}
+///         _ => {}
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn op(op: fsgate::AuditOp) {
+///     use fsgate::AuditOp::*;
+///     match op {
+///         Grant | Revoke | Lock | Open | Create | Metadata | ReadDir => {}
+///     }
+/// }
+/// ```
+///
+/// ```
+/// fn reason(reason: fsgate::AuditReason) {
+///     use fsgate::AuditReason::*;
+///     match reason {
+///         Ok | NoGrant | RightsExceeded | NotAbsolute | Locked | Unsupported | UnknownGrant => {}
+///         _ => {}
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn reason(reason: fsgate::AuditReason) {
+///     use fsgate::AuditReason::*;
+///     match reason {
+///         Ok | NoGrant | RightsExceeded | NotAbsolute | Locked | Unsupported | UnknownGrant => {}
+///     }
+/// }
+/// ```
+///
+/// ```
+/// fn fields(event: &fsgate::AuditEvent) {
+///     let fsgate::AuditEvent { ts, op, path, grant, decision, reason, errno, .. } = event;
+///     let _ = (ts, op, path, grant, decision, reason, errno);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn fields(event: &fsgate::AuditEvent) {
+///     let fsgate::AuditEvent { ts, op, path, grant, decision, reason, errno } = event;
+///     let _ = (ts, op, path, grant, decision, reason, errno);
+/// }
+/// ```
+#[cfg(doctest)]
+struct ExtensibleTypesDoctest;
 
 /// RFC 3339 UTC with milliseconds, from civil-date arithmetic — no
 /// clock/calendar dependency for one format.

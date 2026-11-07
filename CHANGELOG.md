@@ -13,6 +13,7 @@ Prepared for the initial signed-tag release. Not yet tagged or published to crat
 - `revoke(grant)` removes a grant from subsequent gate operations, including after a lock. Already opened files and installed kernel rules are not revoked.
 - `Broker` serves a gate over a Unix socket with `SCM_RIGHTS` descriptor passing. `BrokerGate` is the worker client; `fsgate-broker` starts a command with `FSGATE_BROKER_SOCKET`. A lost broker connection makes subsequent client requests fail closed.
 - `Gate::set_audit_sink` delivers one structured event per authority decision, including broker requests and denials the caller discards. Kernel refusals after policy allows are recorded as allow plus errno.
+- `AuditOp`, `AuditReason`, and `AuditEvent` are `#[non_exhaustive]`, so later releases can add operations, reasons, and fields without breaking callers. Matches outside fsgate need a wildcard arm, and only a `Gate` creates events. `AuditDecision` stays exhaustive.
 - Public documentation is required, and the README example is compiled as a doctest in both the checkout and the packaged crate.
 - The crate archive includes the README and MIT license; CI checks the license and tests the unpacked package.
 
