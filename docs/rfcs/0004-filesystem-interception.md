@@ -297,7 +297,10 @@ release version is assigned. Selecting interception must never fall back
 to unsandboxed execution.
 
 Use the existing `seccompiler` decision for filter construction and safe
-`rustix` operations where available. The profile's strict `O_PATH` resolver
+`rustix` operations where available. As of `seccompiler` 0.5.0 it cannot
+express `SECCOMP_RET_USER_NOTIF` or install a filter with
+`SECCOMP_FILTER_FLAG_NEW_LISTENER`, so the step 1 probe writes its
+notification filter by hand; settle the filter builder before the launcher. The profile's strict `O_PATH` resolver
 is a deliberate extension of ADR 0001: the current public cap-std open
 cannot reject special objects before opening them for I/O. Keep routing
 and rights checks shared; do not replace the existing cap-std operations.

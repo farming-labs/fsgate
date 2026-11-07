@@ -34,7 +34,9 @@ only with merged PR evidence.
 
 ## Verify the candidate
 
-Run from the workspace root:
+Run from the workspace root. The workspace also holds `intercept-probe`,
+an unpublished Linux test crate, so packaging and publishing name
+`-p fsgate` explicitly; the checks below cover both crates.
 
 ```sh
 cargo fmt --all --check
@@ -50,7 +52,7 @@ checkout and test the archive outside the repository. In a separate shell:
 
 ```sh
 set -eu
-cargo package --locked
+cargo package --locked -p fsgate
 package_dir=$(mktemp -d)
 trap 'rm -rf "$package_dir"' EXIT
 tar -xzf "target/package/fsgate-$version.crate" -C "$package_dir"
@@ -108,8 +110,8 @@ set -eu
 git checkout --detach "v$version"
 test "$(git rev-parse HEAD)" = "$release_sha"
 git status --short
-cargo publish --locked --dry-run
-cargo publish --locked
+cargo publish --locked -p fsgate --dry-run
+cargo publish --locked -p fsgate
 ```
 
 `git status --short` must print nothing; never pass `--allow-dirty`. The

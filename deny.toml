@@ -18,6 +18,9 @@ yanked = "deny"
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Path dependencies of unpublished crates (`intercept-probe`) need no
+# version; published crates still may not use wildcards.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
