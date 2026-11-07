@@ -242,6 +242,10 @@ fn json_lines_match_the_rfc_shape() {
     assert_eq!(value["decision"], "allow");
     assert_eq!(value["reason"], "ok");
     assert_eq!(value["grant"], 0);
+    assert!(
+        value["rights"].is_null(),
+        "only grant and narrow carry rights"
+    );
     assert!(value["errno"].is_null());
     let ts = value["ts"].as_str().unwrap();
     assert!(
@@ -318,4 +322,50 @@ fn a_grant_from_another_gate_is_denied_without_naming_a_grant_here() {
         // not name it.
         assert_eq!(event.grant, None);
     }
+}
+
+#[test]
+fn grant_and_narrow_events_record_the_rights_the_grant_holds_after() {
+    let (_root, granted, _) = setup();
+    let (mut gate, sink) = audited_gate(&granted, Rights::READ);
+    let none = Rights::from_bits_truncate(0);
+
+    let grant = gate.grant(&granted, Rights::READ | Rights::WRITE).unwrap();
+    gate.narrow(grant, Rights::READ).unwrap();
+    // Denied: widens. The grant keeps READ, and the event says so.
+    let _ = gate.narrow(grant, Rights::READ | Rights::WRITE);
+    gate.narrow(grant, none).unwrap();
+    gate.revoke(grant).unwrap();
+    // Denied: revoked, so no grant holds anything.
+    let _ = gate.narrow(grant, none);
+    // Denied: no grant is created.
+    let _ = gate.grant("relative", Rights::READ);
+
+    let events = sink.events();
+    let seen: Vec<_> = events
+        .iter()
+        .map(|event| (event.op, event.decision, event.rights))
+        .collect();
+    use AuditDecision::{Allow, Deny};
+    assert_eq!(
+        seen,
+        [
+            (AuditOp::Grant, Allow, Some(Rights::READ)),
+            (AuditOp::Grant, Allow, Some(Rights::READ | Rights::WRITE)),
+            (AuditOp::Narrow, Allow, Some(Rights::READ)),
+            (AuditOp::Narrow, Deny, Some(Rights::READ)),
+            (AuditOp::Narrow, Allow, Some(none)),
+            (AuditOp::Revoke, Allow, None),
+            (AuditOp::Narrow, Deny, None),
+            (AuditOp::Grant, Deny, None),
+        ]
+    );
+
+    let rights_json = |index: usize| {
+        let value: serde_json::Value = serde_json::from_str(&events[index].to_json_line()).unwrap();
+        value["rights"].clone()
+    };
+    assert_eq!(rights_json(1), serde_json::json!(["read", "write"]));
+    assert_eq!(rights_json(4), serde_json::json!([]));
+    assert!(rights_json(5).is_null());
 }
