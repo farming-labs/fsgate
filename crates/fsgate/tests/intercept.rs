@@ -203,9 +203,10 @@ mod dispatcher {
         (gate, sink)
     }
 
-    /// The events after the setup `grant` event.
+    /// Every captured event. The sink is installed after the setup grant,
+    /// so these are the dispatcher's decisions only.
     fn decisions(sink: &Capture) -> Vec<AuditEvent> {
-        sink.0.lock().unwrap()[1..].to_vec()
+        sink.0.lock().unwrap().clone()
     }
 
     #[test]

@@ -137,9 +137,10 @@ fn ungranted_path_is_denied_and_audited_by_the_gate() {
         [decision(libc::SYS_openat, &secret, Some(EACCES))]
     );
     let events = sink.0.lock().unwrap();
-    // The grant itself, then exactly one decision for the notified request.
-    assert_eq!(events.len(), 2, "{events:?}");
-    let event = &events[1];
+    // The sink is installed after the grant: exactly one decision, for the
+    // notified request.
+    assert_eq!(events.len(), 1, "{events:?}");
+    let event = &events[0];
     assert_eq!(
         (event.op, event.decision, event.reason),
         (AuditOp::Open, AuditDecision::Deny, AuditReason::NoGrant)
@@ -162,8 +163,8 @@ fn a_request_refused_before_grant_selection_is_audited() {
     assert_eq!(stdout(&outcome), format!("errno={EOPNOTSUPP}\n"));
     assert_eq!(fs::read(&existing).unwrap(), b"inside");
     let events = sink.0.lock().unwrap();
-    assert_eq!(events.len(), 2, "{events:?}");
-    let event = &events[1];
+    assert_eq!(events.len(), 1, "{events:?}");
+    let event = &events[0];
     assert_eq!(
         (event.op, event.decision, event.reason),
         (
