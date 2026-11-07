@@ -1,6 +1,6 @@
 # RFC 0004: route ordinary file opens through the broker
 
-- Status: proposed; prototype profile specified, runtime unimplemented and unverified
+- Status: accepted ([#4](https://github.com/farming-labs/fsgate/pull/4)); runtime unimplemented and unverified
 - Date: 2026-11-06
 - Roadmap: [M6, after v0.1.0](../../ROADMAP.md#m6--linux-filesystem-interception-experimental)
 
@@ -283,9 +283,10 @@ adding a syscall requires a compatibility test and a boundary review.
 
 ## Rollout and verification
 
-This follow-up specifies the first design task in M6; it is not Linux
-execution evidence or independent review. Keep the roadmap item unchecked
-until its acceptance criteria and merge evidence are recorded.
+Accepting this profile completes the first design task in M6; it is not
+Linux execution evidence or independent review. The remaining M6 tasks
+stay unchecked until their own acceptance criteria and merge evidence
+are recorded.
 
 Implement behind an optional Cargo feature, disabled by default, with no
 interception dependency or startup work in ordinary library use. Reuse
