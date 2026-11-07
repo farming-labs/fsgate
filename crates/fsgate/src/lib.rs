@@ -34,6 +34,8 @@ mod audit;
 #[cfg(unix)]
 mod broker;
 mod containment;
+#[cfg(all(feature = "experimental-intercept", target_os = "linux"))]
+mod intercept;
 
 pub use audit::{AuditDecision, AuditEvent, AuditOp, AuditReason, AuditSink};
 #[cfg(unix)]
@@ -510,6 +512,28 @@ impl Gate {
     pub fn open(&self, path: impl AsRef<Path>) -> Result<File, GateError> {
         self.gated(AuditOp::Open, path.as_ref(), Rights::READ, |entry, rel| {
             entry.dir.open(rel).map(cap_std::fs::File::into_std)
+        })
+    }
+
+    /// Opens an existing regular file for reading under the stricter rules
+    /// of the RFC 0004 interception profile. Needs [`Rights::READ`].
+    ///
+    /// Compared with [`open`](Gate::open), every symlink on the way fails
+    /// with `ELOOP`, even one that stays inside the grant; a directory fails
+    /// with `EISDIR`; and FIFOs, devices, sockets, and procfs or sysfs files
+    /// fail with `EOPNOTSUPP` without being opened for I/O, so a FIFO cannot
+    /// block the caller. The path is resolved to an `O_PATH` handle, checked,
+    /// and that same handle is reopened, so a rename between the check and
+    /// the open cannot substitute another file. These refusals come after
+    /// policy allowed the request: they are [`GateError::Io`] with the errno,
+    /// audited as `allow` with that errno.
+    ///
+    /// **Experimental.** Linux only, behind the `experimental-intercept`
+    /// feature, and not covered by semver.
+    #[cfg(all(feature = "experimental-intercept", target_os = "linux"))]
+    pub fn open_regular_strict(&self, path: impl AsRef<Path>) -> Result<File, GateError> {
+        self.gated(AuditOp::Open, path.as_ref(), Rights::READ, |entry, rel| {
+            intercept::open_regular_beneath(&entry.dir, rel)
         })
     }
 

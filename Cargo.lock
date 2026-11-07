@@ -104,6 +104,7 @@ dependencies = [
  "cap-std",
  "landlock",
  "rustix",
+ "rustix-linux-procfs",
  "serde",
  "serde_json",
  "tempfile",

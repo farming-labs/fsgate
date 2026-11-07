@@ -23,18 +23,21 @@
 //! 4. For each notification it opens a fresh `/proc/<tid>/mem`, checks the
 //!    notification ID after opening and after copying, validates the copy
 //!    against the RFC's file-open contract, authorizes it with
-//!    `fsgate::Gate::open`, and answers with `SECCOMP_ADDFD_FLAG_SEND` or
+//!    `fsgate::Gate::open_regular_strict`, and answers with `SECCOMP_ADDFD_FLAG_SEND` or
 //!    an errno. It never uses `SECCOMP_USER_NOTIF_FLAG_CONTINUE`.
+//!
+//! `open_regular_strict` (fsgate feature `experimental-intercept`) resolves
+//! an `O_PATH` handle beneath the grant, refusing every symlink, and reopens
+//! that same handle once it is known to be a regular file outside procfs and
+//! sysfs. `O_NOFOLLOW`, `RESOLVE_NO_SYMLINKS`, and `RESOLVE_NO_MAGICLINKS`
+//! are accepted because that open already enforces them; other resolve
+//! flags are refused.
 //!
 //! Deliberate gaps, each owned by a later RFC 0004 step:
 //!
 //! - Exec is by path through `std::process::Command`, not `execveat` on the
 //!   held image, and there is no final syscall allowlist yet. Landlock still
 //!   denies the worker every direct file access except its own image.
-//! - Authorization uses the public `fsgate::Gate::open`, which follows
-//!   symlinks inside a grant and can block on a FIFO. The strict `O_PATH`
-//!   resolver (step 2) rejects both; until then `O_NOFOLLOW` and every
-//!   `openat2` resolve flag are refused rather than ignored.
 //! - Refusals before authorization are not audited; the gate audits its own
 //!   `open` decisions. The dispatcher's audit reasons need an RFC 0002
 //!   update first.

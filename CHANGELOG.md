@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Experimental, Linux only, behind the `experimental-intercept` feature and outside semver: `Gate::open_regular_strict`, the read-only open of the RFC 0004 interception profile. It needs `READ` like `open`, but refuses every symlink with `ELOOP` (even inside the grant), directories with `EISDIR`, and FIFOs, devices, sockets, and procfs or sysfs files with `EOPNOTSUPP` without opening them for I/O. It reopens the `O_PATH` handle it checked, so a rename in between cannot substitute another file. The feature adds a direct dependency on `rustix-linux-procfs`, already in the dependency graph through `cap-std`.
+
 ## 0.1.1 (2026-11-07)
 
 The first crates.io release: [`fsgate` 0.1.1](https://crates.io/crates/fsgate/0.1.1), built from the signed tag [`v0.1.1`](https://github.com/farming-labs/fsgate/tree/v0.1.1) on `4250f31`. It adds one security fix over 0.1.0; the public API is unchanged.

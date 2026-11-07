@@ -25,3 +25,10 @@ tempfile = "3.27.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.7"
+rustix-linux-procfs = { version = "0.1.1", optional = true }
+
+[features]
+# Experimental and Linux only: `Gate::open_regular_strict`, the strict
+# regular-file open for the RFC 0004 interception profile. Not covered by
+# semver; it may change or disappear in any release.
+experimental-intercept = ["rustix/fs", "dep:rustix-linux-procfs"]
