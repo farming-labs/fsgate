@@ -70,7 +70,7 @@ M6 does not promise every filesystem syscall or arbitrary binary compatibility. 
 
 ## M7 — grant narrowing
 
-Proposed after M5 / v0.1.0 and independent of M6. Design: [RFC 0005](docs/rfcs/0005-grant-narrowing.md), which resolves RFC 0001's attenuated-grant open question. The new enum variants are breaking, so this targets 0.2.0.
+Implemented in [#6](https://github.com/farming-labs/fsgate/pull/6) and included in v0.1.0; independent of M6. Design: [RFC 0005](docs/rfcs/0005-grant-narrowing.md), which resolves RFC 0001's attenuated-grant open question. `GateError` and `AuditOp` are non-exhaustive, so the new variants are additive. The boxes stay unchecked until their acceptance evidence is recorded.
 
 - [ ] `Gate::narrow(grant, rights)` narrows a live grant in place, before or after `lock()`, keeping its id and held directory handle. Acceptance: denied operations after narrowing leave files absent or unchanged; a set naming a right the grant lacks fails with `GateError::WouldWiden` and leaves the grant unchanged, including an attempt to restore narrowed rights; narrowing a revoked grant fails with `UnknownGrant`; swapping a different directory in under the granted path does not change what the narrowed grant reaches.
 - [ ] Kernel enforcement follows the narrowed rights. Acceptance: a Linux locked child proves raw writes beneath a grant narrowed before `lock()` fail at the kernel and leave files unchanged, and that narrowing after `lock()` denies gate operations without side effects.

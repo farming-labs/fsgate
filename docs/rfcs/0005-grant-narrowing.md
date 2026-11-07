@@ -2,7 +2,7 @@
 
 - Status: proposed
 - Date: 2026-11-06
-- Roadmap: [M7, after v0.1.0](../../ROADMAP.md#m7--grant-narrowing)
+- Roadmap: [M7, in v0.1.0](../../ROADMAP.md#m7--grant-narrowing)
 - Resolves: the attenuated-grant open question in [RFC 0001](0001-core-design.md#open-questions)
 
 ## Problem
@@ -85,11 +85,12 @@ happened, not the resulting set. `grant` events have the same gap.
 
 ### Compatibility
 
-`GateError::WouldWiden` is a new variant of an enum that is not
-`#[non_exhaustive]`. Code that matches `GateError` exhaustively must add
-an arm, so this is a breaking change: it ships in 0.2.0, not in a 0.1.x
-patch. `AuditOp::Narrow` is additive because `AuditOp` is non-exhaustive
-([RFC 0002](0002-audit-events.md#rust-compatibility)).
+`Gate::narrow` ships in v0.1.0, the first release, so it changes no
+released API. `GateError` and `AuditOp` are `#[non_exhaustive]`
+([RFC 0001](0001-core-design.md#errors),
+[RFC 0002](0002-audit-events.md#rust-compatibility)), so
+`GateError::WouldWiden`, `AuditOp::Narrow`, and later variants are
+additive for callers.
 
 ## Alternatives considered
 

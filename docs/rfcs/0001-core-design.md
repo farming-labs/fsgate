@@ -64,7 +64,7 @@ macOS: no Landlock equivalent, so a broker process (M3) holds the grants and aut
 
 ### Errors
 
-One `GateError` enum with stable variants. Errors name the path, the missing right or grant, and the fix where applicable. The audit sink receives structured decision details. Configurable reduction of caller-facing error detail is not implemented for v0.1.0; embedders must redact errors at their own boundary.
+One `GateError` enum, `#[non_exhaustive]`: existing variants and their fields are stable, new failure kinds are additive, and matches outside fsgate need a wildcard arm. Errors name the path, the missing right or grant, and the fix where applicable. The audit sink receives structured decision details. Configurable reduction of caller-facing error detail is not implemented for v0.1.0; embedders must redact errors at their own boundary.
 
 ### Auditing
 
