@@ -88,6 +88,25 @@ Implemented in [#6](https://github.com/farming-labs/fsgate/pull/6) and included 
 
 Acceptance met: `tests/gate.rs` covers denied creates and truncation after narrowing with files left absent or unchanged, `WouldWiden` on an attempt to restore the original rights with the grant left read-only, `UnknownGrant` after revocation, and a directory swapped in under the granted path. `tests/lock.rs` runs a strict-locked child: a raw write beneath a grant narrowed before `lock()` fails with `PermissionDenied` and leaves the file unchanged, and narrowing after `lock()` denies `create` without creating the file. `tests/audit.rs` checks the allow, `rights_exceeded`, and `unknown_grant` events name grant 1. [Linux CI](https://github.com/farming-labs/fsgate/actions/runs/42320274648) ran the locked-child test on stable and Rust 1.85.0 at #6's head `238351f`. Not independently reviewed.
 
+## M8 — containment beyond file paths (Linux)
+
+Proposed; not started. `lock()` installs Landlock filesystem rules up to ABI v3 and nothing else. A locked process can therefore still connect to Unix domain sockets and signal processes outside the sandbox, and through them reach an unconfined process that acts on files for it or passes it descriptors ([#30](https://github.com/farming-labs/fsgate/pull/30) documents this). The `landlock` 0.4.7 crate fsgate already pins supports the ABIs that restrict these. Design comes first, in RFC 0006. CI runners boot Linux 7.0, so ABI v6 is testable in CI; ABI v9 (Linux 7.1) is not yet.
+
+- [ ] RFC 0006: decide how `lock()` adopts the newer restrictions: abstract Unix socket and signal scopes (ABI v6, Linux 6.12), device ioctls (`IoctlDev`, ABI v5, Linux 6.10), and pathname socket connects (`ResolveUnix`, ABI v9, Linux 7.1). Acceptance: the RFC settles what strict `lock()` requires on kernels older than 6.12 (today it requires only v3). It settles how callers learn which restrictions took effect: `LockStatus` and `LockPolicy` are exhaustive, so a new variant breaks callers and has to ship in 0.2.0. And it settles how a locked worker still reaches its broker socket once pathname connects are restricted.
+- [ ] Scope abstract Unix sockets and signals. Acceptance: a Linux locked child cannot connect to an abstract socket its parent listens on, or signal its parent, proven against the real kernel, with a control showing each succeeds without the scope. Kernels without ABI v6 behave as RFC 0006 decides, and that path is tested or the reason it cannot be is stated.
+- [ ] Restrict device ioctls and pathname socket connects. Acceptance: locked-child tests of the same shape. The pathname test needs Linux 7.1 or later; until CI boots one, the item records where the test ran or stays open.
+
+## M9 — review readiness and 0.2.0
+
+Proposed; not started. No part of fsgate has had an independent security review. These are the steps between the current state and a release someone can rely on.
+
+- [ ] Threat model: one document naming each boundary (the gate before `lock()`, the locked process, the broker and its worker, the experimental launcher), what each trusts, and what each does not stop. Acceptance: the README and RFC limit statements link to it, and every listed attack names the test that covers it or says that none does.
+- [ ] Fuzz the broker's server-side decoder: the RFC 0003 framing (length prefix, 1 MiB limit) and JSON request parsing. Acceptance: a `cargo fuzz` target over frame reassembly and request parsing, a recorded run (duration, corpus size, toolchain) without a crash, and a regression test for any crash found.
+- [ ] Independent security review of the handle layer, containment (including M8), broker, and audit sink. Acceptance: the reviewer, scope, reviewed commit, and findings are recorded; each finding is fixed or answered; and the README status says what was reviewed.
+- [ ] Release 0.2.0 through the trusted-publishing workflow, its first real run. Acceptance: the release job's verify step matches the uploaded, crates.io, and downloaded checksums and the `.cargo_vcs_info.json` commit. Before tagging, record two maintainer decisions here: whether 0.2.0 waits for M6 and the review, and whether it includes the `experimental-intercept` feature.
+
+Order: M8 first, because it changes what `lock()` means for existing users and its `LockStatus` change needs a minor release anyway. Then the threat model and fuzzing, then the review, then 0.2.0. M6's last task, verification on the declared kernels, is independent and can run in parallel.
+
 ## Out of scope for v1
 
 Preload shim for unmodified binaries, Windows, quotas and rate budgets, network or non-filesystem capabilities.
