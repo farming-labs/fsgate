@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- `Gate::narrow(grant, rights)` removes rights from a live grant before or after `lock()` and keeps the grant's id and held directory handle. A grant narrowed before `lock()` is enforced by the kernel at its narrowed rights; after `lock()`, narrowing binds gate operations only. Asking to keep a right the grant does not hold fails with `GateError::WouldWiden` and leaves the grant unchanged. Each call emits one `narrow` audit event ([RFC 0005](docs/rfcs/0005-grant-narrowing.md)).
+
+### Changed
+
+- Breaking: `AuditOp::Narrow` and `GateError::WouldWiden` are new variants, so exhaustive matches on `AuditOp` or `GateError` need a new arm.
+
 ## 0.1.0 (unreleased)
 
 Prepared for the initial signed-tag release. Not yet tagged or published to crates.io.

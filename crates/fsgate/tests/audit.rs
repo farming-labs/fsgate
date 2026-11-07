@@ -185,6 +185,51 @@ fn lifecycle_events_cover_grant_revoke_and_lock() {
 }
 
 #[test]
+fn narrow_emits_one_event_per_decision() {
+    let (_root, granted, _) = setup();
+    let (mut gate, sink) = audited_gate(&granted, Rights::READ | Rights::WRITE);
+    // Narrow a second grant so the events must name grant 1, not grant 0.
+    let grant = gate.grant(&granted, Rights::READ | Rights::WRITE).unwrap();
+
+    gate.narrow(grant, Rights::READ).unwrap();
+    let _ = gate.narrow(grant, Rights::READ | Rights::WRITE); // denied: widens
+    gate.revoke(grant).unwrap();
+    let _ = gate.narrow(grant, Rights::READ); // denied: revoked
+
+    let events = sink.events();
+    let narrow: Vec<_> = events[2..]
+        .iter()
+        .filter(|event| event.op != AuditOp::Revoke)
+        .collect();
+    assert_eq!(events.len(), 6);
+    assert_eq!(narrow.len(), 3);
+    let expected = [
+        (
+            AuditDecision::Allow,
+            AuditReason::Ok,
+            Some(granted.as_path()),
+        ),
+        (
+            AuditDecision::Deny,
+            AuditReason::RightsExceeded,
+            Some(granted.as_path()),
+        ),
+        (AuditDecision::Deny, AuditReason::UnknownGrant, None),
+    ];
+    for (event, (decision, reason, path)) in narrow.iter().zip(expected) {
+        assert_eq!(event.op, AuditOp::Narrow);
+        assert_eq!(event.decision, decision);
+        assert_eq!(event.reason, reason);
+        assert_eq!(event.path.as_deref(), path);
+        assert_eq!(event.grant, Some(1));
+        assert_eq!(event.errno, None);
+    }
+
+    let value: serde_json::Value = serde_json::from_str(&narrow[0].to_json_line()).unwrap();
+    assert_eq!(value["op"], "narrow");
+}
+
+#[test]
 fn json_lines_match_the_rfc_shape() {
     let (_root, granted, _) = setup();
     let (gate, sink) = audited_gate(&granted, Rights::READ);

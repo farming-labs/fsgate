@@ -29,6 +29,7 @@ impl Gate {
     pub fn grant(&mut self, path: impl AsRef<Path>, rights: Rights) -> Result<Grant, GateError>;
     pub fn lock(&mut self) -> Result<LockStatus, GateError>;      // irreversible; strict
     pub fn lock_with(&mut self, policy: LockPolicy) -> Result<LockStatus, GateError>;
+    pub fn narrow(&mut self, grant: Grant, rights: Rights) -> Result<(), GateError>; // RFC 0005
     pub fn revoke(&mut self, grant: Grant) -> Result<(), GateError>;
 
     pub fn open(&self, path: impl AsRef<Path>) -> Result<File, GateError>;
@@ -40,7 +41,7 @@ impl Gate {
 
 As implemented for the planned v0.1.0: `lock` reports the achieved `LockStatus` (`FullyEnforced` / `PartiallyEnforced` / `LibraryOnly`) because a best-effort lock that enforced nothing must say so; `create` requires `CREATE | WRITE`, since the returned handle writes data. The broker client (`BrokerGate`, RFC 0003) exposes `open`, `create`, `metadata`, and `read_dir` with serializable result types where needed. Granting, locking, and revocation belong to the server's `Gate`, not the worker client.
 
-Naming follows fixed verb jobs: `grant` confers authority, `lock` applies containment, `revoke` is the reverse of `grant`. Every registration has its reverse; `lock()` is the one deliberate exception and is documented as irreversible.
+Naming follows fixed verb jobs: `grant` confers authority, `lock` applies containment, `narrow` removes rights from a live grant, `revoke` is the reverse of `grant`. Every registration has its reverse; `lock()` is the one deliberate exception and is documented as irreversible.
 
 ### Resolution
 
@@ -84,4 +85,4 @@ LD_PRELOAD interposition, Windows, quotas, network capabilities, in-process mult
 
 - ~~seccomp filter scope vs. real-world libraries that legitimately `openat` relative descriptors~~ — resolved by ADR 0002: Landlock alone mediates paths.
 - ~~Audit sink backpressure: drop, block, or count-and-flag~~ — resolved in RFC 0002: delivery is synchronous and the embedder owns buffering; fsgate never drops an event itself.
-- Whether `Grant` should be cloneable with attenuated rights (`grant.narrow(Rights::READ)`) — deferred past v0.1.0.
+- ~~Whether `Grant` should be cloneable with attenuated rights (`grant.narrow(Rights::READ)`)~~ — proposed in RFC 0005, after v0.1.0: `Gate::narrow(grant, rights)` narrows a live grant in place rather than minting an attenuated copy.
