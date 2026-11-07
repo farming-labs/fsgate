@@ -7,6 +7,8 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 use std::fs;
+use std::io::ErrorKind;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -47,7 +49,7 @@ fn worker() -> &'static Path {
 }
 
 struct Dirs {
-    _root: TempDir,
+    root: TempDir,
     granted: PathBuf,
     outside: PathBuf,
 }
@@ -63,7 +65,7 @@ impl Dirs {
         fs::write(granted.join("a.txt"), b"inside").unwrap();
         fs::write(outside.join("secret.txt"), b"secret").unwrap();
         Dirs {
-            _root: root,
+            root,
             granted,
             outside,
         }
@@ -340,19 +342,75 @@ fn an_aborted_startup_never_executes_the_worker() {
     assert_eq!(err.raw_os_error(), Some(ECANCELED), "{err}");
 }
 
+/// Asserts `run` refused `image` before launching it, with `problem` in the
+/// message.
+fn refused_before_launch(dirs: &Dirs, image: &Path, problem: &str) {
+    let err = run(image, &[], dirs.gate(Rights::READ), Fault::None)
+        .expect_err("the image must be refused");
+    assert_eq!(err.kind(), ErrorKind::InvalidInput, "{err}");
+    assert!(err.to_string().contains(problem), "{err}");
+}
+
 #[test]
-fn an_image_that_needs_an_interpreter_cannot_start() {
+fn an_image_that_needs_an_interpreter_is_refused_before_launch() {
     let dirs = Dirs::new();
-    // A dynamically linked system binary: exec needs the loader, which the
-    // worker's Landlock ruleset does not allow it to execute.
+    // A dynamically linked system binary: it would need the loader.
     let dynamic = Path::new("/bin/true");
     assert!(
         dynamic.exists(),
         "the test needs a dynamically linked /bin/true"
     );
 
-    let err = run(dynamic, &[], dirs.gate(Rights::READ), Fault::None)
-        .expect_err("a dynamic image must not start");
+    refused_before_launch(&dirs, dynamic, "needs an ELF interpreter");
+}
 
-    assert_eq!(err.raw_os_error(), Some(EACCES), "{err}");
+#[test]
+fn scripts_are_refused_before_launch() {
+    let dirs = Dirs::new();
+    let script = dirs.root.path().join("script");
+    fs::write(&script, "#!/bin/sh\necho ran\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+    refused_before_launch(&dirs, &script, "is not an ELF executable");
+}
+
+#[test]
+fn set_id_images_are_refused_before_launch() {
+    let dirs = Dirs::new();
+    let image = dirs.root.path().join("setuid-worker");
+    fs::copy(worker(), &image).unwrap();
+    fs::set_permissions(&image, fs::Permissions::from_mode(0o4755)).unwrap();
+
+    refused_before_launch(&dirs, &image, "set-user-ID or set-group-ID");
+}
+
+#[test]
+fn the_checked_image_runs_even_after_its_path_is_replaced() {
+    let dirs = Dirs::new();
+    let image = dirs.root.path().join("worker");
+    // Copy with `cp`, not `fs::copy`: a writable descriptor in this
+    // multi-threaded process could leak into a concurrently forked child and
+    // make the exec below fail with ETXTBSY.
+    let copied = Command::new("cp")
+        .arg(worker())
+        .arg(&image)
+        .status()
+        .unwrap();
+    assert!(copied.success());
+    let script = dirs.root.path().join("swapped");
+    fs::write(&script, "#!/bin/sh\necho swapped\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = dirs.granted("a.txt");
+
+    let outcome = run(
+        &image,
+        &["read", &path],
+        dirs.gate(Rights::READ),
+        Fault::ReplaceImage { with: script },
+    )
+    .expect("probe run");
+
+    // The child executed the held descriptor, not whatever the path names now.
+    assert_eq!(stdout(&outcome), "inside");
+    assert_eq!(fs::read(&image).unwrap(), b"#!/bin/sh\necho swapped\n");
 }

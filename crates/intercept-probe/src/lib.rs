@@ -9,9 +9,12 @@
 //!
 //! What `run` does:
 //!
-//! 1. Opens the worker image `O_PATH` and builds a Landlock ruleset that
-//!    handles every ABI v3 filesystem right and allows only `READ_FILE |
-//!    EXECUTE` on that image.
+//! 1. Opens the worker image once and checks the RFC's image rule on that
+//!    descriptor: a regular, native x86_64 ELF executable with no
+//!    `PT_INTERP`, not set-ID, and without file capabilities. Scripts and
+//!    dynamically linked binaries are refused before anything is launched.
+//!    It then builds a Landlock ruleset that handles every ABI v3
+//!    filesystem right and allows only `READ_FILE | EXECUTE` on that image.
 //! 2. Forks. Before exec, the child marks every descriptor above stdio
 //!    close-on-exec, sets `no_new_privs`, applies the ruleset, installs a
 //!    seccomp filter with `NEW_LISTENER` that notifies `open`, `openat`, and
@@ -19,7 +22,10 @@
 //!    the supervisor, closes its own copy, and waits.
 //! 3. The supervisor checks the descriptor is a seccomp listener, reads a
 //!    known marker back from the child's `/proc/<pid>/mem`, and only then
-//!    releases the child to exec.
+//!    releases the child, which runs the checked image with
+//!    `execveat(image, "", argv, envp, AT_EMPTY_PATH)`. No path is resolved
+//!    again, so replacing the file at the path after the check changes
+//!    nothing.
 //! 4. For each notification it opens a fresh `/proc/<tid>/mem`, checks the
 //!    notification ID after opening and after copying, and copies the path
 //!    and `open_how` once into an `fsgate::intercept::OpenRequest`.
@@ -38,9 +44,9 @@
 //!
 //! Deliberate gaps, each owned by a later RFC 0004 step:
 //!
-//! - Exec is by path through `std::process::Command`, not `execveat` on the
-//!   held image, and there is no final syscall allowlist yet. Landlock still
-//!   denies the worker every direct file access except its own image.
+//! - There is no final syscall allowlist yet, so `execve`, `io_uring`, and
+//!   other unmediated syscalls are still available to the worker. Landlock
+//!   still denies it every direct file access except its own image.
 //! - `seccompiler` (ADR 0001) cannot express `SECCOMP_RET_USER_NOTIF` or
 //!   `SECCOMP_FILTER_FLAG_NEW_LISTENER` as of 0.5.0, so the 11-instruction
 //!   filter is written by hand.

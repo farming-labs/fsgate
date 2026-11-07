@@ -1,13 +1,15 @@
 //! Launcher and supervisor. Everything here is safe code; the raw
 //! interfaces live in [`crate::sys`].
 
+use std::ffi::{CString, OsStr};
 use std::fs::File;
 use std::io::{self, IoSliceMut, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread::{self, JoinHandle};
 
@@ -43,8 +45,8 @@ const BPF_RET_K: u16 = 0x06;
 const SECCOMP_DATA_NR: u32 = 0;
 const SECCOMP_DATA_ARCH: u32 = 4;
 
-/// Fault injection for the startup and supervisor-loss tests.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Fault injection for the startup, supervisor-loss, and image tests.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Fault {
     /// Normal operation.
     None,
@@ -53,6 +55,13 @@ pub enum Fault {
     CloseListener,
     /// The supervisor never releases the startup barrier.
     AbortStartup,
+    /// After the image is checked and before the child execs, the
+    /// supervisor renames `with` over the executable path. The child still
+    /// runs the image that was checked.
+    ReplaceImage {
+        /// The file renamed over the executable path.
+        with: PathBuf,
+    },
 }
 
 /// One notified open request and the supervisor's answer.
@@ -89,22 +98,32 @@ pub struct Outcome {
 /// startup barrier, returns the child's error and the worker never runs.
 pub fn run(executable: &Path, args: &[&str], gate: Gate, fault: Fault) -> io::Result<Outcome> {
     preflight()?;
-    let image = rustix::fs::open(executable, OFlags::PATH | OFlags::CLOEXEC, Mode::empty())?;
-    if FileType::from_raw_mode(rustix::fs::fstat(&image)?.st_mode) != FileType::RegularFile {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "`{}` is not a regular file; pass the worker executable itself",
-                executable.display()
-            ),
-        ));
-    }
+    // `NONBLOCK` keeps a FIFO at this path from blocking the open; the image
+    // check then refuses anything but a regular file.
+    let image = File::from(rustix::fs::open(
+        executable,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::NOCTTY,
+        Mode::empty(),
+    )?);
+    check_image(&image, executable)?;
     let ruleset = sys::executable_ruleset(image.as_fd())?;
+    let argv = std::iter::once(executable.as_os_str())
+        .chain(args.iter().map(OsStr::new))
+        .map(|arg| {
+            CString::new(arg.as_bytes()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "an argument contains a NUL byte; pass arguments without NUL",
+                )
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let target = executable.to_path_buf();
     let (supervisor_end, child_end) = UnixStream::pair()?;
     // The supervisor holds its end until the child has sent the listener or
     // died, so this number stays valid through the fork.
     let peer = supervisor_end.as_raw_fd();
-    let supervisor = thread::spawn(move || supervise(supervisor_end, gate, fault));
+    let supervisor = thread::spawn(move || supervise(supervisor_end, gate, fault, &target));
 
     let mut command = Command::new(executable);
     command
@@ -120,6 +139,8 @@ pub fn run(executable: &Path, args: &[&str], gate: Gate, fault: Fault) -> io::Re
             socket: child_end.as_raw_fd(),
             peer,
             filter: notify_filter(),
+            image: image.as_raw_fd(),
+            argv,
         },
     );
     let spawned = command.spawn();
@@ -163,6 +184,75 @@ fn preflight() -> io::Result<()> {
     })
 }
 
+/// The RFC 0004 image rule, checked on the held image itself: a regular,
+/// native x86_64 ELF executable with no interpreter, not set-ID, and with
+/// no file capabilities. The child later executes this same descriptor.
+fn check_image(image: &File, executable: &Path) -> io::Result<()> {
+    let refuse = |problem: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("`{}` {problem}", executable.display()),
+        )
+    };
+    let stat = rustix::fs::fstat(image)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(refuse(
+            "is not a regular file; pass the worker executable itself",
+        ));
+    }
+    if stat.st_mode & (libc::S_ISUID | libc::S_ISGID) != 0 {
+        return Err(refuse(
+            "is set-user-ID or set-group-ID; the worker image must not change privileges on exec",
+        ));
+    }
+    match rustix::fs::fgetxattr_query(image, "security.capability") {
+        Ok(_) => {
+            return Err(refuse(
+                "has file capabilities; remove them with `setcap -r` or pick another image",
+            ));
+        }
+        Err(rustix::io::Errno::NODATA | rustix::io::Errno::OPNOTSUPP) => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    let not_elf = || {
+        refuse("is not an ELF executable (scripts are not supported); pass a static native binary")
+    };
+    let mut header = [0u8; 64];
+    image.read_exact_at(&mut header, 0).map_err(|_| not_elf())?;
+    let u16_at = |at: usize| u16::from_le_bytes([header[at], header[at + 1]]);
+    if header[..4] != *b"\x7fELF" {
+        return Err(not_elf());
+    }
+    // ELFCLASS64, ELFDATA2LSB, EM_X86_64, and ET_EXEC or ET_DYN (static PIE).
+    if header[4] != 2 || header[5] != 1 || u16_at(18) != 62 {
+        return Err(refuse(
+            "is not a 64-bit x86_64 ELF; the interception profile supports native x86_64 only",
+        ));
+    }
+    if !matches!(u16_at(16), 2 | 3) {
+        return Err(not_elf());
+    }
+    let mut phoff = [0u8; 8];
+    phoff.copy_from_slice(&header[32..40]);
+    let (phoff, entry_size, entries) = (u64::from_le_bytes(phoff), u16_at(54), u16_at(56));
+    // Elf64_Phdr is 56 bytes; 0xffff (PN_XNUM) and absurd counts are refused.
+    if entry_size != 56 || entries == 0 || entries > 1024 {
+        return Err(refuse("has an unsupported program header table"));
+    }
+    let mut table = vec![0u8; 56 * usize::from(entries)];
+    image
+        .read_exact_at(&mut table, phoff)
+        .map_err(|_| refuse("has a truncated program header table"))?;
+    const PT_INTERP: [u8; 4] = 3u32.to_le_bytes();
+    if table.chunks_exact(56).any(|entry| entry[..4] == PT_INTERP) {
+        return Err(refuse(
+            "needs an ELF interpreter (it is dynamically linked); build it static, for example with `cc -static`",
+        ));
+    }
+    Ok(())
+}
+
 fn unsupported(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::Unsupported, message)
 }
@@ -203,11 +293,17 @@ pub(crate) fn notify_filter() -> Vec<libc::sock_filter> {
     ]
 }
 
-fn supervise(socket: UnixStream, gate: Gate, fault: Fault) -> io::Result<Vec<Decision>> {
+fn supervise(
+    socket: UnixStream,
+    gate: Gate,
+    fault: Fault,
+    executable: &Path,
+) -> io::Result<Vec<Decision>> {
     let (listener, pid) = receive_listener(&socket)?;
     verify_listener(&listener)?;
     verify_child_memory(pid)?;
     match fault {
+        Fault::ReplaceImage { with } => std::fs::rename(with, executable)?,
         // Dropping the socket without the ready byte fails the barrier.
         Fault::AbortStartup => return Ok(Vec::new()),
         Fault::CloseListener => {
