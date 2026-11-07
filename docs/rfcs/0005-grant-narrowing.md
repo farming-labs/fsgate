@@ -85,10 +85,11 @@ happened, not the resulting set. `grant` events have the same gap.
 
 ### Compatibility
 
-`AuditOp::Narrow` and `GateError::WouldWiden` are new variants of
-enums that are not `#[non_exhaustive]`. Code that matches either enum
-exhaustively must add an arm, so this is a breaking change: it ships in
-0.2.0, not in a 0.1.x patch.
+`GateError::WouldWiden` is a new variant of an enum that is not
+`#[non_exhaustive]`. Code that matches `GateError` exhaustively must add
+an arm, so this is a breaking change: it ships in 0.2.0, not in a 0.1.x
+patch. `AuditOp::Narrow` is additive because `AuditOp` is non-exhaustive
+([RFC 0002](0002-audit-events.md#rust-compatibility)).
 
 ## Alternatives considered
 
