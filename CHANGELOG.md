@@ -2,9 +2,18 @@
 
 ## Unreleased
 
+## 0.1.1 (unreleased)
+
+Prepared as the first crates.io release. It adds one security fix over 0.1.0; the public API is unchanged.
+
 ### Fixed
 
 - Descriptors the worker receives through `BrokerGate` (`open` and `create`) are close-on-exec, like the files std opens. In 0.1.0 they were inherited by every program the worker started, so a spawned child could read or write a brokered file without asking the broker. On Linux the flag is set atomically by `recvmsg`; on macOS it is set immediately after, and a concurrent fork and exec on another thread can still inherit the descriptor in that window.
+
+### Changed
+
+- The manifest allows publishing to crates.io (`publish = false` is removed) and adds crates.io keywords and categories.
+- [The release procedure](docs/RELEASING.md) is version-generic and adds the crates.io publish and verification steps.
 
 ## 0.1.0 (2026-11-06)
 

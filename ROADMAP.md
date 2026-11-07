@@ -48,6 +48,7 @@ Acceptance met: `tests/broker.rs` covers socketpair and real-binary transports, 
 - [x] API review pass against RFC 0001; deviations folded back into the RFC ([PR #1](https://github.com/farming-labs/fsgate/pull/1), `168ae27`)
 - [x] Docs: every public item documented, README examples compile as doctests ([PR #1](https://github.com/farming-labs/fsgate/pull/1), `168ae27`)
 - [x] Release v0.1.0 (signed tag [`v0.1.0`](https://github.com/farming-labs/fsgate/tree/v0.1.0), `0ad477f`; preparation in [PR #3](https://github.com/farming-labs/fsgate/pull/3)). Publishing to crates.io is a separate, explicit maintainer decision.
+- [ ] Publish to crates.io as 0.1.1, from the signed tag `v0.1.1`. v0.1.0 was tagged with `publish = false` and is never published. Acceptance: `cargo publish --locked` runs from a clean checkout of the verified tag, and the crates.io checksum matches the uploaded archive.
 
 Preparation merged in PR #1: `LockStatus`, `create` rights, audit delivery, broker client types, and containment limits are folded into RFC 0001. Public documentation is required, the README compiles as a doctest, and CI tests the unpacked crate. Audit regression coverage checks the actual matched grant ID for duplicate and nested grants, revocation, and broker requests. The release followed [the release procedure](docs/RELEASING.md): the signed tag `v0.1.0` (tag object `5bd7761`) points to `0ad477f`, which also includes grant narrowing (M7), non-exhaustive audit and error types, the cross-gate grant fix, and the audit `rights` key (#6–#11).
 

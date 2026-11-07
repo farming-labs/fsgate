@@ -1,13 +1,14 @@
 [package]
 name = "fsgate"
-version = "0.1.0"
+version = "0.1.1"
 description = "Filesystem authority as directory handles granted up front, enforced by the kernel."
 readme = "README.md"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
+keywords = ["sandbox", "landlock", "capabilities", "filesystem", "security"]
+categories = ["filesystem", "os::linux-apis"]
 
 [lints]
 workspace = true
