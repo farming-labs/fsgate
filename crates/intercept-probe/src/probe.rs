@@ -3,7 +3,7 @@
 
 use std::ffi::{CString, OsStr};
 use std::fs::File;
-use std::io::{self, IoSliceMut, Write};
+use std::io::{self, IoSliceMut, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -19,7 +19,7 @@ use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fs::{FileType, Mode, OFlags};
 use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
 
-use crate::sys;
+use crate::{filters, sys};
 
 /// Known bytes the supervisor reads back from the restricted child before
 /// releasing it. The child is a fork of this process, so the static sits at
@@ -35,15 +35,6 @@ const IDLE_TIMEOUT: Timespec = Timespec {
 
 /// Base page size on x86_64; path copies never cross a page in one read.
 const PAGE_SIZE: u64 = 4096;
-
-const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
-const X32_SYSCALL_BIT: u32 = 0x4000_0000;
-const BPF_LD_W_ABS: u16 = 0x20;
-const BPF_JEQ_K: u16 = 0x15;
-const BPF_JGE_K: u16 = 0x35;
-const BPF_RET_K: u16 = 0x06;
-const SECCOMP_DATA_NR: u32 = 0;
-const SECCOMP_DATA_ARCH: u32 = 4;
 
 /// Fault injection for the startup, supervisor-loss, and image tests.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -138,7 +129,8 @@ pub fn run(executable: &Path, args: &[&str], gate: Gate, fault: Fault) -> io::Re
             ruleset: ruleset.as_raw_fd(),
             socket: child_end.as_raw_fd(),
             peer,
-            filter: notify_filter(),
+            filter: filters::notify_filter(),
+            allowlist: filters::final_allowlist(filters::RESERVED_IMAGE_FD),
             image: image.as_raw_fd(),
             argv,
         },
@@ -263,36 +255,6 @@ fn join(supervisor: JoinHandle<io::Result<Vec<Decision>>>) -> io::Result<Vec<Dec
         .unwrap_or_else(|_| Err(io::Error::other("supervisor thread panicked")))
 }
 
-/// The notification filter: kill anything that is not native x86_64 (x32
-/// included), notify the supervisor of the three open syscalls, and allow
-/// everything else. Landlock, not this filter, denies direct file access.
-pub(crate) fn notify_filter() -> Vec<libc::sock_filter> {
-    fn stmt(code: u16, k: u32) -> libc::sock_filter {
-        libc::sock_filter {
-            code,
-            jt: 0,
-            jf: 0,
-            k,
-        }
-    }
-    fn jump(k: u32, jt: u8, jf: u8, code: u16) -> libc::sock_filter {
-        libc::sock_filter { code, jt, jf, k }
-    }
-    vec![
-        stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARCH),
-        jump(AUDIT_ARCH_X86_64, 1, 0, BPF_JEQ_K),
-        stmt(BPF_RET_K, libc::SECCOMP_RET_KILL_PROCESS),
-        stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR),
-        jump(X32_SYSCALL_BIT, 0, 1, BPF_JGE_K),
-        stmt(BPF_RET_K, libc::SECCOMP_RET_KILL_PROCESS),
-        jump(libc::SYS_open as u32, 3, 0, BPF_JEQ_K),
-        jump(libc::SYS_openat as u32, 2, 0, BPF_JEQ_K),
-        jump(libc::SYS_openat2 as u32, 1, 0, BPF_JEQ_K),
-        stmt(BPF_RET_K, libc::SECCOMP_RET_ALLOW),
-        stmt(BPF_RET_K, libc::SECCOMP_RET_USER_NOTIF),
-    ]
-}
-
 fn supervise(
     socket: UnixStream,
     gate: Gate,
@@ -300,6 +262,7 @@ fn supervise(
     executable: &Path,
 ) -> io::Result<Vec<Decision>> {
     let (listener, pid) = receive_listener(&socket)?;
+    await_restricted(&socket)?;
     verify_listener(&listener)?;
     verify_child_memory(pid)?;
     match fault {
@@ -347,6 +310,18 @@ fn receive_listener(socket: &UnixStream) -> io::Result<(OwnedFd, i32)> {
     }
 }
 
+/// Waits for the child to report that both filters are installed, so the
+/// memory check below reads a fully restricted child.
+fn await_restricted(socket: &UnixStream) -> io::Result<()> {
+    let mut byte = [0u8; 1];
+    match (&*socket).read(&mut byte) {
+        Ok(1) if byte[0] == sys::RESTRICTED_BYTE => Ok(()),
+        _ => Err(startup_error(
+            "the child exited before installing its syscall allowlist",
+        )),
+    }
+}
+
 fn verify_listener(listener: &OwnedFd) -> io::Result<()> {
     let target = std::fs::read_link(format!("/proc/self/fd/{}", listener.as_raw_fd()))?;
     if target != Path::new("anon_inode:seccomp notify") {
@@ -379,7 +354,7 @@ fn verify_child_memory(pid: i32) -> io::Result<()> {
 }
 
 fn release(socket: &UnixStream) -> io::Result<()> {
-    (&*socket).write_all(&[sys::READY_BYTE])
+    (&*socket).write_all(&[sys::RELEASE_BYTE])
 }
 
 fn serve(listener: &OwnedFd, gate: &Gate) -> io::Result<Vec<Decision>> {
@@ -561,21 +536,4 @@ fn read_open_how(memory: &File, addr: u64) -> Result<OpenHow, CopyFault> {
         mode: field(1),
         resolve: field(2),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn open_syscalls_jump_to_the_notify_return() {
-        let filter = notify_filter();
-        let notify = filter.len() - 1;
-        assert_eq!(filter[notify].k, libc::SECCOMP_RET_USER_NOTIF);
-        for (index, instruction) in filter.iter().enumerate().take(9).skip(6) {
-            let target = index + 1 + usize::from(instruction.jt);
-            assert_eq!(target, notify, "instruction {index}");
-        }
-        assert_eq!(filter[notify - 1].k, libc::SECCOMP_RET_ALLOW);
-    }
 }

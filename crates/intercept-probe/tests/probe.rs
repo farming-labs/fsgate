@@ -34,7 +34,7 @@ fn worker() -> &'static Path {
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/worker.c");
         let output = Path::new(env!("CARGO_TARGET_TMPDIR")).join("intercept-probe-worker");
         let status = Command::new("cc")
-            .args(["-static", "-O2", "-Wall", "-Werror", "-o"])
+            .args(["-static", "-pthread", "-O2", "-Wall", "-Werror", "-o"])
             .arg(&output)
             .arg(&source)
             .status()
@@ -197,7 +197,7 @@ fn write_and_create_requests_are_refused_and_change_nothing() {
 }
 
 #[test]
-fn unmediated_creat_is_stopped_by_landlock() {
+fn unmediated_creat_is_refused_by_the_allowlist() {
     let dirs = Dirs::new();
     let fresh = dirs.granted("new.txt");
     let rights = Rights::READ | Rights::WRITE | Rights::CREATE;
@@ -205,10 +205,98 @@ fn unmediated_creat_is_stopped_by_landlock() {
     let outcome = probe(dirs.gate(rights), &["creat", &fresh]);
 
     // `creat` is not a notified syscall, so the supervisor never sees it;
-    // the worker's Landlock ruleset refuses it in the kernel.
-    assert_eq!(stdout(&outcome), format!("errno={EACCES}\n"));
+    // the allowlist refuses it, with Landlock behind it.
+    assert_eq!(stdout(&outcome), format!("errno={EOPNOTSUPP}\n"));
     assert!(outcome.decisions.is_empty());
     assert!(!Path::new(&fresh).exists());
+}
+
+#[test]
+fn execve_io_uring_sockets_prctl_and_namespaces_are_refused() {
+    let dirs = Dirs::new();
+    let tool = dirs.granted("a.txt");
+
+    for args in [
+        vec!["exec", "/bin/true"],
+        vec!["uring"],
+        vec!["socket"],
+        vec!["prctl"],
+        vec!["clone-ns"],
+        vec!["creat", tool.as_str()],
+    ] {
+        let outcome = probe(dirs.gate(Rights::READ), &args);
+        assert_eq!(
+            stdout(&outcome),
+            format!("errno={EOPNOTSUPP}\n"),
+            "{args:?}"
+        );
+        assert!(outcome.decisions.is_empty(), "{args:?}");
+    }
+    assert_eq!(fs::read(&tool).unwrap(), b"inside");
+}
+
+/// An executable copy of the worker inside the grant, so that only Landlock,
+/// not file permissions, can refuse to execute it.
+fn executable_in_grant(dirs: &Dirs) -> String {
+    let tool = dirs.granted("tool");
+    let copied = Command::new("cp")
+        .arg(worker())
+        .arg(&tool)
+        .status()
+        .unwrap();
+    assert!(copied.success());
+    tool
+}
+
+#[test]
+fn a_delivered_file_moved_to_the_reserved_number_cannot_be_executed() {
+    let dirs = Dirs::new();
+    let tool = executable_in_grant(&dirs);
+
+    let outcome = probe(dirs.gate(Rights::READ), &["execfd", &tool]);
+
+    // The allowlist passes `execveat(1000, "", AT_EMPTY_PATH)`; Landlock
+    // refuses because the descriptor is not the checked image.
+    assert_eq!(stdout(&outcome), format!("errno={EACCES}\n"));
+    assert_eq!(outcome.decisions, [decision(libc::SYS_openat, &tool, None)]);
+}
+
+#[test]
+fn an_absolute_path_cannot_be_executed_through_the_reserved_number() {
+    let dirs = Dirs::new();
+    let tool = executable_in_grant(&dirs);
+
+    let outcome = probe(dirs.gate(Rights::READ), &["execat", &tool]);
+
+    assert_eq!(stdout(&outcome), format!("errno={EACCES}\n"));
+    assert!(outcome.decisions.is_empty());
+}
+
+#[test]
+fn forked_children_stay_mediated() {
+    let dirs = Dirs::new();
+    let path = dirs.granted("a.txt");
+    let secret = dirs.outside("secret.txt");
+
+    let granted = probe(dirs.gate(Rights::READ), &["fork-read", &path]);
+    let denied = probe(dirs.gate(Rights::READ), &["fork-read", &secret]);
+
+    assert_eq!(stdout(&granted), "inside");
+    assert_eq!(granted.decisions, [decision(libc::SYS_openat, &path, None)]);
+    assert_eq!(stdout(&denied), format!("errno={EACCES}\n"));
+}
+
+#[test]
+fn threads_stay_mediated() {
+    let dirs = Dirs::new();
+    let path = dirs.granted("a.txt");
+
+    // glibc tries clone3 first; the allowlist answers ENOSYS so it falls
+    // back to clone, whose thread flags are allowed.
+    let outcome = probe(dirs.gate(Rights::READ), &["thread-read", &path]);
+
+    assert_eq!(stdout(&outcome), "inside");
+    assert_eq!(outcome.decisions, [decision(libc::SYS_openat, &path, None)]);
 }
 
 #[test]
