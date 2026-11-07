@@ -22,7 +22,7 @@ Fields:
 - `ts` — RFC 3339 UTC with milliseconds.
 - `op` — `grant`, `revoke`, `narrow` (RFC 0005), `lock`, `open`, `create`, `metadata`, `read_dir` (grows with the API).
 - `path` — the normalized requested path. For `grant`/`revoke`/`narrow`, the grant's path. `null` for `lock`, which has no path.
-- `grant` — the matched grant's id, or `null` when none matched.
+- `grant` — the matched grant's id, or `null` when none matched. `revoke` and `narrow` of an already revoked grant record the requested id; a grant from another gate is `null`, because its id names nothing in this gate.
 - `decision` — `allow` or `deny`. An operation that passed policy but failed at the kernel is `allow` with a non-null `errno`: policy said yes, the OS said no, and both facts are recorded.
 - `reason` — `ok`, `no_grant`, `rights_exceeded` (for `narrow`: the requested set names a right the grant does not hold), `not_absolute`, `locked`, `unsupported` (a lock the kernel could not enforce), `unknown_grant` (revoking or narrowing a grant that does not exist). Grows with the API.
 - `errno` — OS error number when the underlying syscall failed, else `null`.

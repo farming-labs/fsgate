@@ -20,6 +20,7 @@ Prepared for the initial signed-tag release. Not yet tagged or published to crat
 
 ### Fixed
 
+- `revoke` and `narrow` reject a `Grant` created by a different gate with `GateError::UnknownGrant`, as documented, and change no grant. Before, a grant carried only its index, so another gate revoked or narrowed whichever of its own grants held that index. The audit event for a rejected foreign grant has `grant: null`.
 - Rights denials report the grant selected by routing, including when multiple grants name the same directory, and record the normalized requested path ([PR #1](https://github.com/farming-labs/fsgate/pull/1)).
 
 ### Limits

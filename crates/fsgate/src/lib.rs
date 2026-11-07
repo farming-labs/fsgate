@@ -45,6 +45,7 @@ use std::io;
 use std::ops::BitOr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use cap_std::ambient_authority;
@@ -231,8 +232,13 @@ pub enum LockStatus {
 }
 
 /// Handle to one grant inside a [`Gate`], used to narrow or revoke it.
+///
+/// A grant belongs to the gate that created it. Passing it to another
+/// gate's [`revoke`](Gate::revoke) or [`narrow`](Gate::narrow) fails with
+/// [`GateError::UnknownGrant`] and changes nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Grant {
+    gate: u64,
     index: usize,
 }
 
@@ -242,8 +248,13 @@ struct GrantEntry {
     rights: Rights,
 }
 
+/// Source of gate ids. Wrapping needs 2^64 gates, so ids never repeat in
+/// practice.
+static NEXT_GATE_ID: AtomicU64 = AtomicU64::new(0);
+
 /// A set of granted directories and the only way through them.
 pub struct Gate {
+    id: u64,
     grants: Vec<Option<GrantEntry>>,
     locked: bool,
     audit: Option<Arc<dyn AuditSink>>,
@@ -254,6 +265,7 @@ impl Gate {
     /// [`grant`](Gate::grant) is called.
     pub fn new() -> Gate {
         Gate {
+            id: NEXT_GATE_ID.fetch_add(1, Ordering::Relaxed),
             grants: Vec::new(),
             locked: false,
             audit: None,
@@ -326,7 +338,10 @@ impl Gate {
             AuditReason::Ok,
             None,
         );
-        Ok(Grant { index })
+        Ok(Grant {
+            gate: self.id,
+            index,
+        })
     }
 
     /// Ends the granting phase and applies kernel containment, strictly:
@@ -397,14 +412,18 @@ impl Gate {
     /// that after a lock the kernel rules are fixed: revoking then stops
     /// this `Gate` from using the grant, but code bypassing the gate keeps
     /// whatever the kernel ruleset allowed until the process exits.
+    ///
+    /// Fails with [`GateError::UnknownGrant`] if the grant was already
+    /// revoked or belongs to another gate; no grant changes.
     pub fn revoke(&mut self, grant: Grant) -> Result<(), GateError> {
-        match self.grants.get_mut(grant.index) {
+        let index = self.index_of(grant);
+        match index.and_then(|index| self.grants.get_mut(index)) {
             Some(slot @ Some(_)) => {
                 let path = slot.take().map(|entry| entry.path);
                 self.emit(
                     AuditOp::Revoke,
                     path.as_deref(),
-                    Some(grant.index),
+                    index,
                     AuditDecision::Allow,
                     AuditReason::Ok,
                     None,
@@ -415,7 +434,7 @@ impl Gate {
                 self.emit(
                     AuditOp::Revoke,
                     None,
-                    Some(grant.index),
+                    index,
                     AuditDecision::Deny,
                     AuditReason::UnknownGrant,
                     None,
@@ -438,13 +457,14 @@ impl Gate {
     ///
     /// Fails with [`GateError::WouldWiden`] if `rights` names a right the
     /// grant does not hold, and with [`GateError::UnknownGrant`] if the grant
-    /// was revoked. Either way the grant is unchanged.
+    /// was revoked or belongs to another gate. Either way no grant changes.
     pub fn narrow(&mut self, grant: Grant, rights: Rights) -> Result<(), GateError> {
-        let Some(Some(entry)) = self.grants.get_mut(grant.index) else {
+        let index = self.index_of(grant);
+        let Some(Some(entry)) = index.and_then(|index| self.grants.get_mut(index)) else {
             self.emit(
                 AuditOp::Narrow,
                 None,
-                Some(grant.index),
+                index,
                 AuditDecision::Deny,
                 AuditReason::UnknownGrant,
                 None,
@@ -457,7 +477,7 @@ impl Gate {
             self.emit(
                 AuditOp::Narrow,
                 Some(&path),
-                Some(grant.index),
+                index,
                 AuditDecision::Deny,
                 AuditReason::RightsExceeded,
                 None,
@@ -472,12 +492,18 @@ impl Gate {
         self.emit(
             AuditOp::Narrow,
             Some(&path),
-            Some(grant.index),
+            index,
             AuditDecision::Allow,
             AuditReason::Ok,
             None,
         );
         Ok(())
+    }
+
+    /// The grant's slot in this gate's table, or `None` for a grant created
+    /// by another gate, whose index means nothing here.
+    fn index_of(&self, grant: Grant) -> Option<usize> {
+        (grant.gate == self.id).then_some(grant.index)
     }
 
     /// Opens an existing file for reading. Needs [`Rights::READ`].

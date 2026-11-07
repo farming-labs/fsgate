@@ -296,3 +296,26 @@ fn broker_decisions_are_audited_server_side() {
     assert_eq!(sink.events().len(), 5);
     assert!(!granted.join("new.txt").exists());
 }
+
+#[test]
+fn a_grant_from_another_gate_is_denied_without_naming_a_grant_here() {
+    let (_root, granted, _) = setup();
+    let (mut gate, sink) = audited_gate(&granted, Rights::READ);
+    let mut other = Gate::new();
+    let foreign = other.grant(&granted, Rights::READ).unwrap();
+
+    let _ = gate.revoke(foreign);
+    let _ = gate.narrow(foreign, Rights::READ);
+
+    let events = sink.events();
+    assert_eq!(events.len(), 3);
+    for (event, op) in events[1..].iter().zip([AuditOp::Revoke, AuditOp::Narrow]) {
+        assert_eq!(event.op, op);
+        assert_eq!(event.decision, AuditDecision::Deny);
+        assert_eq!(event.reason, AuditReason::UnknownGrant);
+        assert_eq!(event.path, None);
+        // Grant 0 of this gate is a different, live grant: the event must
+        // not name it.
+        assert_eq!(event.grant, None);
+    }
+}

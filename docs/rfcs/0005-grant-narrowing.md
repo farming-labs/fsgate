@@ -43,7 +43,8 @@ impl Gate {
   `revoke` instead lets a covering parent grant take over those paths.
 - The grant keeps its id, its held descriptor, and its routing position.
   Nothing re-resolves its path.
-- Narrowing a revoked grant fails with `GateError::UnknownGrant`.
+- Narrowing a revoked grant, or a grant from another gate, fails with
+  `GateError::UnknownGrant`.
 - `narrow` is allowed before and after `lock()`. It only removes
   authority, so it is not part of the granting phase that `lock()` ends.
 
@@ -79,6 +80,7 @@ op `narrow`:
 | Narrowed | the grant's path | its id | `allow` | `ok` |
 | Set names a right the grant lacks | the grant's path | its id | `deny` | `rights_exceeded` |
 | Grant already revoked | `null` | the requested id | `deny` | `unknown_grant` |
+| Grant from another gate | `null` | `null` | `deny` | `unknown_grant` |
 
 Format v1 has no rights key, so the event records that a narrowing
 happened, not the resulting set. `grant` events have the same gap.
@@ -119,8 +121,7 @@ additive for callers.
 
 - Recording the resulting rights in `grant` and `narrow` audit events.
   A `rights` key would be additive within format v1.
-- `Grant` holds only an index. A grant from one gate passed to another
-  gate's `revoke` or `narrow` acts on whichever grant holds that index
-  there, although the `UnknownGrant` documentation says such a grant is
-  rejected. Tagging grants with their gate would make that rejection
-  real. This affects `revoke` today and is not changed here.
+- ~~`Grant` holds only an index, so a grant from one gate passed to
+  another gate's `revoke` or `narrow` acts on whichever grant holds that
+  index there.~~ Fixed: each `Grant` records the gate that created it, and
+  any other gate rejects it with `UnknownGrant`.
