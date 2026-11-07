@@ -103,6 +103,15 @@ pub enum AuditReason {
     Unsupported,
     /// The revoked or narrowed grant did not exist.
     UnknownGrant,
+    /// An intercepted request (RFC 0004) asked for something the
+    /// interception profile does not support: a path that is relative,
+    /// non-canonical, or not UTF-8, a write or other unsupported flag, or an
+    /// unsupported `openat2` layout or resolve flag.
+    UnsupportedInput,
+    /// An intercepted request's arguments could not be copied out of the
+    /// worker's memory: unreadable, inaccessible, or with no terminator
+    /// within the path limit.
+    InvalidMemory,
 }
 
 impl AuditReason {
@@ -116,6 +125,8 @@ impl AuditReason {
             AuditReason::Locked => "locked",
             AuditReason::Unsupported => "unsupported",
             AuditReason::UnknownGrant => "unknown_grant",
+            AuditReason::UnsupportedInput => "unsupported_input",
+            AuditReason::InvalidMemory => "invalid_memory",
         }
     }
 }
@@ -147,6 +158,12 @@ pub struct AuditEvent {
     pub reason: AuditReason,
     /// OS error number when policy allowed but the syscall failed.
     pub errno: Option<i32>,
+    /// For a request intercepted from a worker's syscall (RFC 0004), that
+    /// syscall: `open`, `openat`, or `openat2`. `None` otherwise.
+    pub syscall: Option<&'static str>,
+    /// For an intercepted request, its seccomp notification ID. `None`
+    /// otherwise.
+    pub notification: Option<u64>,
 }
 
 impl AuditEvent {
@@ -165,6 +182,8 @@ impl AuditEvent {
             "decision": self.decision.as_str(),
             "reason": self.reason.as_str(),
             "errno": self.errno,
+            "syscall": self.syscall,
+            "notification": self.notification,
         });
         value.to_string()
     }

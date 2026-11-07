@@ -178,3 +178,129 @@ fn a_refusal_after_policy_is_audited_as_allow_with_errno() {
     assert_eq!(last.errno, Some(ELOOP));
     assert_eq!(last.grant, Some(0));
 }
+
+mod dispatcher {
+    use super::*;
+
+    use fsgate::intercept::{CopyFault, OpenCall, OpenRequest};
+
+    const EACCES: i32 = 13;
+    const EFAULT: i32 = 14;
+    const O_RDONLY: u32 = 0;
+
+    fn request(notification: u64, path: &[u8]) -> OpenRequest {
+        OpenRequest {
+            notification,
+            call: OpenCall::Openat { flags: O_RDONLY },
+            path: Ok(path.to_vec()),
+        }
+    }
+
+    fn audited(granted: &Path) -> (Gate, Arc<Capture>) {
+        let sink = Arc::new(Capture::default());
+        let mut gate = gate(granted, Rights::READ);
+        gate.set_audit_sink(sink.clone());
+        (gate, sink)
+    }
+
+    /// Every captured event. The sink is installed after the setup grant,
+    /// so these are the dispatcher's decisions only.
+    fn decisions(sink: &Capture) -> Vec<AuditEvent> {
+        sink.0.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn a_granted_request_is_delivered_and_audited_once_with_its_syscall() {
+        let (_root, granted, _) = setup();
+        let (gate, sink) = audited(&granted);
+        let path = granted.join("a.txt");
+
+        let file = gate
+            .open_intercepted(&request(7, path.to_str().unwrap().as_bytes()))
+            .unwrap();
+
+        assert_eq!(read(file), "inside");
+        let events = decisions(&sink);
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(
+            (event.op, event.decision, event.reason),
+            (AuditOp::Open, AuditDecision::Allow, AuditReason::Ok)
+        );
+        assert_eq!(event.path.as_deref(), Some(path.as_path()));
+        assert_eq!(
+            (event.syscall, event.notification),
+            (Some("openat"), Some(7))
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&event.to_json_line()).unwrap();
+        assert_eq!(value["syscall"], "openat");
+        assert_eq!(value["notification"], 7);
+    }
+
+    #[test]
+    fn a_request_refused_before_grant_selection_is_still_audited() {
+        let (_root, granted, _) = setup();
+        let (gate, sink) = audited(&granted);
+
+        let err = gate.open_intercepted(&request(8, b"a.txt")).unwrap_err();
+
+        assert_eq!(err.raw_os_error(), Some(EOPNOTSUPP));
+        let events = decisions(&sink);
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(
+            (event.decision, event.reason),
+            (AuditDecision::Deny, AuditReason::UnsupportedInput)
+        );
+        assert_eq!(event.path.as_deref(), Some(Path::new("a.txt")));
+        assert_eq!(event.grant, None);
+        assert_eq!(event.errno, None);
+        assert_eq!(
+            (event.syscall, event.notification),
+            (Some("openat"), Some(8))
+        );
+    }
+
+    #[test]
+    fn unreadable_arguments_are_invalid_memory_without_a_path() {
+        let (_root, granted, _) = setup();
+        let (gate, sink) = audited(&granted);
+        let mut unreadable = request(9, b"");
+        unreadable.path = Err(CopyFault::Unreadable);
+
+        let err = gate.open_intercepted(&unreadable).unwrap_err();
+
+        assert_eq!(err.raw_os_error(), Some(EFAULT));
+        let events = decisions(&sink);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reason, AuditReason::InvalidMemory);
+        assert_eq!(events[0].path, None);
+    }
+
+    #[test]
+    fn policy_and_filesystem_refusals_keep_the_gates_events() {
+        let (_root, granted, outside) = setup();
+        symlink("a.txt", granted.join("inner")).unwrap();
+        let (gate, sink) = audited(&granted);
+        let secret = outside.join("secret.txt");
+        let inner = granted.join("inner");
+
+        let denied = gate.open_intercepted(&request(10, secret.to_str().unwrap().as_bytes()));
+        let looped = gate.open_intercepted(&request(11, inner.to_str().unwrap().as_bytes()));
+
+        assert_eq!(denied.unwrap_err().raw_os_error(), Some(EACCES));
+        assert_eq!(looped.unwrap_err().raw_os_error(), Some(ELOOP));
+        let events = decisions(&sink);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            (events[0].decision, events[0].reason, events[0].notification),
+            (AuditDecision::Deny, AuditReason::NoGrant, Some(10))
+        );
+        assert_eq!(
+            (events[1].decision, events[1].errno, events[1].notification),
+            (AuditDecision::Allow, Some(ELOOP), Some(11))
+        );
+        assert!(events.iter().all(|event| event.syscall == Some("openat")));
+    }
+}

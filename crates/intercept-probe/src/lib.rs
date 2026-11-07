@@ -21,13 +21,16 @@
 //!    known marker back from the child's `/proc/<pid>/mem`, and only then
 //!    releases the child to exec.
 //! 4. For each notification it opens a fresh `/proc/<tid>/mem`, checks the
-//!    notification ID after opening and after copying, validates the copy
-//!    against the RFC's file-open contract, authorizes it with
-//!    `fsgate::Gate::open_regular_strict`, and answers with `SECCOMP_ADDFD_FLAG_SEND` or
-//!    an errno. It never uses `SECCOMP_USER_NOTIF_FLAG_CONTINUE`.
+//!    notification ID after opening and after copying, and copies the path
+//!    and `open_how` once into an `fsgate::intercept::OpenRequest`.
+//!    `fsgate::Gate::open_intercepted` validates that copy against the RFC's
+//!    file-open contract, authorizes it with the strict regular-file open,
+//!    and emits one audit event; the supervisor answers with
+//!    `SECCOMP_ADDFD_FLAG_SEND` or the errno. It never uses
+//!    `SECCOMP_USER_NOTIF_FLAG_CONTINUE`.
 //!
-//! `open_regular_strict` (fsgate feature `experimental-intercept`) resolves
-//! an `O_PATH` handle beneath the grant, refusing every symlink, and reopens
+//! The strict open (fsgate feature `experimental-intercept`) resolves an
+//! `O_PATH` handle beneath the grant, refusing every symlink, and reopens
 //! that same handle once it is known to be a regular file outside procfs and
 //! sysfs. `O_NOFOLLOW`, `RESOLVE_NO_SYMLINKS`, and `RESOLVE_NO_MAGICLINKS`
 //! are accepted because that open already enforces them; other resolve
@@ -38,9 +41,6 @@
 //! - Exec is by path through `std::process::Command`, not `execveat` on the
 //!   held image, and there is no final syscall allowlist yet. Landlock still
 //!   denies the worker every direct file access except its own image.
-//! - Refusals before authorization are not audited; the gate audits its own
-//!   `open` decisions. The dispatcher's audit reasons need an RFC 0002
-//!   update first.
 //! - `seccompiler` (ADR 0001) cannot express `SECCOMP_RET_USER_NOTIF` or
 //!   `SECCOMP_FILTER_FLAG_NEW_LISTENER` as of 0.5.0, so the 11-instruction
 //!   filter is written by hand.
