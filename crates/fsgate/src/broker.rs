@@ -27,6 +27,14 @@ use crate::{Gate, GateError, Rights};
 /// violation and fails the connection closed.
 const MAX_FRAME_BYTES: usize = 1 << 20;
 
+/// Received descriptors must not survive `exec`, like every file std
+/// opens. Linux marks them close-on-exec atomically inside `recvmsg`;
+/// other platforms mark them right after it (see [`read_frame`]).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const RECV_FLAGS: rustix::net::RecvFlags = rustix::net::RecvFlags::CMSG_CLOEXEC;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const RECV_FLAGS: rustix::net::RecvFlags = rustix::net::RecvFlags::empty();
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Request {
@@ -404,7 +412,12 @@ fn write_frame(stream: &mut UnixStream, body: &[u8], fd: Option<BorrowedFd>) -> 
 }
 
 /// Reads one frame, collecting any file descriptors delivered alongside
-/// it. Returns `UnexpectedEof` when the peer is gone.
+/// it, each marked close-on-exec. Returns `UnexpectedEof` when the peer
+/// is gone.
+///
+/// Without `MSG_CMSG_CLOEXEC` (macOS and other non-Linux systems), a
+/// thread that forks and execs between `recvmsg` and `fcntl` can still
+/// inherit a descriptor; nothing outside the kernel can close that window.
 fn read_frame(stream: &mut UnixStream) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
     let mut fds = Vec::new();
     let mut acc: Vec<u8> = Vec::new();
@@ -437,11 +450,17 @@ fn read_frame(stream: &mut UnixStream) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
             &*stream,
             &mut [IoSliceMut::new(&mut buf)],
             &mut ancillary,
-            rustix::net::RecvFlags::empty(),
+            RECV_FLAGS,
         )?;
         for message in ancillary.drain() {
             if let rustix::net::RecvAncillaryMessage::ScmRights(received_fds) = message {
-                fds.extend(received_fds);
+                for fd in received_fds {
+                    // On failure, `?` drops (closes) this descriptor and
+                    // every other one received so far.
+                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                    rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)?;
+                    fds.push(fd);
+                }
             }
         }
         if received.bytes == 0 {

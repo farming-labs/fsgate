@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Descriptors the worker receives through `BrokerGate` (`open` and `create`) are close-on-exec, like the files std opens. In 0.1.0 they were inherited by every program the worker started, so a spawned child could read or write a brokered file without asking the broker. On Linux the flag is set atomically by `recvmsg`; on macOS it is set immediately after, and a concurrent fork and exec on another thread can still inherit the descriptor in that window.
+
 ## 0.1.0 (unreleased)
 
 Prepared for the initial signed-tag release. Not yet tagged or published to crates.io.
