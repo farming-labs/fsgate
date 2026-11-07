@@ -662,12 +662,25 @@ fn a_revoked_grant_denies_later_opens_but_delivered_files_stay_usable() {
         out,
         format!("first=inside\nsecond=errno={EACCES}\nkept=inside\n")
     );
+    // The revoke is audited too, between the two opens.
+    let revoked = decisions
+        .recv_timeout(Duration::from_secs(10))
+        .expect("revoke event");
+    assert_eq!(
+        (revoked.op, revoked.decision, revoked.path),
+        (
+            AuditOp::Revoke,
+            AuditDecision::Allow,
+            Some(dirs.granted.clone())
+        )
+    );
     let second = decisions
         .recv_timeout(Duration::from_secs(10))
         .expect("second decision");
     assert_eq!(
-        (second.decision, second.reason, second.path),
+        (second.op, second.decision, second.reason, second.path),
         (
+            AuditOp::Open,
             AuditDecision::Deny,
             AuditReason::NoGrant,
             Some(PathBuf::from(&path))
