@@ -18,6 +18,11 @@ fn main() -> Result<(), fsgate::GateError> {
 }
 ```
 
+```sh
+cargo add fsgate             # the library
+cargo install fsgate         # the fsgate-broker binary
+```
+
 ## How it enforces
 
 Two layers:
@@ -41,9 +46,9 @@ fsgate-broker --grant /srv/data:rl --socket /tmp/app.sock -- ./worker
 
 ## Status
 
-Early implementation, released as the signed tag [`v0.1.0`](https://github.com/farming-labs/fsgate/tree/v0.1.0); not independently reviewed. The handle layer (M1), Linux containment (M2), broker (M3), and audit sink (M4) are implemented. Tests cover denied operations without side effects, Linux kernel enforcement in a child process, and broker failure. `Gate::set_audit_sink` observes authority decisions synchronously, including denials the caller discards and requests served by the broker. A rights denial carries the matched grant's ID; a kernel refusal after a policy allow carries an errno. `Gate::narrow` ([RFC 0005](docs/rfcs/0005-grant-narrowing.md), M7) is implemented and included in v0.1.0.
+Early implementation, published on crates.io as [`fsgate` 0.1.1](https://crates.io/crates/fsgate/0.1.1) from the signed tag [`v0.1.1`](https://github.com/farming-labs/fsgate/tree/v0.1.1); not independently reviewed. The handle layer (M1), Linux containment (M2), broker (M3), and audit sink (M4) are implemented. Tests cover denied operations without side effects, Linux kernel enforcement in a child process, and broker failure. `Gate::set_audit_sink` observes authority decisions synchronously, including denials the caller discards and requests served by the broker. A rights denial carries the matched grant's ID; a kernel refusal after a policy allow carries an errno. `Gate::narrow` ([RFC 0005](docs/rfcs/0005-grant-narrowing.md), M7) is implemented and included since v0.1.0.
 
-v0.1.0 is the signed tag `v0.1.0` on `0ad477f`, prepared in [PR #1](https://github.com/farming-labs/fsgate/pull/1) and [PR #3](https://github.com/farming-labs/fsgate/pull/3). The README example compiles as a doctest, public documentation is required by `missing_docs = "deny"`, and CI tests the packaged crate as well as the checkout. v0.1.0 kept `publish = false`. 0.1.1 is prepared as the first crates.io release, adding the broker close-on-exec fix; see [the release procedure](docs/RELEASING.md). Design: [RFC 0001](docs/rfcs/0001-core-design.md); plan and evidence: [ROADMAP.md](ROADMAP.md).
+v0.1.0 is the signed tag `v0.1.0` on `0ad477f`, prepared in [PR #1](https://github.com/farming-labs/fsgate/pull/1) and [PR #3](https://github.com/farming-labs/fsgate/pull/3). The README example compiles as a doctest, public documentation is required by `missing_docs = "deny"`, and CI tests the packaged crate as well as the checkout. v0.1.0 kept `publish = false` and is not on crates.io. 0.1.1 is the first crates.io release and adds the broker close-on-exec fix ([PR #15](https://github.com/farming-labs/fsgate/pull/15)); releases follow [the release procedure](docs/RELEASING.md). Design: [RFC 0001](docs/rfcs/0001-core-design.md); plan and evidence: [ROADMAP.md](ROADMAP.md).
 
 ## Prior art
 

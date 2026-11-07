@@ -127,8 +127,20 @@ curl -sf -A "fsgate-release-check" "https://crates.io/api/v1/crates/fsgate/$vers
   | python3 -c 'import json,sys; v=json.load(sys.stdin)["version"]; print(v["num"], v["checksum"])'
 ```
 
-The checksum must match `shasum -a 256 "target/package/fsgate-$version.crate"`,
-the archive `cargo publish` just built and uploaded from the tagged checkout.
+The checksum must match the archive `cargo publish` just uploaded from the
+tagged checkout. Cargo 1.99 leaves it at
+`target/package/tmp-crate/fsgate-$version.crate` (older cargo:
+`target/package/fsgate-$version.crate`). Also download the published crate
+and confirm it records the tagged commit:
+
+```sh
+curl -sfL -A "fsgate-release-check" -o "fsgate-$version.crate" \
+  "https://static.crates.io/crates/fsgate/fsgate-$version.crate"
+shasum -a 256 "fsgate-$version.crate"
+tar -xzOf "fsgate-$version.crate" "fsgate-$version/.cargo_vcs_info.json"
+```
+
+The `sha1` in `.cargo_vcs_info.json` must equal `$release_sha`.
 If a publish fails, fix the cause and retry the same version without bumping
 again; if it succeeded with a defect, yank it and release a new version.
 
