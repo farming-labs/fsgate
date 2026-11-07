@@ -139,6 +139,14 @@ pub(crate) fn user_notif_available() -> io::Result<()> {
     .map(drop)
 }
 
+/// Sends `signal` to process `pid`. Test-only: the launcher never signals
+/// its worker during normal operation.
+#[cfg(test)]
+pub(crate) fn signal(pid: i32, signal: i32) -> io::Result<()> {
+    // SAFETY: kill takes integers only.
+    check(unsafe { libc::kill(pid, signal) } as c_long).map(drop)
+}
+
 /// Receives one pending notification.
 pub(crate) fn notif_recv(listener: BorrowedFd<'_>) -> io::Result<libc::seccomp_notif> {
     // SAFETY: seccomp_notif is plain integers, so all-zero is a valid value,

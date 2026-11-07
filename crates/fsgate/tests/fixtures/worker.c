@@ -72,6 +72,10 @@ static void *flip_race_path(void *unused) {
     return NULL;
 }
 
+static void on_signal(int signal) {
+    (void)signal;
+}
+
 static int run_execveat(int dirfd, const char *path) {
     char *args[] = {"worker", "fds", NULL};
     char *env[] = {NULL};
@@ -125,6 +129,47 @@ int main(int argc, char **argv) {
         atomic_store(&race_stop, 1);
         pthread_join(flipper, NULL);
         printf("ok granted=%d denied=%d\n", granted, denied);
+        return 0;
+    }
+    if (strcmp(op, "interrupted-open") == 0) {
+        /* A handler without SA_RESTART: a signal ends the blocked open with
+         * EINTR. Then report any descriptor beyond stdio. */
+        struct sigaction action = {0};
+        action.sa_handler = on_signal;
+        sigaction(SIGUSR1, &action, NULL);
+        int fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            printf("opened=%d\n", fd);
+        } else {
+            printf("errno=%d\n", errno);
+        }
+        for (int other = 3; other < 1024; other++) {
+            if (fcntl(other, F_GETFD) != -1) printf("open=%d\n", other);
+        }
+        printf("done\n");
+        return 0;
+    }
+    if (strcmp(op, "revoke-cycle") == 0) {
+        /* Open, wait for one byte on stdin, open again, then reread the
+         * first descriptor. */
+        int first = open(path, O_RDONLY);
+        if (first < 0) return fail();
+        char buf[64] = {0};
+        ssize_t n = read(first, buf, sizeof buf - 1);
+        printf("first=%.*s\n", (int)(n > 0 ? n : 0), buf);
+        fflush(stdout);
+        char go;
+        if (read(0, &go, 1) != 1) return fail();
+        int second = open(path, O_RDONLY);
+        if (second < 0) {
+            printf("second=errno=%d\n", errno);
+        } else {
+            printf("second=opened\n");
+        }
+        memset(buf, 0, sizeof buf);
+        lseek(first, 0, SEEK_SET);
+        n = read(first, buf, sizeof buf - 1);
+        printf("kept=%.*s\n", (int)(n > 0 ? n : 0), buf);
         return 0;
     }
     if (strcmp(op, "write") == 0) {
