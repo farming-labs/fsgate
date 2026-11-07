@@ -83,7 +83,10 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      # actionlint also runs the runner's shellcheck on every `run:` script.
+      # actionlint also runs the runner's shellcheck on every `run:` script,
+      # but skips that check without failing when shellcheck is missing.
+      # Require it so a runner image without shellcheck fails here.
+      - run: shellcheck --version
       - run: pipx run --spec actionlint-py==1.7.12.25 actionlint
       # Online audits use the read-only job token to check that pinned
       # action SHAs exist in their repositories and have no known advisories.
