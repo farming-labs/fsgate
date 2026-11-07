@@ -356,3 +356,50 @@ fn narrowing_to_no_rights_keeps_routing_to_the_grant() {
         Err(GateError::RightsExceeded { .. })
     ));
 }
+
+#[test]
+fn revoking_a_grant_from_another_gate_is_unknown_grant_and_changes_neither_gate() {
+    let (root, granted, _) = setup();
+    let other_dir = root.path().join("other");
+    fs::create_dir(&other_dir).unwrap();
+    fs::write(granted.join("a.txt"), b"a").unwrap();
+    fs::write(other_dir.join("b.txt"), b"b").unwrap();
+
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::READ).unwrap();
+    let mut other = Gate::new();
+    let foreign = other.grant(&other_dir, Rights::READ).unwrap();
+
+    // Each grant is the first in its own gate, so only the gate tells them
+    // apart.
+    assert!(matches!(gate.revoke(foreign), Err(GateError::UnknownGrant)));
+
+    let file = gate.open(granted.join("a.txt")).unwrap();
+    assert_eq!(read_to_string(file), "a");
+    let file = other.open(other_dir.join("b.txt")).unwrap();
+    assert_eq!(read_to_string(file), "b");
+}
+
+#[test]
+fn narrowing_a_grant_from_another_gate_is_unknown_grant_and_keeps_both_rights() {
+    let (root, granted, _) = setup();
+    let other_dir = root.path().join("other");
+    fs::create_dir(&other_dir).unwrap();
+    let all = Rights::READ | Rights::WRITE | Rights::CREATE;
+
+    let mut gate = Gate::new();
+    gate.grant(&granted, all).unwrap();
+    let mut other = Gate::new();
+    let foreign = other.grant(&other_dir, all).unwrap();
+
+    assert!(matches!(
+        gate.narrow(foreign, Rights::READ),
+        Err(GateError::UnknownGrant)
+    ));
+
+    // Neither grant lost the rights to create a file.
+    gate.create(granted.join("a.txt")).unwrap();
+    other.create(other_dir.join("b.txt")).unwrap();
+    assert!(granted.join("a.txt").exists());
+    assert!(other_dir.join("b.txt").exists());
+}

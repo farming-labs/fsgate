@@ -10,6 +10,10 @@
 
 - Breaking: `AuditOp::Narrow` and `GateError::WouldWiden` are new variants, so exhaustive matches on `AuditOp` or `GateError` need a new arm.
 
+### Fixed
+
+- `revoke` and `narrow` reject a `Grant` created by a different gate with `GateError::UnknownGrant`, as documented, and change no grant. Before, a grant carried only its index, so another gate revoked or narrowed whichever of its own grants held that index. The audit event for a rejected foreign grant has `grant: null`.
+
 ## 0.1.0 (unreleased)
 
 Prepared for the initial signed-tag release. Not yet tagged or published to crates.io.
