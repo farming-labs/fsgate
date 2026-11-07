@@ -21,6 +21,7 @@
 //!   fork: no allocation, no locks, no std I/O, and no panicking operations.
 //!   Errors are `io::Error`s built from an errno, which do not allocate.
 
+use std::ffi::CString;
 use std::io;
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
@@ -223,24 +224,84 @@ pub(crate) struct ChildSetup {
     pub(crate) peer: RawFd,
     /// The notification filter program.
     pub(crate) filter: Vec<libc::sock_filter>,
+    /// The checked worker image, which the child executes by descriptor.
+    pub(crate) image: RawFd,
+    /// The worker's argument vector, `argv[0]` included.
+    pub(crate) argv: Vec<CString>,
 }
 
 /// Registers the startup sequence to run in the child between fork and
 /// exec: close-on-exec for every inherited descriptor above stdio,
 /// `no_new_privs`, Landlock, the notification filter, handing the listener
-/// to the supervisor, and waiting for the supervisor's release.
+/// to the supervisor, waiting for the supervisor's release, and finally
+/// `execveat` on the held image. `Command` never execs its program path:
+/// the closure either replaces the process or returns the errno.
 pub(crate) fn install_child_setup(command: &mut Command, setup: ChildSetup) {
     let ChildSetup {
         ruleset,
         socket,
         peer,
         filter,
+        image,
+        argv,
     } = setup;
-    let child = move || child_setup(ruleset, socket, peer, &filter);
-    // SAFETY: `child_setup` keeps the post-fork rules in the module contract,
-    // and the caller keeps all three descriptors open until `spawn` returns.
+    let exec = ExecArgs::new(argv);
+    let child = move || {
+        child_setup(ruleset, socket, peer, &filter)?;
+        Err(exec.execveat(image))
+    };
+    // SAFETY: `child_setup` and `ExecArgs::execveat` keep the post-fork
+    // rules in the module contract, and the caller keeps every descriptor
+    // open until `spawn` returns.
     unsafe {
         command.pre_exec(child);
+    }
+}
+
+/// An argument vector and an empty environment, laid out before the fork
+/// so the child only reads them.
+struct ExecArgs {
+    /// Owns the strings `argv` points into; the heap buffers do not move
+    /// when the struct does.
+    _strings: Vec<CString>,
+    /// NUL-terminated array of the strings' addresses.
+    argv: Vec<usize>,
+    /// An empty, NUL-terminated environment.
+    envp: [usize; 1],
+}
+
+impl ExecArgs {
+    fn new(strings: Vec<CString>) -> ExecArgs {
+        let argv = strings
+            .iter()
+            .map(|string| string.as_ptr() as usize)
+            .chain(std::iter::once(0))
+            .collect();
+        ExecArgs {
+            _strings: strings,
+            argv,
+            envp: [0],
+        }
+    }
+
+    /// Executes the image behind `image` without resolving any path. Returns
+    /// only on failure, with the errno.
+    fn execveat(&self, image: RawFd) -> io::Error {
+        // SAFETY: `argv` and `envp` are NUL-terminated arrays of addresses of
+        // NUL-terminated strings owned by `self`; on x86_64 `usize` and a
+        // pointer have the same size and alignment. The empty path with
+        // AT_EMPTY_PATH executes `image` itself.
+        unsafe {
+            libc::syscall(
+                libc::SYS_execveat,
+                image,
+                c"".as_ptr(),
+                self.argv.as_ptr(),
+                self.envp.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            );
+        }
+        io::Error::last_os_error()
     }
 }
 
