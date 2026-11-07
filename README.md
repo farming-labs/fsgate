@@ -37,6 +37,13 @@ fsgate-broker --grant /srv/data:rl --socket /tmp/app.sock -- ./worker
 # worker: BrokerGate::connect(env FSGATE_BROKER_SOCKET) → open/create/metadata/read_dir
 ```
 
+Experimental and unsupported, Linux x86_64 only: built with `--features experimental-intercept`, `fsgate-broker --experimental-intercept` runs an unmodified static binary and answers its `open`/`openat`/`openat2` calls from the grants ([RFC 0004](docs/rfcs/0004-filesystem-interception.md)). Without `--apply` it only prints the plan; it never falls back to running the worker unconfined.
+
+```text
+fsgate-broker --experimental-intercept --grant /srv/data:r -- ./report /srv/data/in.csv           # plan only
+fsgate-broker --experimental-intercept --grant /srv/data:r --audit --apply -- ./report /srv/data/in.csv
+```
+
 ## What fsgate does not do
 
 - It does not sandbox the network, environment, or memory. Filesystem only.

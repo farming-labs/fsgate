@@ -486,3 +486,76 @@ fn a_static_worker_passes_the_check() {
         .check()
         .expect("the fixture is a static x86_64 ELF");
 }
+
+/// `fsgate-broker --experimental-intercept` with `args`, granting `granted`
+/// read-only.
+fn broker(dirs: &Dirs, args: &[&str]) -> std::process::Output {
+    let grant = format!("{}:r", dirs.granted.display());
+    Command::new(env!("CARGO_BIN_EXE_fsgate-broker"))
+        .args(["--experimental-intercept", "--grant", &grant])
+        .args(args)
+        .output()
+        .expect("run fsgate-broker")
+}
+
+#[test]
+fn the_broker_plans_without_starting_anything() {
+    let dirs = Dirs::new();
+    let path = dirs.granted("a.txt");
+    let worker = worker().to_str().unwrap();
+
+    let output = broker(&dirs, &["--", worker, "read", &path]);
+
+    let plan = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{plan}");
+    assert!(plan.contains("check:   ok"), "{plan}");
+    assert!(
+        plan.contains(&format!("grant:   {} READ", dirs.granted.display())),
+        "{plan}"
+    );
+    assert!(plan.contains("Nothing was started"), "{plan}");
+    // The worker would have printed the file.
+    assert!(!plan.contains("inside"), "{plan}");
+}
+
+#[test]
+fn the_broker_applies_and_audits_the_worker() {
+    let dirs = Dirs::new();
+    let path = dirs.granted("a.txt");
+    let worker = worker().to_str().unwrap();
+
+    let output = broker(&dirs, &["--audit", "--apply", "--", worker, "read", &path]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"inside");
+    let audit = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        audit.contains(r#""op":"open""#) && audit.contains(r#""syscall":"openat""#),
+        "{audit}"
+    );
+}
+
+#[test]
+fn the_broker_relays_the_workers_stderr_and_exit_code() {
+    let dirs = Dirs::new();
+    let worker = worker().to_str().unwrap();
+
+    let output = broker(&dirs, &["--apply", "--", worker, "no-such-op"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown op: no-such-op"));
+}
+
+#[test]
+fn the_broker_refuses_an_image_the_profile_rejects_in_plan_and_apply() {
+    let dirs = Dirs::new();
+
+    let plan = broker(&dirs, &["--", "/bin/true"]);
+    let apply = broker(&dirs, &["--apply", "--", "/bin/true"]);
+
+    assert_eq!(plan.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&plan.stdout).contains("refused"));
+    assert_eq!(apply.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&apply.stderr).contains("needs an ELF interpreter"));
+    assert!(apply.stdout.is_empty());
+}
