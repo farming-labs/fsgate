@@ -11,7 +11,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 
 use rustix::event::{PollFd, PollFlags, Timespec};
@@ -19,7 +20,7 @@ use rustix::fs::{FileType, Mode, OFlags};
 use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
 
 use super::{CopyFault, OPEN_HOW_SIZE, OpenCall, OpenHow, OpenRequest, PATH_MAX, filters, sys};
-use crate::Gate;
+use crate::{Gate, GateError, Grant, Rights};
 
 /// Known bytes the supervisor reads back from the restricted child before
 /// releasing it. The child is a fork of this process, so the static sits at
@@ -52,6 +53,11 @@ enum Fault {
     /// supervisor renames `with` over the executable path.
     #[cfg_attr(not(test), allow(dead_code))]
     ReplaceImage { with: PathBuf },
+    /// After deciding the first request, and before delivering it, the
+    /// supervisor interrupts the worker with `SIGUSR1` and waits until the
+    /// request is cancelled.
+    #[cfg_attr(not(test), allow(dead_code))]
+    InterruptFirstRequest,
 }
 
 /// Launches a worker under the RFC 0004 interception profile and answers
@@ -127,16 +133,131 @@ impl Launch {
         check_image(&image, &self.executable)
     }
 
-    /// Runs the worker to completion and returns its exit status and
-    /// output.
+    /// Starts the worker and returns a handle to it while its supervisor
+    /// answers requests from `gate`.
     ///
     /// Fails before the worker runs if [`check`](Launch::check) would, or if
-    /// any startup step fails; the worker never runs unconfined. After it
-    /// starts, the supervisor answers requests until the worker exits, or
-    /// gives up after 30 seconds without a request or an exit, failing any
-    /// pending open.
+    /// any startup step fails; the worker never runs unconfined. The
+    /// supervisor answers until the worker exits, or gives up after 30
+    /// seconds without a request or an exit, failing any pending open.
+    pub fn spawn(&self, gate: Gate) -> io::Result<Running> {
+        spawn(&self.executable, &self.args, gate, Fault::None)
+    }
+
+    /// Runs the worker to completion, with standard input closed, and
+    /// returns its exit status and output: [`spawn`](Launch::spawn), then
+    /// [`Running::wait`].
     pub fn run(&self, gate: Gate) -> io::Result<Outcome> {
-        run(&self.executable, &self.args, gate, Fault::None)
+        self.spawn(gate)?.wait()
+    }
+}
+
+/// A worker started by [`Launch::spawn`], with its supervisor answering
+/// requests from the gate.
+///
+/// [`revoke`](Running::revoke) and [`narrow`](Running::narrow) change the
+/// gate while the worker runs. They are serialized with the supervisor: each
+/// returns only after any request already being decided has been answered,
+/// and every request after that is decided against the changed grants.
+/// Neither takes back a descriptor already delivered; the worker keeps
+/// reading it.
+///
+/// Standard output and error are drained in the background and returned by
+/// [`wait`](Running::wait). Dropping a `Running` without waiting kills and
+/// reaps the worker; its supervisor then stops on its own.
+pub struct Running {
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
+    stdout: Option<JoinHandle<io::Result<Vec<u8>>>>,
+    stderr: Option<JoinHandle<io::Result<Vec<u8>>>>,
+    supervisor: Option<JoinHandle<io::Result<()>>>,
+    gate: Arc<Mutex<Gate>>,
+}
+
+impl Running {
+    /// The worker's process ID.
+    pub fn id(&self) -> u32 {
+        self.child.as_ref().map_or(0, Child::id)
+    }
+
+    /// Takes the writing end of the worker's standard input, a dedicated
+    /// pipe. Dropping it, or calling [`wait`](Running::wait), closes it.
+    pub fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.stdin.take()
+    }
+
+    /// Revokes `grant` for every later request (see [`Gate::revoke`]).
+    pub fn revoke(&self, grant: Grant) -> Result<(), GateError> {
+        lock(&self.gate).revoke(grant)
+    }
+
+    /// Narrows `grant` for every later request (see [`Gate::narrow`]).
+    pub fn narrow(&self, grant: Grant, rights: Rights) -> Result<(), GateError> {
+        lock(&self.gate).narrow(grant, rights)
+    }
+
+    /// Kills the worker with `SIGKILL`. Call [`wait`](Running::wait)
+    /// afterwards to reap it and collect its output.
+    pub fn kill(&mut self) -> io::Result<()> {
+        match &mut self.child {
+            Some(child) => child.kill(),
+            None => Ok(()),
+        }
+    }
+
+    /// Closes standard input, waits for the worker to exit, and returns its
+    /// status and output. Fails if the supervisor failed while serving, for
+    /// example after 30 seconds without a request or an exit.
+    pub fn wait(mut self) -> io::Result<Outcome> {
+        drop(self.stdin.take());
+        let status = match self.child.take() {
+            Some(mut child) => child.wait(),
+            None => Err(io::Error::other("the worker was already reaped")),
+        };
+        let stdout = join_output(self.stdout.take());
+        let stderr = join_output(self.stderr.take());
+        // The supervisor stops once the reaped worker leaves the filter.
+        if let Some(supervisor) = self.supervisor.take() {
+            join(supervisor)?;
+        }
+        Ok(Outcome {
+            status: status?,
+            stdout: stdout?,
+            stderr: stderr?,
+        })
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Locks the shared gate. A panic while it was held cannot leave a grant
+/// half changed, because each gate method completes or returns an error, so
+/// a poisoned lock is used as is: revocation must keep working.
+fn lock(gate: &Mutex<Gate>) -> MutexGuard<'_, Gate> {
+    gate.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn drain(mut pipe: impl Read + Send + 'static) -> JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        pipe.read_to_end(&mut output)?;
+        Ok(output)
+    })
+}
+
+fn join_output(reader: Option<JoinHandle<io::Result<Vec<u8>>>>) -> io::Result<Vec<u8>> {
+    match reader {
+        Some(reader) => reader
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("an output reader panicked"))),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -162,11 +283,11 @@ fn open_image(executable: &Path) -> io::Result<File> {
     )?))
 }
 
-/// Runs `executable` with `args` as a contained worker whose open-family
+/// Starts `executable` with `args` as a contained worker whose open-family
 /// syscalls are answered from `gate`. A failure before exec, including the
 /// supervisor refusing to release the startup barrier, returns the child's
 /// error and the worker never runs.
-fn run(executable: &Path, args: &[OsString], gate: Gate, fault: Fault) -> io::Result<Outcome> {
+fn spawn(executable: &Path, args: &[OsString], gate: Gate, fault: Fault) -> io::Result<Running> {
     preflight()?;
     let image = open_image(executable)?;
     check_image(&image, executable)?;
@@ -183,17 +304,19 @@ fn run(executable: &Path, args: &[OsString], gate: Gate, fault: Fault) -> io::Re
         })
         .collect::<io::Result<Vec<_>>>()?;
     let target = executable.to_path_buf();
+    let gate = Arc::new(Mutex::new(gate));
+    let shared = Arc::clone(&gate);
     let (supervisor_end, child_end) = UnixStream::pair()?;
     // The supervisor holds its end until the child has sent the listener or
     // died, so this number stays valid through the fork.
     let peer = supervisor_end.as_raw_fd();
-    let supervisor = thread::spawn(move || supervise(supervisor_end, gate, fault, &target));
+    let supervisor = thread::spawn(move || supervise(supervisor_end, &shared, fault, &target));
 
     let mut command = Command::new(executable);
     command
         .args(args)
         .env_clear()
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     sys::install_child_setup(
@@ -214,19 +337,20 @@ fn run(executable: &Path, args: &[OsString], gate: Gate, fault: Fault) -> io::Re
     drop(ruleset);
     drop(image);
 
-    let output = match spawned {
-        Ok(child) => child.wait_with_output(),
+    let mut child = match spawned {
+        Ok(child) => child,
         // A supervisor failure explains a failed startup better than the
         // child's errno; otherwise the child's error (a refused barrier, a
         // failed exec) is the answer.
         Err(err) => return Err(join(supervisor).err().unwrap_or(err)),
     };
-    join(supervisor)?;
-    let output = output?;
-    Ok(Outcome {
-        status: output.status,
-        stdout: output.stdout,
-        stderr: output.stderr,
+    Ok(Running {
+        stdin: child.stdin.take(),
+        stdout: child.stdout.take().map(drain),
+        stderr: child.stderr.take().map(drain),
+        child: Some(child),
+        supervisor: Some(supervisor),
+        gate,
     })
 }
 
@@ -327,7 +451,13 @@ fn join(supervisor: JoinHandle<io::Result<()>>) -> io::Result<()> {
         .unwrap_or_else(|_| Err(io::Error::other("supervisor thread panicked")))
 }
 
-fn supervise(socket: UnixStream, gate: Gate, fault: Fault, executable: &Path) -> io::Result<()> {
+fn supervise(
+    socket: UnixStream,
+    gate: &Mutex<Gate>,
+    fault: Fault,
+    executable: &Path,
+) -> io::Result<()> {
+    let interrupt_first = fault == Fault::InterruptFirstRequest;
     let (listener, pid) = receive_listener(&socket)?;
     await_restricted(&socket)?;
     verify_listener(&listener)?;
@@ -341,11 +471,11 @@ fn supervise(socket: UnixStream, gate: Gate, fault: Fault, executable: &Path) ->
             release(&socket)?;
             return Ok(());
         }
-        Fault::None => {}
+        Fault::None | Fault::InterruptFirstRequest => {}
     }
     release(&socket)?;
     drop(socket);
-    serve(&listener, &gate)
+    serve(&listener, gate, interrupt_first)
 }
 
 fn startup_error(message: &str) -> io::Error {
@@ -424,7 +554,7 @@ fn release(socket: &UnixStream) -> io::Result<()> {
     (&*socket).write_all(&[sys::RELEASE_BYTE])
 }
 
-fn serve(listener: &OwnedFd, gate: &Gate) -> io::Result<()> {
+fn serve(listener: &OwnedFd, gate: &Mutex<Gate>, mut interrupt_next: bool) -> io::Result<()> {
     loop {
         let mut fds = [PollFd::new(listener, PollFlags::IN)];
         if rustix::event::poll(&mut fds, Some(&IDLE_TIMEOUT))? == 0 {
@@ -436,7 +566,7 @@ fn serve(listener: &OwnedFd, gate: &Gate) -> io::Result<()> {
         let revents = fds[0].revents();
         if revents.contains(PollFlags::IN) {
             match sys::notif_recv(listener.as_fd()) {
-                Ok(notif) => answer(listener, gate, &notif),
+                Ok(notif) => answer(listener, gate, &notif, std::mem::take(&mut interrupt_next)),
                 // The target died or its syscall was interrupted first.
                 Err(err) if err.raw_os_error() == Some(libc::ENOENT) => {}
                 Err(err) => return Err(err),
@@ -459,8 +589,10 @@ enum Copied {
 }
 
 /// Answers one notification: the gate decides and audits; the supervisor
-/// delivers the file or the errno.
-fn answer(listener: &OwnedFd, gate: &Gate, notif: &libc::seccomp_notif) {
+/// delivers the file or the errno. The gate stays locked from the decision
+/// through the delivery, so a concurrent revoke waits for this request and
+/// applies to every later one.
+fn answer(listener: &OwnedFd, gate: &Mutex<Gate>, notif: &libc::seccomp_notif, interrupt: bool) {
     let request = match copy_request(listener, notif) {
         Copied::Cancelled => return,
         Copied::NotAnOpen => {
@@ -469,24 +601,45 @@ fn answer(listener: &OwnedFd, gate: &Gate, notif: &libc::seccomp_notif) {
         }
         Copied::Request(request) => request,
     };
+    let gate = lock(gate);
     let errno = match gate.open_intercepted(&request) {
-        Ok(file) => match sys::notif_addfd_send(
-            listener.as_fd(),
-            notif.id,
-            file.as_fd(),
-            request.wants_cloexec(),
-        ) {
-            Ok(_) => return,
-            // Cancelled between authorization and delivery.
-            Err(err) if err.raw_os_error() == Some(libc::ENOENT) => return,
-            Err(err) => err.raw_os_error().unwrap_or(libc::EIO),
-        },
+        Ok(file) => {
+            if interrupt {
+                interrupt_request(listener, notif);
+            }
+            match sys::notif_addfd_send(
+                listener.as_fd(),
+                notif.id,
+                file.as_fd(),
+                request.wants_cloexec(),
+            ) {
+                Ok(_) => return,
+                // Cancelled between authorization and delivery: `file` is
+                // dropped here and nothing was installed in the worker.
+                Err(err) if err.raw_os_error() == Some(libc::ENOENT) => return,
+                Err(err) => err.raw_os_error().unwrap_or(libc::EIO),
+            }
+        }
         Err(err) => err.raw_os_error().unwrap_or(libc::EIO),
     };
     // Fails with ENOENT if the request was cancelled meanwhile; then there
     // is nobody to answer.
     let _ = sys::notif_send_error(listener.as_fd(), notif.id, errno);
 }
+
+/// The `InterruptFirstRequest` fault: signals the worker and waits, without
+/// sleeping, until its blocked syscall is cancelled.
+#[cfg(test)]
+fn interrupt_request(listener: &OwnedFd, notif: &libc::seccomp_notif) {
+    let _ = sys::signal(notif.pid as i32, libc::SIGUSR1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while sys::notif_id_valid(listener.as_fd(), notif.id) && std::time::Instant::now() < deadline {
+        thread::yield_now();
+    }
+}
+
+#[cfg(not(test))]
+fn interrupt_request(_: &OwnedFd, _: &libc::seccomp_notif) {}
 
 /// Copies the request's arguments out of the worker once (RFC 0004,
 /// "Memory, delivery, and audit"). Validation happens in fsgate, on this
@@ -644,6 +797,13 @@ mod tests {
         }
     }
 
+    /// `spawn` with a fault, standard input closed, then `wait`.
+    fn run(executable: &Path, args: &[OsString], gate: Gate, fault: Fault) -> io::Result<Outcome> {
+        let mut running = spawn(executable, args, gate, fault)?;
+        drop(running.take_stdin());
+        running.wait()
+    }
+
     #[test]
     fn an_aborted_startup_never_executes_the_worker() {
         let fixture = Fixture::new();
@@ -698,6 +858,31 @@ mod tests {
         assert_eq!(
             fs::read(&fixture.worker).unwrap(),
             b"#!/bin/sh\necho swapped\n"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_request_delivers_no_descriptor() {
+        let fixture = Fixture::new();
+        let args = vec![
+            "interrupted-open".into(),
+            fixture.granted.join("a.txt").into(),
+        ];
+
+        let outcome = run(
+            &fixture.worker,
+            &args,
+            fixture.gate(),
+            Fault::InterruptFirstRequest,
+        )
+        .expect("worker run");
+
+        // The open was decided, then cancelled by the signal: the worker sees
+        // EINTR and holds no descriptor beyond stdio. The supervisor's copy
+        // of the file was dropped when delivery failed.
+        assert_eq!(
+            outcome.stdout,
+            format!("errno={}\ndone\n", libc::EINTR).as_bytes()
         );
     }
 }
