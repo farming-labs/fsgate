@@ -107,6 +107,9 @@ pub fn run(executable: &Path, args: &[&str], gate: Gate, fault: Fault) -> io::Re
     }
     let ruleset = sys::executable_ruleset(image.as_fd())?;
     let (supervisor_end, child_end) = UnixStream::pair()?;
+    // The supervisor holds its end until the child has sent the listener or
+    // died, so this number stays valid through the fork.
+    let peer = supervisor_end.as_raw_fd();
     let supervisor = thread::spawn(move || supervise(supervisor_end, gate, fault));
 
     let mut command = Command::new(executable);
@@ -121,6 +124,7 @@ pub fn run(executable: &Path, args: &[&str], gate: Gate, fault: Fault) -> io::Re
         sys::ChildSetup {
             ruleset: ruleset.as_raw_fd(),
             socket: child_end.as_raw_fd(),
+            peer,
             filter: notify_filter(),
         },
     );
@@ -132,10 +136,10 @@ pub fn run(executable: &Path, args: &[&str], gate: Gate, fault: Fault) -> io::Re
 
     let output = match spawned {
         Ok(child) => child.wait_with_output(),
-        Err(err) => {
-            let _ = join(supervisor);
-            return Err(err);
-        }
+        // A supervisor failure explains a failed startup better than the
+        // child's errno; otherwise the child's error (a refused barrier, a
+        // failed exec) is the answer.
+        Err(err) => return Err(join(supervisor).err().unwrap_or(err)),
     };
     let decisions = join(supervisor)?;
     let output = output?;

@@ -217,6 +217,10 @@ pub(crate) struct ChildSetup {
     pub(crate) ruleset: RawFd,
     /// The child's end of the startup socket.
     pub(crate) socket: RawFd,
+    /// The supervisor's end of the startup socket. The fork copies it into
+    /// the child, which closes it first: a child holding the peer would
+    /// never see end-of-file when the supervisor goes away.
+    pub(crate) peer: RawFd,
     /// The notification filter program.
     pub(crate) filter: Vec<libc::sock_filter>,
 }
@@ -229,17 +233,27 @@ pub(crate) fn install_child_setup(command: &mut Command, setup: ChildSetup) {
     let ChildSetup {
         ruleset,
         socket,
+        peer,
         filter,
     } = setup;
-    let child = move || child_setup(ruleset, socket, &filter);
+    let child = move || child_setup(ruleset, socket, peer, &filter);
     // SAFETY: `child_setup` keeps the post-fork rules in the module contract,
-    // and the caller keeps both descriptors open until `spawn` returns.
+    // and the caller keeps all three descriptors open until `spawn` returns.
     unsafe {
         command.pre_exec(child);
     }
 }
 
-fn child_setup(ruleset: RawFd, socket: RawFd, filter: &[libc::sock_filter]) -> io::Result<()> {
+fn child_setup(
+    ruleset: RawFd,
+    socket: RawFd,
+    peer: RawFd,
+    filter: &[libc::sock_filter],
+) -> io::Result<()> {
+    // Drop the child's copy of the supervisor's end, so the barrier read
+    // below sees end-of-file if the supervisor exits without releasing it.
+    // SAFETY: `peer` is this process's own copy, made by the fork.
+    check(unsafe { libc::close(peer) } as c_long)?;
     // Only stdio survives exec. The setup descriptors stay usable until then.
     // SAFETY: close_range takes integers only.
     check(unsafe {
