@@ -7,8 +7,10 @@
 
 use std::fs;
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -46,6 +48,36 @@ fn open_travels_over_the_socket() {
     let mut file = client.open(granted.join("a.txt")).unwrap();
     let mut content = String::new();
     file.read_to_string(&mut content).unwrap();
+    assert_eq!(content, "inside");
+}
+
+/// The worker's own opens are close-on-exec, so a descriptor the broker
+/// delivers must not survive into a program the worker starts.
+#[test]
+fn delivered_descriptors_do_not_leak_into_spawned_programs() {
+    let (_root, granted, _) = setup();
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::READ).unwrap();
+    let (mut client, _server) = brokered(gate);
+
+    let file = client.open(granted.join("a.txt")).unwrap();
+
+    // `/dev/fd/N` names the child's descriptor N, which is the delivered
+    // file only if it was inherited across exec.
+    let output = Command::new("cat")
+        .arg(format!("/dev/fd/{}", file.as_raw_fd()))
+        .output()
+        .expect("run cat");
+    assert!(
+        !output.status.success(),
+        "descriptor leaked across exec: child read {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stdout.is_empty());
+
+    // The descriptor is still valid in the worker itself.
+    let mut content = String::new();
+    (&file).read_to_string(&mut content).unwrap();
     assert_eq!(content, "inside");
 }
 
