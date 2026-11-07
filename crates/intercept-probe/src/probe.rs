@@ -39,6 +39,10 @@ const OPEN_HOW_SIZE: u64 = 24;
 /// The kernel's `O_LARGEFILE` on x86_64. libc defines it as 0 for
 /// userspace, but some runtimes pass the kernel bit explicitly.
 const KERNEL_O_LARGEFILE: u64 = 0o100000;
+/// `RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS`: the only `openat2`
+/// resolve flags accepted, since the strict open already refuses every
+/// symlink and magic link.
+const ACCEPTED_RESOLVE: u64 = 0x02 | 0x04;
 
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
@@ -402,9 +406,11 @@ fn copy_request(listener: &OwnedFd, notif: &libc::seccomp_notif) -> Request {
         None => flags,
         Some(Err(errno)) => return refused(Some(path), errno),
         Some(Ok(how)) if how.mode != 0 => return refused(Some(path), libc::EINVAL),
-        // Resolve flags need the strict resolver (step 2); refuse rather
-        // than drop their meaning.
-        Some(Ok(how)) if how.resolve != 0 => return refused(Some(path), libc::EOPNOTSUPP),
+        // Anything beyond what the strict open already enforces is refused
+        // rather than silently dropped.
+        Some(Ok(how)) if how.resolve & !ACCEPTED_RESOLVE != 0 => {
+            return refused(Some(path), libc::EOPNOTSUPP);
+        }
         Some(Ok(how)) => how.flags,
     };
     if let Err(errno) = validate_flags(flags) {
@@ -480,33 +486,24 @@ pub(crate) fn validate_path(path: &str) -> Result<(), i32> {
     Ok(())
 }
 
-/// Read-only opens only, with `O_CLOEXEC` and `O_LARGEFILE` the only extra
-/// bits. `O_NOFOLLOW` is refused until the strict resolver exists, since
-/// [`Gate::open`] follows symlinks inside a grant.
+/// Read-only opens only, with `O_CLOEXEC`, `O_NOFOLLOW`, and `O_LARGEFILE`
+/// the only extra bits. `O_NOFOLLOW` is honored because the strict open
+/// refuses every symlink.
 pub(crate) fn validate_flags(flags: u64) -> Result<(), i32> {
     let access = flags & libc::O_ACCMODE as u64;
-    let allowed = libc::O_CLOEXEC as u64 | KERNEL_O_LARGEFILE;
+    let allowed = libc::O_CLOEXEC as u64 | libc::O_NOFOLLOW as u64 | KERNEL_O_LARGEFILE;
     if access != libc::O_RDONLY as u64 || flags & !(libc::O_ACCMODE as u64 | allowed) != 0 {
         return Err(libc::EOPNOTSUPP);
     }
     Ok(())
 }
 
-/// Authorizes through the existing gate. Only regular files are delivered.
+/// Authorizes through the gate's strict regular-file open, which refuses
+/// symlinks (`ELOOP`), directories (`EISDIR`), and special or procfs/sysfs
+/// files (`EOPNOTSUPP`) without opening them for I/O.
 fn authorize(gate: &Gate, path: &str) -> Result<File, i32> {
-    match gate.open(path) {
-        Ok(file) => {
-            let metadata = file
-                .metadata()
-                .map_err(|err| err.raw_os_error().unwrap_or(libc::EIO))?;
-            if metadata.is_dir() {
-                Err(libc::EISDIR)
-            } else if !metadata.is_file() {
-                Err(libc::EOPNOTSUPP)
-            } else {
-                Ok(file)
-            }
-        }
+    match gate.open_regular_strict(path) {
+        Ok(file) => Ok(file),
         Err(GateError::Io { source, .. }) => Err(source.raw_os_error().unwrap_or(libc::EIO)),
         // NoGrant, RightsExceeded, and any future refusal: the gate has
         // already audited the decision.
@@ -553,6 +550,7 @@ mod tests {
         assert_eq!(validate_flags(rdonly), Ok(()));
         assert_eq!(validate_flags(rdonly | libc::O_CLOEXEC as u64), Ok(()));
         assert_eq!(validate_flags(rdonly | KERNEL_O_LARGEFILE), Ok(()));
+        assert_eq!(validate_flags(rdonly | libc::O_NOFOLLOW as u64), Ok(()));
         for flags in [
             libc::O_WRONLY,
             libc::O_RDWR,
@@ -560,7 +558,6 @@ mod tests {
             libc::O_TRUNC,
             libc::O_PATH,
             libc::O_DIRECTORY,
-            libc::O_NOFOLLOW,
             libc::O_TMPFILE,
         ] {
             assert_eq!(

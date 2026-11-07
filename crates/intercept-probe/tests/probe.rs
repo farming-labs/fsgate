@@ -18,9 +18,12 @@ use tempfile::TempDir;
 const EACCES: i32 = 13;
 const ENOSYS: i32 = 38;
 const EISDIR: i32 = 21;
+const ELOOP: i32 = 40;
 const EOPNOTSUPP: i32 = 95;
 const ECANCELED: i32 = 125;
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+const RESOLVE_BENEATH: u64 = 0x08;
 
 /// The worker fixture, compiled once per test run with `cc -static`.
 fn worker() -> &'static Path {
@@ -202,17 +205,55 @@ fn directories_are_refused_with_eisdir() {
 }
 
 #[test]
-fn openat2_accepts_only_plain_resolution() {
+fn openat2_accepts_only_the_resolve_flags_the_strict_open_enforces() {
     let dirs = Dirs::new();
     let path = dirs.granted("a.txt");
-    let no_symlinks = RESOLVE_NO_SYMLINKS.to_string();
+    let enforced = (RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS).to_string();
+    let beneath = RESOLVE_BENEATH.to_string();
 
     let plain = probe(dirs.gate(Rights::READ), &["openat2", &path, "0"]);
-    let strict = probe(dirs.gate(Rights::READ), &["openat2", &path, &no_symlinks]);
+    let strict = probe(dirs.gate(Rights::READ), &["openat2", &path, &enforced]);
+    let other = probe(dirs.gate(Rights::READ), &["openat2", &path, &beneath]);
 
     assert_eq!(stdout(&plain), "inside");
     assert_eq!(plain.decisions, [decision(libc::SYS_openat2, &path, None)]);
-    assert_eq!(stdout(&strict), format!("errno={EOPNOTSUPP}\n"));
+    assert_eq!(stdout(&strict), "inside");
+    // Not dropped: a flag the supervisor does not enforce is refused.
+    assert_eq!(stdout(&other), format!("errno={EOPNOTSUPP}\n"));
+}
+
+#[test]
+fn symlinks_are_refused_with_eloop_even_inside_the_grant() {
+    let dirs = Dirs::new();
+    let link = dirs.granted("link");
+    std::os::unix::fs::symlink("a.txt", &link).unwrap();
+
+    let outcome = probe(dirs.gate(Rights::READ), &["read", &link]);
+
+    assert_eq!(stdout(&outcome), format!("errno={ELOOP}\n"));
+    assert_eq!(
+        outcome.decisions,
+        [decision(libc::SYS_openat, &link, Some(ELOOP))]
+    );
+}
+
+#[test]
+fn a_fifo_is_refused_without_blocking_the_supervisor() {
+    let dirs = Dirs::new();
+    let fifo = dirs.granted("fifo");
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &fifo,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        0,
+    )
+    .unwrap();
+
+    // A plain read-only open of a FIFO with no writer would hang here.
+    let outcome = probe(dirs.gate(Rights::READ), &["read", &fifo]);
+
+    assert_eq!(stdout(&outcome), format!("errno={EOPNOTSUPP}\n"));
 }
 
 #[test]
