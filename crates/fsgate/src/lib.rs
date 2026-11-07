@@ -125,7 +125,11 @@ impl fmt::Debug for Rights {
 }
 
 /// Why a gated operation failed.
+///
+/// Failure kinds grow with the API, so a `match` outside fsgate needs a
+/// wildcard arm. Existing variants keep their fields.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum GateError {
     /// The requested path was not absolute.
     #[error("path `{path}` is not absolute; pass an absolute path")]
@@ -681,6 +685,35 @@ fn normalize(path: &Path) -> Result<PathBuf, GateError> {
     }
     Ok(out)
 }
+
+/// Compile checks from outside the crate. The `compile_fail` block differs
+/// from its passing twin only by the wildcard arm, so an unrelated compile
+/// error cannot satisfy it.
+///
+/// ```
+/// fn kind(err: &fsgate::GateError) {
+///     use fsgate::GateError::*;
+///     match err {
+///         NotAbsolute { .. } | NoGrant { .. } | RightsExceeded { .. } | WouldWiden { .. }
+///         | UnknownGrant | Locked | LockUnsupported { .. } | LockFailed { .. }
+///         | Broker { .. } | Io { .. } => {}
+///         _ => {}
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn kind(err: &fsgate::GateError) {
+///     use fsgate::GateError::*;
+///     match err {
+///         NotAbsolute { .. } | NoGrant { .. } | RightsExceeded { .. } | WouldWiden { .. }
+///         | UnknownGrant | Locked | LockUnsupported { .. } | LockFailed { .. }
+///         | Broker { .. } | Io { .. } => {}
+///     }
+/// }
+/// ```
+#[cfg(doctest)]
+struct ExtensibleErrorDoctest;
 
 /// The README's example must keep compiling; this pulls it into the
 /// doctest suite without shipping it in the crate docs.

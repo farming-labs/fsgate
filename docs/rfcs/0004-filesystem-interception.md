@@ -224,10 +224,10 @@ plus optional syscall and notification IDs. Emit one decision for each
 notified request, including refusals before grant selection. Use
 `path = null` when no valid path was copied. A filter-only refusal is not
 a broker audit event, and a restarted syscall can create a new notification.
-These wire additions require an RFC 0002 update. The current Rust event
-struct and reason enum are public and exhaustive, so extending them also
-needs an explicit source-compatibility decision before dispatcher work;
-optional wire fields alone do not preserve Rust source compatibility.
+These wire additions require an RFC 0002 update. The Rust event struct
+and the operation and reason enums are non-exhaustive (see
+[RFC 0002](0002-audit-events.md#rust-compatibility)), so the new reasons
+and optional fields are additive for Rust callers.
 
 ### Syscall boundary and bypass analysis
 
