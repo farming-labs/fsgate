@@ -2,9 +2,9 @@
 
 ## Unreleased
 
-## 0.1.1 (unreleased)
+## 0.1.1 (2026-11-07)
 
-Prepared as the first crates.io release. It adds one security fix over 0.1.0; the public API is unchanged.
+The first crates.io release: [`fsgate` 0.1.1](https://crates.io/crates/fsgate/0.1.1), built from the signed tag [`v0.1.1`](https://github.com/farming-labs/fsgate/tree/v0.1.1) on `4250f31`. It adds one security fix over 0.1.0; the public API is unchanged.
 
 ### Fixed
 
