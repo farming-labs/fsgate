@@ -103,6 +103,7 @@ version = "0.1.1"
 dependencies = [
  "cap-std",
  "landlock",
+ "libc",
  "rustix",
  "rustix-linux-procfs",
  "serde",
@@ -120,16 +121,6 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi",
-]
-
-[[package]]
-name = "intercept-probe"
-version = "0.0.0"
-dependencies = [
- "fsgate",
- "libc",
- "rustix",
- "tempfile",
 ]
 
 [[package]]

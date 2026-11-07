@@ -40,7 +40,7 @@ fsgate-broker --grant /srv/data:rl --socket /tmp/app.sock -- ./worker
 ## What fsgate does not do
 
 - It does not sandbox the network, environment, or memory. Filesystem only.
-- It does not intercept `open(2)` in unmodified binaries. Experimental Linux syscall interception is proposed for [M6](ROADMAP.md#m6--linux-filesystem-interception-experimental), after v0.1.0; it is not implemented. A preload shim remains out of scope for v1.
+- It does not intercept `open(2)` in unmodified binaries, except through an experimental, unreviewed launcher for static Linux x86_64 binaries behind the `experimental-intercept` feature ([M6](ROADMAP.md#m6--linux-filesystem-interception-experimental), [RFC 0004](docs/rfcs/0004-filesystem-interception.md)). That launcher is not supported yet. A preload shim remains out of scope for v1.
 - It does not support Windows in v1.
 - It is not a container runtime and does not replace one.
 

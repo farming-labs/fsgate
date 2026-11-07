@@ -1,7 +1,8 @@
-//! Launcher and supervisor. Everything here is safe code; the raw
-//! interfaces live in [`crate::sys`].
+//! The experimental launcher and its supervisor. Everything here is safe
+//! code; the raw interfaces live in the private `sys` module, the BPF
+//! programs in `filters`.
 
-use std::ffi::{CString, OsStr};
+use std::ffi::{CString, OsString};
 use std::fs::File;
 use std::io::{self, IoSliceMut, Read, Write};
 use std::mem::MaybeUninit;
@@ -13,18 +14,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread::{self, JoinHandle};
 
-use fsgate::Gate;
-use fsgate::intercept::{CopyFault, OPEN_HOW_SIZE, OpenCall, OpenHow, OpenRequest, PATH_MAX};
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fs::{FileType, Mode, OFlags};
 use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
 
-use crate::{filters, sys};
+use super::{CopyFault, OPEN_HOW_SIZE, OpenCall, OpenHow, OpenRequest, PATH_MAX, filters, sys};
+use crate::Gate;
 
 /// Known bytes the supervisor reads back from the restricted child before
 /// releasing it. The child is a fork of this process, so the static sits at
 /// the same address there.
-static READY_MARKER: [u8; 16] = *b"fsgate-probe-rdy";
+static READY_MARKER: [u8; 16] = *b"fsgate-launch-ok";
 
 /// How long the supervisor waits for a request or the worker's exit before
 /// giving up and closing the listener, which fails any pending open.
@@ -38,36 +38,111 @@ const PAGE_SIZE: u64 = 4096;
 
 /// Fault injection for the startup, supervisor-loss, and image tests.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Fault {
+enum Fault {
     /// Normal operation.
     None,
     /// The supervisor closes its listener before releasing the startup
     /// barrier, as if it died right after startup.
+    #[cfg_attr(not(test), allow(dead_code))]
     CloseListener,
     /// The supervisor never releases the startup barrier.
+    #[cfg_attr(not(test), allow(dead_code))]
     AbortStartup,
     /// After the image is checked and before the child execs, the
-    /// supervisor renames `with` over the executable path. The child still
-    /// runs the image that was checked.
-    ReplaceImage {
-        /// The file renamed over the executable path.
-        with: PathBuf,
-    },
+    /// supervisor renames `with` over the executable path.
+    #[cfg_attr(not(test), allow(dead_code))]
+    ReplaceImage { with: PathBuf },
 }
 
-/// One notified open request and the supervisor's answer.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Decision {
-    /// The syscall number: `SYS_open`, `SYS_openat`, or `SYS_openat2`.
-    pub syscall: i64,
-    /// The copied path, when one was read and decoded as UTF-8.
-    pub path: Option<String>,
-    /// `None` when a descriptor was delivered; otherwise the errno returned.
-    pub errno: Option<i32>,
+/// Launches a worker under the RFC 0004 interception profile and answers
+/// its file opens from a [`Gate`].
+///
+/// **Experimental.** Linux x86_64 only, behind the `experimental-intercept`
+/// feature, and not covered by semver. The design has not been
+/// independently reviewed.
+///
+/// The worker image must be a regular, native x86_64 ELF executable with no
+/// interpreter (statically linked), not set-ID, and without file
+/// capabilities. It starts with only stdio open (standard input empty,
+/// standard output and error captured), an empty environment, under
+/// `no_new_privs`, a Landlock ruleset that allows it nothing but executing
+/// its own image, and two seccomp filters: one that sends `open`, `openat`,
+/// and `openat2` to the supervisor, and the RFC's final syscall allowlist.
+/// Each notified open is decided by [`Gate::open_intercepted`], which emits
+/// one audit event per request through the gate's sink.
+///
+/// ```no_run
+/// use fsgate::{Gate, Rights};
+/// use fsgate::intercept::Launch;
+///
+/// # fn main() -> std::io::Result<()> {
+/// let mut gate = Gate::new();
+/// gate.grant("/srv/data", Rights::READ).map_err(std::io::Error::other)?;
+///
+/// let outcome = Launch::new("/opt/tools/report")
+///     .arg("/srv/data/input.csv")
+///     .run(gate)?;
+/// assert!(outcome.status.success());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Debug)]
+pub struct Launch {
+    executable: PathBuf,
+    args: Vec<OsString>,
 }
 
-/// What one probe run observed.
+impl Launch {
+    /// A launch of `executable`, with no arguments yet.
+    pub fn new(executable: impl Into<PathBuf>) -> Launch {
+        Launch {
+            executable: executable.into(),
+            args: Vec::new(),
+        }
+    }
+
+    /// Appends one argument. `argv[0]` is the executable path.
+    pub fn arg(&mut self, arg: impl Into<OsString>) -> &mut Launch {
+        self.args.push(arg.into());
+        self
+    }
+
+    /// Appends several arguments.
+    pub fn args<I, S>(&mut self, args: I) -> &mut Launch
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        self.args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    /// Checks kernel support and the image rule without launching
+    /// anything: Landlock ABI 3, seccomp user notifications, and the
+    /// executable itself. Fails with `Unsupported` for a missing kernel
+    /// feature and `InvalidInput` for an image the profile refuses.
+    pub fn check(&self) -> io::Result<()> {
+        preflight()?;
+        let image = open_image(&self.executable)?;
+        check_image(&image, &self.executable)
+    }
+
+    /// Runs the worker to completion and returns its exit status and
+    /// output.
+    ///
+    /// Fails before the worker runs if [`check`](Launch::check) would, or if
+    /// any startup step fails; the worker never runs unconfined. After it
+    /// starts, the supervisor answers requests until the worker exits, or
+    /// gives up after 30 seconds without a request or an exit, failing any
+    /// pending open.
+    pub fn run(&self, gate: Gate) -> io::Result<Outcome> {
+        run(&self.executable, &self.args, gate, Fault::None)
+    }
+}
+
+/// What a finished worker left behind.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Outcome {
     /// The worker's exit status.
     pub status: ExitStatus,
@@ -75,31 +150,29 @@ pub struct Outcome {
     pub stdout: Vec<u8>,
     /// Everything the worker wrote to standard error.
     pub stderr: Vec<u8>,
-    /// Every request the supervisor answered, in order.
-    pub decisions: Vec<Decision>,
 }
 
-/// Runs `executable` with `args` as a contained worker whose open-family
-/// syscalls are answered from `gate`.
-///
-/// The worker starts with only stdio open, under `no_new_privs`, a Landlock
-/// ruleset that allows it nothing but executing its own image, and a seccomp
-/// filter that sends `open`, `openat`, and `openat2` to the supervisor. A
-/// failure before exec, including the supervisor refusing to release the
-/// startup barrier, returns the child's error and the worker never runs.
-pub fn run(executable: &Path, args: &[&str], gate: Gate, fault: Fault) -> io::Result<Outcome> {
-    preflight()?;
-    // `NONBLOCK` keeps a FIFO at this path from blocking the open; the image
-    // check then refuses anything but a regular file.
-    let image = File::from(rustix::fs::open(
+/// Opens the image once, without blocking on a FIFO at the path; the image
+/// check then refuses anything but a regular file.
+fn open_image(executable: &Path) -> io::Result<File> {
+    Ok(File::from(rustix::fs::open(
         executable,
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::NOCTTY,
         Mode::empty(),
-    )?);
+    )?))
+}
+
+/// Runs `executable` with `args` as a contained worker whose open-family
+/// syscalls are answered from `gate`. A failure before exec, including the
+/// supervisor refusing to release the startup barrier, returns the child's
+/// error and the worker never runs.
+fn run(executable: &Path, args: &[OsString], gate: Gate, fault: Fault) -> io::Result<Outcome> {
+    preflight()?;
+    let image = open_image(executable)?;
     check_image(&image, executable)?;
     let ruleset = sys::executable_ruleset(image.as_fd())?;
     let argv = std::iter::once(executable.as_os_str())
-        .chain(args.iter().map(OsStr::new))
+        .chain(args.iter().map(OsString::as_os_str))
         .map(|arg| {
             CString::new(arg.as_bytes()).map_err(|_| {
                 io::Error::new(
@@ -148,30 +221,29 @@ pub fn run(executable: &Path, args: &[&str], gate: Gate, fault: Fault) -> io::Re
         // failed exec) is the answer.
         Err(err) => return Err(join(supervisor).err().unwrap_or(err)),
     };
-    let decisions = join(supervisor)?;
+    join(supervisor)?;
     let output = output?;
     Ok(Outcome {
         status: output.status,
         stdout: output.stdout,
         stderr: output.stderr,
-        decisions,
     })
 }
 
 fn preflight() -> io::Result<()> {
     let abi = sys::landlock_abi().map_err(|err| {
         unsupported(format!(
-            "landlock is unavailable ({err}); the probe needs Landlock ABI 3 (Linux 6.2+) enabled"
+            "landlock is unavailable ({err}); interception needs Landlock ABI 3 (Linux 6.2+) enabled"
         ))
     })?;
     if abi < 3 {
         return Err(unsupported(format!(
-            "landlock ABI {abi} is too old; the probe needs ABI 3 (Linux 6.2+)"
+            "landlock ABI {abi} is too old; interception needs ABI 3 (Linux 6.2+)"
         )));
     }
     sys::user_notif_available().map_err(|err| {
         unsupported(format!(
-            "seccomp user notifications are unavailable ({err}); the probe needs Linux 5.14+ with seccomp enabled"
+            "seccomp user notifications are unavailable ({err}); interception needs Linux 5.14+ with seccomp enabled"
         ))
     })
 }
@@ -249,18 +321,13 @@ fn unsupported(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::Unsupported, message)
 }
 
-fn join(supervisor: JoinHandle<io::Result<Vec<Decision>>>) -> io::Result<Vec<Decision>> {
+fn join(supervisor: JoinHandle<io::Result<()>>) -> io::Result<()> {
     supervisor
         .join()
         .unwrap_or_else(|_| Err(io::Error::other("supervisor thread panicked")))
 }
 
-fn supervise(
-    socket: UnixStream,
-    gate: Gate,
-    fault: Fault,
-    executable: &Path,
-) -> io::Result<Vec<Decision>> {
+fn supervise(socket: UnixStream, gate: Gate, fault: Fault, executable: &Path) -> io::Result<()> {
     let (listener, pid) = receive_listener(&socket)?;
     await_restricted(&socket)?;
     verify_listener(&listener)?;
@@ -268,11 +335,11 @@ fn supervise(
     match fault {
         Fault::ReplaceImage { with } => std::fs::rename(with, executable)?,
         // Dropping the socket without the ready byte fails the barrier.
-        Fault::AbortStartup => return Ok(Vec::new()),
+        Fault::AbortStartup => return Ok(()),
         Fault::CloseListener => {
             drop(listener);
             release(&socket)?;
-            return Ok(Vec::new());
+            return Ok(());
         }
         Fault::None => {}
     }
@@ -357,8 +424,7 @@ fn release(socket: &UnixStream) -> io::Result<()> {
     (&*socket).write_all(&[sys::RELEASE_BYTE])
 }
 
-fn serve(listener: &OwnedFd, gate: &Gate) -> io::Result<Vec<Decision>> {
-    let mut decisions = Vec::new();
+fn serve(listener: &OwnedFd, gate: &Gate) -> io::Result<()> {
     loop {
         let mut fds = [PollFd::new(listener, PollFlags::IN)];
         if rustix::event::poll(&mut fds, Some(&IDLE_TIMEOUT))? == 0 {
@@ -370,14 +436,14 @@ fn serve(listener: &OwnedFd, gate: &Gate) -> io::Result<Vec<Decision>> {
         let revents = fds[0].revents();
         if revents.contains(PollFlags::IN) {
             match sys::notif_recv(listener.as_fd()) {
-                Ok(notif) => decisions.extend(answer(listener, gate, &notif)),
+                Ok(notif) => answer(listener, gate, &notif),
                 // The target died or its syscall was interrupted first.
                 Err(err) if err.raw_os_error() == Some(libc::ENOENT) => {}
                 Err(err) => return Err(err),
             }
         } else if revents.intersects(PollFlags::HUP | PollFlags::ERR) {
             // No task uses the filter any more: the worker has exited.
-            return Ok(decisions);
+            return Ok(());
         }
     }
 }
@@ -392,17 +458,14 @@ enum Copied {
     Request(OpenRequest),
 }
 
-fn answer(listener: &OwnedFd, gate: &Gate, notif: &libc::seccomp_notif) -> Option<Decision> {
-    let syscall = i64::from(notif.data.nr);
+/// Answers one notification: the gate decides and audits; the supervisor
+/// delivers the file or the errno.
+fn answer(listener: &OwnedFd, gate: &Gate, notif: &libc::seccomp_notif) {
     let request = match copy_request(listener, notif) {
-        Copied::Cancelled => return None,
+        Copied::Cancelled => return,
         Copied::NotAnOpen => {
             let _ = sys::notif_send_error(listener.as_fd(), notif.id, libc::ENOSYS);
-            return Some(Decision {
-                syscall,
-                path: None,
-                errno: Some(libc::ENOSYS),
-            });
+            return;
         }
         Copied::Request(request) => request,
     };
@@ -413,27 +476,16 @@ fn answer(listener: &OwnedFd, gate: &Gate, notif: &libc::seccomp_notif) -> Optio
             file.as_fd(),
             request.wants_cloexec(),
         ) {
-            Ok(_) => None,
+            Ok(_) => return,
             // Cancelled between authorization and delivery.
-            Err(err) if err.raw_os_error() == Some(libc::ENOENT) => return None,
-            Err(err) => Some(err.raw_os_error().unwrap_or(libc::EIO)),
+            Err(err) if err.raw_os_error() == Some(libc::ENOENT) => return,
+            Err(err) => err.raw_os_error().unwrap_or(libc::EIO),
         },
-        Err(err) => Some(err.raw_os_error().unwrap_or(libc::EIO)),
+        Err(err) => err.raw_os_error().unwrap_or(libc::EIO),
     };
-    if let Some(errno) = errno {
-        // Fails with ENOENT if the request was cancelled meanwhile; then
-        // there is nobody to answer.
-        let _ = sys::notif_send_error(listener.as_fd(), notif.id, errno);
-    }
-    let path = request
-        .path
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok());
-    Some(Decision {
-        syscall,
-        path,
-        errno,
-    })
+    // Fails with ENOENT if the request was cancelled meanwhile; then there
+    // is nobody to answer.
+    let _ = sys::notif_send_error(listener.as_fd(), notif.id, errno);
 }
 
 /// Copies the request's arguments out of the worker once (RFC 0004,
@@ -536,4 +588,116 @@ fn read_open_how(memory: &File, addr: u64) -> Result<OpenHow, CopyFault> {
         mode: field(1),
         resolve: field(2),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use crate::Rights;
+
+    /// A temporary directory with a granted `a.txt` and the worker fixture,
+    /// built with `cc -static` (`tests/fixtures/worker.c`).
+    struct Fixture {
+        root: tempfile::TempDir,
+        worker: PathBuf,
+        granted: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Fixture {
+            let root = tempfile::tempdir().unwrap();
+            let granted = root.path().join("granted");
+            fs::create_dir(&granted).unwrap();
+            fs::write(granted.join("a.txt"), b"inside").unwrap();
+            let worker = root.path().join("worker");
+            let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/worker.c");
+            let status = Command::new("cc")
+                .args(["-static", "-pthread", "-O2", "-Wall", "-Werror", "-o"])
+                .arg(&worker)
+                .arg(&source)
+                .status()
+                .expect("run cc; the launcher tests need a C compiler and static libc (libc6-dev)");
+            assert!(
+                status.success(),
+                "cc -static failed for {}",
+                source.display()
+            );
+            Fixture {
+                root,
+                worker,
+                granted,
+            }
+        }
+
+        fn gate(&self) -> Gate {
+            let mut gate = Gate::new();
+            gate.grant(&self.granted, Rights::READ).unwrap();
+            gate
+        }
+
+        fn read_args(&self) -> Vec<OsString> {
+            vec!["read".into(), self.granted.join("a.txt").into()]
+        }
+    }
+
+    #[test]
+    fn an_aborted_startup_never_executes_the_worker() {
+        let fixture = Fixture::new();
+
+        let err = run(
+            &fixture.worker,
+            &fixture.read_args(),
+            fixture.gate(),
+            Fault::AbortStartup,
+        )
+        .expect_err("startup must fail before exec");
+
+        assert_eq!(err.raw_os_error(), Some(libc::ECANCELED), "{err}");
+    }
+
+    #[test]
+    fn a_closed_listener_fails_later_opens_with_enosys() {
+        let fixture = Fixture::new();
+
+        let outcome = run(
+            &fixture.worker,
+            &fixture.read_args(),
+            fixture.gate(),
+            Fault::CloseListener,
+        )
+        .expect("worker run");
+
+        // No supervisor, no open: the kernel fails the notified call.
+        assert_eq!(
+            outcome.stdout,
+            format!("errno={}\n", libc::ENOSYS).as_bytes()
+        );
+    }
+
+    #[test]
+    fn the_checked_image_runs_even_after_its_path_is_replaced() {
+        let fixture = Fixture::new();
+        let script = fixture.root.path().join("swapped");
+        fs::write(&script, "#!/bin/sh\necho swapped\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let outcome = run(
+            &fixture.worker,
+            &fixture.read_args(),
+            fixture.gate(),
+            Fault::ReplaceImage { with: script },
+        )
+        .expect("worker run");
+
+        // The child executed the held descriptor, not what the path names now.
+        assert_eq!(outcome.stdout, b"inside");
+        assert_eq!(
+            fs::read(&fixture.worker).unwrap(),
+            b"#!/bin/sh\necho swapped\n"
+        );
+    }
 }
