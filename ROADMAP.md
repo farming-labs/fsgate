@@ -71,6 +71,8 @@ Planning landed in [#2](https://github.com/farming-labs/fsgate/pull/2). The prot
 - [ ] Handle shutdown, cancellation, and revocation. Acceptance: supervisor death prevents new brokered opens, interrupted requests leak no descriptors, descendants retain restrictions, and revocation denies subsequent brokered opens. Document that already-delivered file descriptors remain usable.
 - [ ] Verify and document the supported subset from a release build and unpacked crate on Linux. Acceptance: real-filesystem denial and bypass tests pass on the declared kernels and architectures, unsupported-host startup tests pass, and the README and example state the remaining compatibility limits.
 
+Implementation step 1 of RFC 0004 is a disposable probe, `crates/intercept-probe` (unpublished, Linux x86_64 only), that runs the startup sequence, supervisor memory access, and atomic descriptor delivery against a static worker in Linux CI. It is evidence for the design, not a launcher, and checks none of the boxes above.
+
 M6 does not promise every filesystem syscall or arbitrary binary compatibility. Relative paths and directory descriptors, writes and creation, metadata, and directory enumeration need explicit semantics and coverage before support expands. macOS interception, a preload shim, and a custom eBPF LSM backend are not part of the proposed first implementation.
 
 ## M7 — grant narrowing

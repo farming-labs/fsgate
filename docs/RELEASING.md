@@ -35,7 +35,9 @@ only with merged PR evidence.
 
 ## Verify the candidate
 
-Run from the workspace root:
+Run from the workspace root. The workspace also holds `intercept-probe`,
+an unpublished Linux test crate, so packaging and publishing name
+`-p fsgate` explicitly; the checks below cover both crates.
 
 ```sh
 cargo fmt --all --check
@@ -51,7 +53,7 @@ checkout and test the archive outside the repository. In a separate shell:
 
 ```sh
 set -eu
-cargo package --locked
+cargo package --locked -p fsgate
 package_dir=$(mktemp -d)
 trap 'rm -rf "$package_dir"' EXIT
 tar -xzf "target/package/fsgate-$version.crate" -C "$package_dir"
@@ -109,10 +111,10 @@ token is stored. The workflow:
 1. Refuses a tag that is not annotated, does not point to a commit on
    `main`, or does not match the manifest version, with the fix in the
    error.
-2. Runs `cargo test --locked` and `cargo publish --locked --dry-run`.
+2. Runs `cargo test --locked` and `cargo publish --locked -p fsgate --dry-run`.
 3. Exchanges the job's GitHub OIDC identity for a short-lived crates.io
    token with `rust-lang/crates-io-auth-action`, which revokes it when the
-   job ends, and runs `cargo publish --locked`.
+   job ends, and runs `cargo publish --locked -p fsgate`.
 4. Checks that the uploaded archive, the crates.io checksum, and the
    crate downloaded from `static.crates.io` agree, and that the crate's
    `.cargo_vcs_info.json` records the tagged commit.
@@ -146,8 +148,8 @@ set -eu
 git checkout --detach "v$version"
 test "$(git rev-parse HEAD)" = "$release_sha"
 git status --short
-cargo publish --locked --dry-run
-cargo publish --locked
+cargo publish --locked -p fsgate --dry-run
+cargo publish --locked -p fsgate
 ```
 
 Cargo reads the token from `cargo login` (`~/.cargo/credentials.toml`) or
