@@ -137,13 +137,43 @@ fn ungranted_path_is_denied_and_audited_by_the_gate() {
         [decision(libc::SYS_openat, &secret, Some(EACCES))]
     );
     let events = sink.0.lock().unwrap();
-    assert!(
-        events.iter().any(|event| event.op == AuditOp::Open
-            && event.decision == AuditDecision::Deny
-            && event.reason == AuditReason::NoGrant
-            && event.path.as_deref() == Some(Path::new(&secret))),
-        "no open/deny/no_grant event for {secret}: {events:?}"
+    // The grant itself, then exactly one decision for the notified request.
+    assert_eq!(events.len(), 2, "{events:?}");
+    let event = &events[1];
+    assert_eq!(
+        (event.op, event.decision, event.reason),
+        (AuditOp::Open, AuditDecision::Deny, AuditReason::NoGrant)
     );
+    assert_eq!(event.path.as_deref(), Some(Path::new(&secret)));
+    assert_eq!(event.syscall, Some("openat"));
+    assert!(event.notification.is_some());
+}
+
+#[test]
+fn a_request_refused_before_grant_selection_is_audited() {
+    let dirs = Dirs::new();
+    let existing = dirs.granted("a.txt");
+    let sink = Arc::new(Capture::default());
+    let mut gate = dirs.gate(Rights::READ | Rights::WRITE | Rights::CREATE);
+    gate.set_audit_sink(sink.clone());
+
+    let outcome = probe(gate, &["write", &existing]);
+
+    assert_eq!(stdout(&outcome), format!("errno={EOPNOTSUPP}\n"));
+    assert_eq!(fs::read(&existing).unwrap(), b"inside");
+    let events = sink.0.lock().unwrap();
+    assert_eq!(events.len(), 2, "{events:?}");
+    let event = &events[1];
+    assert_eq!(
+        (event.op, event.decision, event.reason),
+        (
+            AuditOp::Open,
+            AuditDecision::Deny,
+            AuditReason::UnsupportedInput
+        )
+    );
+    assert_eq!(event.path.as_deref(), Some(Path::new(&existing)));
+    assert_eq!((event.grant, event.syscall), (None, Some("openat")));
 }
 
 #[test]

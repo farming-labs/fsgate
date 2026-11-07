@@ -11,7 +11,8 @@ use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread::{self, JoinHandle};
 
-use fsgate::{Gate, GateError};
+use fsgate::Gate;
+use fsgate::intercept::{CopyFault, OPEN_HOW_SIZE, OpenCall, OpenHow, OpenRequest, PATH_MAX};
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fs::{FileType, Mode, OFlags};
 use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
@@ -30,19 +31,8 @@ const IDLE_TIMEOUT: Timespec = Timespec {
     tv_nsec: 0,
 };
 
-/// Paths are at most 4096 bytes including the terminator (RFC 0004).
-const PATH_MAX: usize = 4096;
 /// Base page size on x86_64; path copies never cross a page in one read.
 const PAGE_SIZE: u64 = 4096;
-/// `sizeof(struct open_how)`; the only `openat2` layout accepted.
-const OPEN_HOW_SIZE: u64 = 24;
-/// The kernel's `O_LARGEFILE` on x86_64. libc defines it as 0 for
-/// userspace, but some runtimes pass the kernel bit explicitly.
-const KERNEL_O_LARGEFILE: u64 = 0o100000;
-/// `RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS`: the only `openat2`
-/// resolve flags accepted, since the strict open already refuses every
-/// symlink and magic link.
-const ACCEPTED_RESOLVE: u64 = 0x02 | 0x04;
 
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
@@ -321,41 +311,53 @@ fn serve(listener: &OwnedFd, gate: &Gate) -> io::Result<Vec<Decision>> {
     }
 }
 
-/// A copied and validated request, or why it cannot proceed.
-enum Request {
+/// What the supervisor copied for one notification.
+enum Copied {
     /// The notification is no longer pending; nobody is waiting for a reply.
     Cancelled,
-    /// Refused before authorization.
-    Refused { path: Option<String>, errno: i32 },
-    /// A supported read-only open of an absolute path.
-    Open { path: String, cloexec: bool },
+    /// A syscall the filter should never have notified.
+    NotAnOpen,
+    /// An open request, its arguments copied once.
+    Request(OpenRequest),
 }
 
 fn answer(listener: &OwnedFd, gate: &Gate, notif: &libc::seccomp_notif) -> Option<Decision> {
     let syscall = i64::from(notif.data.nr);
-    let (path, errno) = match copy_request(listener, notif) {
-        Request::Cancelled => return None,
-        Request::Refused { path, errno } => (path, Some(errno)),
-        Request::Open { path, cloexec } => {
-            let errno = match authorize(gate, &path) {
-                Ok(file) => {
-                    match sys::notif_addfd_send(listener.as_fd(), notif.id, file.as_fd(), cloexec) {
-                        Ok(_) => None,
-                        // Cancelled between authorization and delivery.
-                        Err(err) if err.raw_os_error() == Some(libc::ENOENT) => return None,
-                        Err(err) => Some(err.raw_os_error().unwrap_or(libc::EIO)),
-                    }
-                }
-                Err(errno) => Some(errno),
-            };
-            (Some(path), errno)
+    let request = match copy_request(listener, notif) {
+        Copied::Cancelled => return None,
+        Copied::NotAnOpen => {
+            let _ = sys::notif_send_error(listener.as_fd(), notif.id, libc::ENOSYS);
+            return Some(Decision {
+                syscall,
+                path: None,
+                errno: Some(libc::ENOSYS),
+            });
         }
+        Copied::Request(request) => request,
+    };
+    let errno = match gate.open_intercepted(&request) {
+        Ok(file) => match sys::notif_addfd_send(
+            listener.as_fd(),
+            notif.id,
+            file.as_fd(),
+            request.wants_cloexec(),
+        ) {
+            Ok(_) => None,
+            // Cancelled between authorization and delivery.
+            Err(err) if err.raw_os_error() == Some(libc::ENOENT) => return None,
+            Err(err) => Some(err.raw_os_error().unwrap_or(libc::EIO)),
+        },
+        Err(err) => Some(err.raw_os_error().unwrap_or(libc::EIO)),
     };
     if let Some(errno) = errno {
         // Fails with ENOENT if the request was cancelled meanwhile; then
         // there is nobody to answer.
         let _ = sys::notif_send_error(listener.as_fd(), notif.id, errno);
     }
+    let path = request
+        .path
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok());
     Some(Decision {
         syscall,
         path,
@@ -363,75 +365,78 @@ fn answer(listener: &OwnedFd, gate: &Gate, notif: &libc::seccomp_notif) -> Optio
     })
 }
 
-/// Copies the request's arguments out of the worker once, then validates
-/// only that copy (RFC 0004, "Memory, delivery, and audit").
-fn copy_request(listener: &OwnedFd, notif: &libc::seccomp_notif) -> Request {
+/// Copies the request's arguments out of the worker once (RFC 0004,
+/// "Memory, delivery, and audit"). Validation happens in fsgate, on this
+/// copy only.
+fn copy_request(listener: &OwnedFd, notif: &libc::seccomp_notif) -> Copied {
     let args = notif.data.args;
-    let refused = |path: Option<String>, errno: i32| Request::Refused { path, errno };
-    let (path_addr, flags, how_addr) = match i64::from(notif.data.nr) {
-        // `int flags`: the kernel ignores the upper half of the register.
-        libc::SYS_open => (args[0], u64::from(args[1] as u32), None),
-        libc::SYS_openat => (args[1], u64::from(args[2] as u32), None),
-        libc::SYS_openat2 if args[3] != OPEN_HOW_SIZE => return refused(None, libc::EOPNOTSUPP),
-        libc::SYS_openat2 => (args[1], 0, Some(args[2])),
-        _ => return refused(None, libc::ENOSYS),
+    // `int flags`: the kernel ignores the upper half of the register.
+    let (path_addr, call, how_addr) = match i64::from(notif.data.nr) {
+        libc::SYS_open => (
+            args[0],
+            OpenCall::Open {
+                flags: args[1] as u32,
+            },
+            None,
+        ),
+        libc::SYS_openat => (
+            args[1],
+            OpenCall::Openat {
+                flags: args[2] as u32,
+            },
+            None,
+        ),
+        libc::SYS_openat2 => {
+            let size = args[3];
+            let how = Err(CopyFault::Unreadable);
+            let how_addr = (size == OPEN_HOW_SIZE).then_some(args[2]);
+            (args[1], OpenCall::Openat2 { size, how }, how_addr)
+        }
+        _ => return Copied::NotAnOpen,
+    };
+    let request = |call, path| {
+        Copied::Request(OpenRequest {
+            notification: notif.id,
+            call,
+            path,
+        })
     };
 
     // A fresh memory handle per notification, checked against the
     // notification after opening it and again after copying.
-    let memory = match File::open(format!("/proc/{}/mem", notif.pid)) {
-        Ok(memory) => memory,
-        Err(_) if !sys::notif_id_valid(listener.as_fd(), notif.id) => return Request::Cancelled,
-        Err(_) => return refused(None, libc::EACCES),
+    let Ok(memory) = File::open(format!("/proc/{}/mem", notif.pid)) else {
+        if !sys::notif_id_valid(listener.as_fd(), notif.id) {
+            return Copied::Cancelled;
+        }
+        return request(call, Err(CopyFault::Inaccessible));
     };
     if !sys::notif_id_valid(listener.as_fd(), notif.id) {
-        return Request::Cancelled;
+        return Copied::Cancelled;
     }
     let path = read_path(&memory, path_addr);
-    let how = how_addr.map(|addr| read_open_how(&memory, addr));
+    let call = match (call, how_addr) {
+        (OpenCall::Openat2 { size, .. }, Some(addr)) => OpenCall::Openat2 {
+            size,
+            how: read_open_how(&memory, addr),
+        },
+        (call, _) => call,
+    };
     if !sys::notif_id_valid(listener.as_fd(), notif.id) {
-        return Request::Cancelled;
+        return Copied::Cancelled;
     }
-    drop(memory);
-
-    let path = match path.map(String::from_utf8) {
-        Ok(Ok(path)) => path,
-        Ok(Err(_)) => return refused(None, libc::EILSEQ),
-        Err(errno) => return refused(None, errno),
-    };
-    if let Err(errno) = validate_path(&path) {
-        return refused(Some(path), errno);
-    }
-    let flags = match how {
-        None => flags,
-        Some(Err(errno)) => return refused(Some(path), errno),
-        Some(Ok(how)) if how.mode != 0 => return refused(Some(path), libc::EINVAL),
-        // Anything beyond what the strict open already enforces is refused
-        // rather than silently dropped.
-        Some(Ok(how)) if how.resolve & !ACCEPTED_RESOLVE != 0 => {
-            return refused(Some(path), libc::EOPNOTSUPP);
-        }
-        Some(Ok(how)) => how.flags,
-    };
-    if let Err(errno) = validate_flags(flags) {
-        return refused(Some(path), errno);
-    }
-    Request::Open {
-        path,
-        cloexec: flags & libc::O_CLOEXEC as u64 != 0,
-    }
+    request(call, path)
 }
 
 /// Copies a NUL-terminated path, one page at a time, stopping at
 /// [`PATH_MAX`] bytes.
-fn read_path(memory: &File, mut addr: u64) -> Result<Vec<u8>, i32> {
+fn read_path(memory: &File, mut addr: u64) -> Result<Vec<u8>, CopyFault> {
     let mut path = Vec::new();
     let mut page = [0u8; PAGE_SIZE as usize];
     while path.len() < PATH_MAX {
         let to_page_end = (PAGE_SIZE - addr % PAGE_SIZE) as usize;
         let want = to_page_end.min(PATH_MAX - path.len());
         let read = match memory.read_at(&mut page[..want], addr) {
-            Ok(0) | Err(_) => return Err(libc::EFAULT),
+            Ok(0) | Err(_) => return Err(CopyFault::Unreadable),
             Ok(read) => read,
         };
         if let Some(end) = page[..read].iter().position(|&byte| byte == 0) {
@@ -439,23 +444,17 @@ fn read_path(memory: &File, mut addr: u64) -> Result<Vec<u8>, i32> {
             return Ok(path);
         }
         path.extend_from_slice(&page[..read]);
-        addr = addr.checked_add(read as u64).ok_or(libc::EFAULT)?;
+        addr = addr.checked_add(read as u64).ok_or(CopyFault::Unreadable)?;
     }
-    Err(libc::ENAMETOOLONG)
+    Err(CopyFault::Unterminated)
 }
 
-/// `struct open_how`, copied once into owned memory.
-struct OpenHow {
-    flags: u64,
-    mode: u64,
-    resolve: u64,
-}
-
-fn read_open_how(memory: &File, addr: u64) -> Result<OpenHow, i32> {
+/// Copies `struct open_how` once into owned memory.
+fn read_open_how(memory: &File, addr: u64) -> Result<OpenHow, CopyFault> {
     let mut raw = [0u8; OPEN_HOW_SIZE as usize];
     memory
         .read_exact_at(&mut raw, addr)
-        .map_err(|_| libc::EFAULT)?;
+        .map_err(|_| CopyFault::Unreadable)?;
     let field = |index: usize| {
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&raw[index * 8..index * 8 + 8]);
@@ -466,49 +465,6 @@ fn read_open_how(memory: &File, addr: u64) -> Result<OpenHow, i32> {
         mode: field(1),
         resolve: field(2),
     })
-}
-
-/// The path rules from RFC 0004's file-open contract, applied before the
-/// gate's lexical normalizer ever sees the path.
-pub(crate) fn validate_path(path: &str) -> Result<(), i32> {
-    if path.is_empty() {
-        return Err(libc::ENOENT);
-    }
-    if !path.starts_with('/') || path.ends_with('/') || path.contains("//") {
-        return Err(libc::EOPNOTSUPP);
-    }
-    if path[1..]
-        .split('/')
-        .any(|component| component == "." || component == "..")
-    {
-        return Err(libc::EOPNOTSUPP);
-    }
-    Ok(())
-}
-
-/// Read-only opens only, with `O_CLOEXEC`, `O_NOFOLLOW`, and `O_LARGEFILE`
-/// the only extra bits. `O_NOFOLLOW` is honored because the strict open
-/// refuses every symlink.
-pub(crate) fn validate_flags(flags: u64) -> Result<(), i32> {
-    let access = flags & libc::O_ACCMODE as u64;
-    let allowed = libc::O_CLOEXEC as u64 | libc::O_NOFOLLOW as u64 | KERNEL_O_LARGEFILE;
-    if access != libc::O_RDONLY as u64 || flags & !(libc::O_ACCMODE as u64 | allowed) != 0 {
-        return Err(libc::EOPNOTSUPP);
-    }
-    Ok(())
-}
-
-/// Authorizes through the gate's strict regular-file open, which refuses
-/// symlinks (`ELOOP`), directories (`EISDIR`), and special or procfs/sysfs
-/// files (`EOPNOTSUPP`) without opening them for I/O.
-fn authorize(gate: &Gate, path: &str) -> Result<File, i32> {
-    match gate.open_regular_strict(path) {
-        Ok(file) => Ok(file),
-        Err(GateError::Io { source, .. }) => Err(source.raw_os_error().unwrap_or(libc::EIO)),
-        // NoGrant, RightsExceeded, and any future refusal: the gate has
-        // already audited the decision.
-        Err(_) => Err(libc::EACCES),
-    }
 }
 
 #[cfg(test)]
@@ -525,46 +481,5 @@ mod tests {
             assert_eq!(target, notify, "instruction {index}");
         }
         assert_eq!(filter[notify - 1].k, libc::SECCOMP_RET_ALLOW);
-    }
-
-    #[test]
-    fn paths_outside_the_contract_are_refused() {
-        assert_eq!(validate_path("/srv/data/a.txt"), Ok(()));
-        assert_eq!(validate_path(""), Err(libc::ENOENT));
-        for path in [
-            "a.txt",
-            "/srv/data/",
-            "/",
-            "/srv//data",
-            "/srv/./data",
-            "/srv/../etc",
-            "/srv/..",
-        ] {
-            assert_eq!(validate_path(path), Err(libc::EOPNOTSUPP), "{path}");
-        }
-    }
-
-    #[test]
-    fn only_read_only_flags_are_accepted() {
-        let rdonly = libc::O_RDONLY as u64;
-        assert_eq!(validate_flags(rdonly), Ok(()));
-        assert_eq!(validate_flags(rdonly | libc::O_CLOEXEC as u64), Ok(()));
-        assert_eq!(validate_flags(rdonly | KERNEL_O_LARGEFILE), Ok(()));
-        assert_eq!(validate_flags(rdonly | libc::O_NOFOLLOW as u64), Ok(()));
-        for flags in [
-            libc::O_WRONLY,
-            libc::O_RDWR,
-            libc::O_CREAT,
-            libc::O_TRUNC,
-            libc::O_PATH,
-            libc::O_DIRECTORY,
-            libc::O_TMPFILE,
-        ] {
-            assert_eq!(
-                validate_flags(flags as u64),
-                Err(libc::EOPNOTSUPP),
-                "{flags:#o}"
-            );
-        }
     }
 }

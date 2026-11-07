@@ -35,7 +35,7 @@ mod audit;
 mod broker;
 mod containment;
 #[cfg(all(feature = "experimental-intercept", target_os = "linux"))]
-mod intercept;
+pub mod intercept;
 
 pub use audit::{AuditDecision, AuditEvent, AuditOp, AuditReason, AuditSink};
 #[cfg(unix)]
@@ -537,6 +537,59 @@ impl Gate {
         })
     }
 
+    /// Decides one intercepted open request (RFC 0004) and returns the file
+    /// to deliver to the worker.
+    ///
+    /// The request's copied arguments are checked against the interception
+    /// profile's file-open contract, then authorized with
+    /// [`open_regular_strict`](Gate::open_regular_strict). Exactly one `open`
+    /// audit event is emitted, carrying the request's syscall and
+    /// notification ID: a deny with `unsupported_input` or `invalid_memory`
+    /// for a request refused before any grant is matched (with the path when
+    /// a valid one was copied), and otherwise the same event
+    /// `open_regular_strict` emits.
+    ///
+    /// Every error carries the errno to answer the worker with
+    /// ([`io::Error::raw_os_error`]): `EACCES` when no grant covers the path
+    /// or it lacks [`Rights::READ`], the contract's errno for a refused
+    /// argument, and the filesystem's errno otherwise.
+    ///
+    /// **Experimental.** Linux only, behind the `experimental-intercept`
+    /// feature, and not covered by semver.
+    #[cfg(all(feature = "experimental-intercept", target_os = "linux"))]
+    pub fn open_intercepted(&self, request: &intercept::OpenRequest) -> io::Result<File> {
+        let origin = Origin {
+            op: AuditOp::Open,
+            notified: Some(Notified {
+                syscall: request.call.name(),
+                notification: request.notification,
+            }),
+        };
+        let path = match intercept::validate(request) {
+            Ok(path) => path,
+            Err(refusal) => {
+                self.emit(
+                    origin,
+                    refusal.path.as_deref().map(Path::new),
+                    None,
+                    AuditDecision::Deny,
+                    refusal.reason,
+                    None,
+                );
+                return Err(refusal.errno.into());
+            }
+        };
+        let opened = self.gated(origin, Path::new(&path), Rights::READ, |entry, rel| {
+            intercept::open_regular_beneath(&entry.dir, rel)
+        });
+        match opened {
+            Ok(file) => Ok(file),
+            Err(GateError::Io { source, .. }) => Err(source),
+            // No grant or a missing right; the gate has audited the deny.
+            Err(_) => Err(rustix::io::Errno::ACCESS.into()),
+        }
+    }
+
     /// Creates (or truncates) a file for writing. Needs [`Rights::CREATE`]
     /// and [`Rights::WRITE`], because the returned handle writes data.
     pub fn create(&self, path: impl AsRef<Path>) -> Result<File, GateError> {
@@ -573,11 +626,13 @@ impl Gate {
     /// filesystem then refused) once policy is satisfied.
     fn gated<T>(
         &self,
-        op: AuditOp,
+        origin: impl Into<Origin>,
         path: &Path,
         needed: Rights,
         run: impl FnOnce(&GrantEntry, &Path) -> io::Result<T>,
     ) -> Result<T, GateError> {
+        let origin = origin.into();
+        let op = origin.op;
         let (index, entry, rel, full) = match self.resolve(path) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -587,13 +642,13 @@ impl Gate {
                     // resolve() returns no other variants.
                     _ => AuditReason::Ok,
                 };
-                self.emit(op, Some(path), None, AuditDecision::Deny, reason, None);
+                self.emit(origin, Some(path), None, AuditDecision::Deny, reason, None);
                 return Err(err);
             }
         };
         if !entry.rights.contains(needed) {
             self.emit(
-                op,
+                origin,
                 Some(&full),
                 Some(index),
                 AuditDecision::Deny,
@@ -610,7 +665,7 @@ impl Gate {
         match run(entry, &rel) {
             Ok(value) => {
                 self.emit(
-                    op,
+                    origin,
                     Some(&full),
                     Some(index),
                     AuditDecision::Allow,
@@ -621,7 +676,7 @@ impl Gate {
             }
             Err(source) => {
                 self.emit(
-                    op,
+                    origin,
                     Some(&full),
                     Some(index),
                     AuditDecision::Allow,
@@ -661,7 +716,7 @@ impl Gate {
 
     fn emit(
         &self,
-        op: AuditOp,
+        origin: impl Into<Origin>,
         path: Option<&Path>,
         grant: Option<usize>,
         decision: AuditDecision,
@@ -669,15 +724,18 @@ impl Gate {
         errno: Option<i32>,
     ) {
         if let Some(sink) = &self.audit {
+            let origin = origin.into();
             sink.event(&AuditEvent {
                 ts: SystemTime::now(),
-                op,
+                op: origin.op,
                 path: path.map(Path::to_path_buf),
                 grant,
                 rights: None,
                 decision,
                 reason,
                 errno,
+                syscall: origin.notified.map(|notified| notified.syscall),
+                notification: origin.notified.map(|notified| notified.notification),
             });
         }
     }
@@ -703,6 +761,8 @@ impl Gate {
                 decision,
                 reason,
                 errno: None,
+                syscall: None,
+                notification: None,
             });
         }
     }
@@ -712,6 +772,31 @@ impl Default for Gate {
     fn default() -> Gate {
         Gate::new()
     }
+}
+
+/// The operation an audit event records, and, for an intercepted request,
+/// which syscall and notification it answers.
+#[derive(Clone, Copy)]
+struct Origin {
+    op: AuditOp,
+    notified: Option<Notified>,
+}
+
+impl From<AuditOp> for Origin {
+    fn from(op: AuditOp) -> Origin {
+        Origin { op, notified: None }
+    }
+}
+
+/// Identifies an intercepted request (RFC 0004) in its audit event.
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    not(all(feature = "experimental-intercept", target_os = "linux")),
+    allow(dead_code)
+)]
+struct Notified {
+    syscall: &'static str,
+    notification: u64,
 }
 
 /// Normalizes an absolute path lexically: resolves `.` and `..` without

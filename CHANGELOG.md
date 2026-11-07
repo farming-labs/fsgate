@@ -5,6 +5,8 @@
 ### Added
 
 - Experimental, Linux only, behind the `experimental-intercept` feature and outside semver: `Gate::open_regular_strict`, the read-only open of the RFC 0004 interception profile. It needs `READ` like `open`, but refuses every symlink with `ELOOP` (even inside the grant), directories with `EISDIR`, and FIFOs, devices, sockets, and procfs or sysfs files with `EOPNOTSUPP` without opening them for I/O. It reopens the `O_PATH` handle it checked, so a rename in between cannot substitute another file. The feature adds a direct dependency on `rustix-linux-procfs`, already in the dependency graph through `cap-std`.
+- Experimental, same feature: `fsgate::intercept::OpenRequest` and `Gate::open_intercepted`, the audited dispatcher for intercepted open requests. It validates the copied arguments against the RFC 0004 file-open contract, authorizes with `open_regular_strict`, and emits exactly one audit event per request, including requests refused before any grant is matched.
+- `AuditReason::UnsupportedInput` and `AuditReason::InvalidMemory`, and the `AuditEvent` fields `syscall` and `notification`, set only for intercepted requests. Every JSON line now carries `syscall` and `notification` keys, `null` outside interception; both are additive within format v1 ([RFC 0002](docs/rfcs/0002-audit-events.md)).
 
 ## 0.1.1 (2026-11-07)
 
