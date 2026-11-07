@@ -1,0 +1,94 @@
+name: release
+
+# Publishes fsgate to crates.io when a signed release tag is pushed, using
+# crates.io trusted publishing (GitHub OIDC). No long-lived token is stored.
+# The procedure is docs/RELEASING.md.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - name: Refuse a tag that is not a release of main
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          version="${tag#v}"
+          # Fetch the tag object itself; signed tags are annotated, so a
+          # lightweight tag is refused.
+          git fetch --force --no-tags origin "refs/tags/$tag:refs/tags/$tag"
+          if [ "$(git cat-file -t "refs/tags/$tag")" != tag ]; then
+            echo "::error::$tag is not an annotated tag; create it with 'git tag -s' (docs/RELEASING.md)."
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$tag points to $GITHUB_SHA, which is not on main; tag a merged release commit."
+            exit 1
+          fi
+          manifest=$(cargo metadata --locked --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "fsgate") | .version')
+          if [ "$manifest" != "$version" ]; then
+            echo "::error::$tag does not match crates/fsgate/Cargo.toml version $manifest; bump with cargo set-version first."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_ENV"
+
+      - run: cargo test --locked
+      - run: cargo publish --locked --dry-run
+
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+        id: auth
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: Verify the published crate
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Cargo versions differ on where they leave the uploaded archive
+          # (target/package or target/package/tmp-crate); every copy must agree.
+          sums=$(find target/package -name "fsgate-$version.crate" -exec sha256sum {} + | cut -d' ' -f1 | sort -u)
+          count=$(printf '%s' "$sums" | grep -c . || true)
+          if [ "$count" -ne 1 ]; then
+            echo "::error::expected one uploaded archive checksum for $version, found $count."
+            exit 1
+          fi
+          uploaded="$sums"
+          registry=$(curl -sf -A "fsgate-release (https://github.com/farming-labs/fsgate)" \
+            "https://crates.io/api/v1/crates/fsgate/$version" | jq -r '.version.checksum')
+          curl -sfL -A "fsgate-release (https://github.com/farming-labs/fsgate)" \
+            -o published.crate "https://static.crates.io/crates/fsgate/fsgate-$version.crate"
+          downloaded=$(sha256sum published.crate | cut -d' ' -f1)
+          recorded=$(tar -xzOf published.crate "fsgate-$version/.cargo_vcs_info.json" | jq -r '.git.sha1')
+          echo "uploaded:   $uploaded"
+          echo "crates.io:  $registry"
+          echo "downloaded: $downloaded"
+          echo "recorded:   $recorded (tag commit $GITHUB_SHA)"
+          test "$uploaded" = "$registry"
+          test "$uploaded" = "$downloaded"
+          test "$recorded" = "$GITHUB_SHA"

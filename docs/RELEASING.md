@@ -1,9 +1,9 @@
 # Releasing fsgate
 
 Each release is a signed Git tag `vX.Y.Z`, and the crate published to
-crates.io is built from exactly that tagged commit. Publishing needs an
-explicit maintainer request for each release. A version bump or merged
-release-preparation PR is not a completed release.
+crates.io is built from exactly that tagged commit. Pushing a release tag
+publishes it from CI, so push one only on an explicit maintainer request.
+A version bump or merged release-preparation PR is not a completed release.
 
 The commands below set `version` once; use the release's version.
 
@@ -12,7 +12,8 @@ version=X.Y.Z
 ```
 
 v0.1.0 was tagged while the manifest still had `publish = false`, so it was
-never published. 0.1.1 is the first crates.io release.
+never published. 0.1.1, the first crates.io release, was published from a
+local checkout with a token; later releases publish from CI.
 
 ## Prepare the version
 
@@ -97,13 +98,50 @@ git ls-remote --tags origin "refs/tags/v$version*"
 Signature verification requires a trusted public key; SSH signing uses
 Git's `gpg.ssh.allowedSignersFile`. Stop if signing or verification fails.
 Never move a tag or reuse a version. Retry a failed tag push without
-changing the signed tag.
+changing the signed tag. The push starts the publish workflow below.
 
 ## Publish to crates.io
 
 Publishing cannot be undone: a version can be yanked but never deleted or
-replaced. Publish only on an explicit request, from a clean checkout of the
-verified tag, after the remote tag points to the recorded commit:
+replaced. Pushing the signed tag starts
+[`.github/workflows/release.yml`](../.github/workflows/release.yml), which
+publishes that tag through crates.io trusted publishing. No long-lived
+token is stored. The workflow:
+
+1. Refuses a tag that is not annotated, does not point to a commit on
+   `main`, or does not match the manifest version, with the fix in the
+   error.
+2. Runs `cargo test --locked` and `cargo publish --locked --dry-run`.
+3. Exchanges the job's GitHub OIDC identity for a short-lived crates.io
+   token with `rust-lang/crates-io-auth-action`, which revokes it when the
+   job ends, and runs `cargo publish --locked`.
+4. Checks that the uploaded archive, the crates.io checksum, and the
+   crate downloaded from `static.crates.io` agree, and that the crate's
+   `.cargo_vcs_info.json` records the tagged commit.
+
+Watch the run with `gh run watch` and confirm the verification step passed
+before recording the release. If a publish fails, fix the cause and re-run
+the workflow for the same tag; never bump again or move the tag. If it
+succeeded with a defect, yank it and release a new version.
+
+### One-time setup
+
+Until both are configured, the token exchange fails and nothing is
+published:
+
+- On crates.io, under `fsgate` → Settings → Trusted Publishing, add a
+  GitHub publisher: owner `farming-labs`, repository `fsgate`, workflow
+  `release.yml`, environment `crates-io`.
+- On GitHub, under Settings → Environments → `crates-io`, add required
+  reviewers so a pushed tag waits for approval before it publishes, and
+  restrict deployments to tags matching `v*`.
+
+### Manual fallback
+
+Use a local token only on an explicit maintainer request when CI
+publishing is unavailable. Publish from a clean checkout of the verified
+tag; `git status --short` must print nothing, and never pass
+`--allow-dirty`:
 
 ```sh
 set -eu
@@ -114,25 +152,24 @@ cargo publish --locked -p fsgate --dry-run
 cargo publish --locked -p fsgate
 ```
 
-`git status --short` must print nothing; never pass `--allow-dirty`. The
-dry run builds the archive and checks the manifest without uploading.
-Cargo needs a crates.io token for the first release of the crate: either
-`cargo login`, which stores it in `~/.cargo/credentials.toml`, or
-`CARGO_REGISTRY_TOKEN` for that one command. Never put the token in a
-commit, a CI log, or a shell history entry. Later releases should move to
-crates.io trusted publishing from CI once it is configured for the crate.
-
-After the upload, confirm the published version and its recorded commit:
+Cargo reads the token from `cargo login` (`~/.cargo/credentials.toml`) or
+`CARGO_REGISTRY_TOKEN` for that one command. Never put a token in a commit,
+a CI log, or a shell history entry. Then run the workflow's checks by hand.
+Cargo 1.99 leaves the uploaded archive at
+`target/package/tmp-crate/fsgate-$version.crate` (older cargo:
+`target/package/fsgate-$version.crate`); its checksum must equal the
+crates.io checksum and the downloaded crate's:
 
 ```sh
 curl -sf -A "fsgate-release-check" "https://crates.io/api/v1/crates/fsgate/$version" \
   | python3 -c 'import json,sys; v=json.load(sys.stdin)["version"]; print(v["num"], v["checksum"])'
+curl -sfL -A "fsgate-release-check" -o "fsgate-$version.crate" \
+  "https://static.crates.io/crates/fsgate/fsgate-$version.crate"
+shasum -a 256 "fsgate-$version.crate"
+tar -xzOf "fsgate-$version.crate" "fsgate-$version/.cargo_vcs_info.json"
 ```
 
-The checksum must match `shasum -a 256 "target/package/fsgate-$version.crate"`,
-the archive `cargo publish` just built and uploaded from the tagged checkout.
-If a publish fails, fix the cause and retry the same version without bumping
-again; if it succeeded with a defect, yank it and release a new version.
+The `sha1` in `.cargo_vcs_info.json` must equal `$release_sha`.
 
 ## Record the release
 
