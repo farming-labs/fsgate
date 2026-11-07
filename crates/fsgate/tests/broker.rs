@@ -6,13 +6,12 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
 
 use fsgate::{Broker, BrokerGate, Gate, GateError, Rights};
 use tempfile::TempDir;
@@ -170,17 +169,23 @@ fn broker_binary_serves_and_dies_closed() {
             "--",
             "sh",
             "-c",
-            "sleep 30",
+            "echo ready; exec sleep 30",
         ])
+        .stdout(Stdio::piped())
         .spawn()
         .expect("spawn fsgate-broker");
 
-    // Wait for the socket to appear.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !socket.exists() {
-        assert!(Instant::now() < deadline, "broker socket never appeared");
-        thread::sleep(Duration::from_millis(20));
-    }
+    // The socket file exists from bind(), but connecting before listen() is
+    // refused. The broker starts its command only after both, so the
+    // command's first line is the readiness signal.
+    let mut ready = String::new();
+    BufReader::new(broker.stdout.take().expect("piped stdout"))
+        .read_line(&mut ready)
+        .expect("read the broker command's output");
+    assert_eq!(
+        ready, "ready\n",
+        "broker exited before starting its command"
+    );
 
     let mut client = BrokerGate::connect(&socket).unwrap();
 
