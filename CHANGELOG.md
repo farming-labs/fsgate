@@ -2,9 +2,9 @@
 
 ## Unreleased
 
-## 0.1.0 (unreleased)
+## 0.1.0 (2026-11-06)
 
-Prepared for the initial signed-tag release. Not yet tagged or published to crates.io.
+The initial release: the signed tag [`v0.1.0`](https://github.com/farming-labs/fsgate/tree/v0.1.0) on `0ad477f`. Not published to crates.io; the crate remains `publish = false`.
 
 ### Added
 
