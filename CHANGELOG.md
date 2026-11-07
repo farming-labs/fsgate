@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.1.1 (unreleased)
+
+Prepared as the first crates.io release. No library or binary changes since 0.1.0.
+
+### Changed
+
+- The manifest allows publishing to crates.io (`publish = false` is removed) and adds crates.io keywords and categories.
+- [The release procedure](docs/RELEASING.md) is version-generic and adds the crates.io publish and verification steps.
+
 ## 0.1.0 (2026-11-06)
 
 The initial release: the signed tag [`v0.1.0`](https://github.com/farming-labs/fsgate/tree/v0.1.0) on `0ad477f`. Not published to crates.io; the crate remains `publish = false`.
