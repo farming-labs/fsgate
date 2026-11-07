@@ -85,4 +85,4 @@ LD_PRELOAD interposition, Windows, quotas, network capabilities, in-process mult
 
 - ~~seccomp filter scope vs. real-world libraries that legitimately `openat` relative descriptors~~ — resolved by ADR 0002: Landlock alone mediates paths.
 - ~~Audit sink backpressure: drop, block, or count-and-flag~~ — resolved in RFC 0002: delivery is synchronous and the embedder owns buffering; fsgate never drops an event itself.
-- ~~Whether `Grant` should be cloneable with attenuated rights (`grant.narrow(Rights::READ)`)~~ — proposed in RFC 0005, after v0.1.0: `Gate::narrow(grant, rights)` narrows a live grant in place rather than minting an attenuated copy.
+- ~~Whether `Grant` should be cloneable with attenuated rights (`grant.narrow(Rights::READ)`)~~ — resolved by RFC 0005, in v0.1.0: `Gate::narrow(grant, rights)` narrows a live grant in place rather than minting an attenuated copy.

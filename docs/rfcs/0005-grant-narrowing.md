@@ -1,6 +1,6 @@
 # RFC 0005: narrow a grant's rights in place
 
-- Status: proposed
+- Status: accepted; implemented in [#6](https://github.com/farming-labs/fsgate/pull/6)
 - Date: 2026-11-06
 - Roadmap: [M7, in v0.1.0](../../ROADMAP.md#m7--grant-narrowing)
 - Resolves: the attenuated-grant open question in [RFC 0001](0001-core-design.md#open-questions)
