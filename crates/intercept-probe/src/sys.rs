@@ -31,8 +31,12 @@ use std::ptr;
 
 use libc::{c_long, c_ulong};
 
+use crate::filters::RESERVED_IMAGE_FD;
+
+/// Byte the child writes once both filters are installed.
+pub(crate) const RESTRICTED_BYTE: u8 = b'r';
 /// Byte the supervisor writes to release the startup barrier.
-pub(crate) const READY_BYTE: u8 = b'1';
+pub(crate) const RELEASE_BYTE: u8 = b'1';
 
 /// `struct landlock_ruleset_attr` for ABI v1–v3, which has only this field.
 #[repr(C)]
@@ -224,31 +228,38 @@ pub(crate) struct ChildSetup {
     pub(crate) peer: RawFd,
     /// The notification filter program.
     pub(crate) filter: Vec<libc::sock_filter>,
-    /// The checked worker image, which the child executes by descriptor.
+    /// The final allowlist, stacked after the notification filter and built
+    /// around [`RESERVED_IMAGE_FD`].
+    pub(crate) allowlist: Vec<libc::sock_filter>,
+    /// The checked worker image. The child moves it to
+    /// [`RESERVED_IMAGE_FD`] and executes it from there.
     pub(crate) image: RawFd,
     /// The worker's argument vector, `argv[0]` included.
     pub(crate) argv: Vec<CString>,
 }
 
 /// Registers the startup sequence to run in the child between fork and
-/// exec: close-on-exec for every inherited descriptor above stdio,
-/// `no_new_privs`, Landlock, the notification filter, handing the listener
-/// to the supervisor, waiting for the supervisor's release, and finally
-/// `execveat` on the held image. `Command` never execs its program path:
-/// the closure either replaces the process or returns the errno.
+/// exec (RFC 0004, "Bootstrap authority"): close-on-exec for every
+/// inherited descriptor above stdio, `no_new_privs`, Landlock, the
+/// notification filter, handing the listener to the supervisor, moving the
+/// image to [`RESERVED_IMAGE_FD`], the final allowlist, signalling that both
+/// filters are in place, waiting for the supervisor's release, and finally
+/// `execveat` on the reserved descriptor. `Command` never execs its program
+/// path: the closure either replaces the process or returns the errno.
 pub(crate) fn install_child_setup(command: &mut Command, setup: ChildSetup) {
     let ChildSetup {
         ruleset,
         socket,
         peer,
         filter,
+        allowlist,
         image,
         argv,
     } = setup;
     let exec = ExecArgs::new(argv);
     let child = move || {
-        child_setup(ruleset, socket, peer, &filter)?;
-        Err(exec.execveat(image))
+        child_setup(ruleset, socket, peer, &filter, image, &allowlist)?;
+        Err(exec.execveat(RESERVED_IMAGE_FD))
     };
     // SAFETY: `child_setup` and `ExecArgs::execveat` keep the post-fork
     // rules in the module contract, and the caller keeps every descriptor
@@ -310,6 +321,8 @@ fn child_setup(
     socket: RawFd,
     peer: RawFd,
     filter: &[libc::sock_filter],
+    image: RawFd,
+    allowlist: &[libc::sock_filter],
 ) -> io::Result<()> {
     // Drop the child's copy of the supervisor's end, so the barrier read
     // below sees end-of-file if the supervisor exits without releasing it.
@@ -340,20 +353,7 @@ fn child_setup(
     // SAFETY: integers only; `ruleset` was inherited across fork and is open.
     check(unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset, 0u32) })?;
 
-    let program = libc::sock_fprog {
-        len: filter.len() as u16,
-        filter: filter.as_ptr().cast_mut(),
-    };
-    // SAFETY: `program` points at `filter`, which outlives the call; the
-    // kernel copies the program and only reads it.
-    let listener = check(unsafe {
-        libc::syscall(
-            libc::SYS_seccomp,
-            libc::SECCOMP_SET_MODE_FILTER,
-            libc::SECCOMP_FILTER_FLAG_NEW_LISTENER,
-            &program as *const libc::sock_fprog,
-        )
-    })? as RawFd;
+    let listener = install_filter(filter, libc::SECCOMP_FILTER_FLAG_NEW_LISTENER)? as RawFd;
 
     let sent = send_listener(socket, listener);
     // The supervisor holds its own copy now; the worker must not inherit one.
@@ -363,13 +363,49 @@ fn child_setup(
     }
     sent?;
 
+    // The allowlist names the image by a fixed number, so it is moved there
+    // first. `dup3` fails if the number is out of range: startup fails.
+    if image != RESERVED_IMAGE_FD {
+        // SAFETY: integers only; `image` was inherited across fork.
+        check(unsafe { libc::dup3(image, RESERVED_IMAGE_FD, libc::O_CLOEXEC) } as c_long)?;
+    }
+    install_filter(allowlist, 0)?;
+    // From here on only the allowlisted syscalls work: no more seccomp,
+    // prctl, or socket calls. `write`, `read`, and `execveat` remain.
+    let restricted = [RESTRICTED_BYTE];
+    // SAFETY: writes one byte from a local array.
+    let written = unsafe { libc::write(socket, restricted.as_ptr().cast(), 1) };
+    if written != 1 {
+        return Err(io::Error::from_raw_os_error(libc::ECANCELED));
+    }
+
     let mut byte = 0u8;
     // SAFETY: reads at most one byte into a local.
     let read = unsafe { libc::read(socket, (&raw mut byte).cast(), 1) };
-    if read != 1 || byte != READY_BYTE {
+    if read != 1 || byte != RELEASE_BYTE {
         return Err(io::Error::from_raw_os_error(libc::ECANCELED));
     }
     Ok(())
+}
+
+/// Installs `program` as a seccomp filter on the calling thread with
+/// `flags`, returning the syscall's result (a listener with
+/// `SECCOMP_FILTER_FLAG_NEW_LISTENER`, otherwise 0).
+fn install_filter(program: &[libc::sock_filter], flags: c_ulong) -> io::Result<c_long> {
+    let program = libc::sock_fprog {
+        len: program.len() as u16,
+        filter: program.as_ptr().cast_mut(),
+    };
+    // SAFETY: `program` points at a filter that outlives the call; the
+    // kernel copies the program and only reads it.
+    check(unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER,
+            flags,
+            &program as *const libc::sock_fprog,
+        )
+    })
 }
 
 /// Sends `listener` over `socket` with this process's PID as the payload.

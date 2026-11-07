@@ -10,12 +10,22 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+/* The probe moves the worker image to this descriptor number before the
+ * allowlist; tests aim reused descriptors and paths at it. */
+#define RESERVED_IMAGE_FD 1000
 
 /* `struct open_how` from linux/openat2.h, redeclared to avoid clashing
  * with libc headers that define it too. */
@@ -37,6 +47,18 @@ static int dump(int fd) {
         fwrite(buf, 1, (size_t)n, stdout);
     }
     return n < 0 ? fail() : 0;
+}
+
+static void *read_in_thread(void *path) {
+    int fd = open(path, O_RDONLY);
+    return (void *)(intptr_t)(fd < 0 ? fail() : dump(fd));
+}
+
+static int run_execveat(int dirfd, const char *path) {
+    char *args[] = {"worker", "fds", NULL};
+    char *env[] = {NULL};
+    syscall(SYS_execveat, dirfd, path, args, env, AT_EMPTY_PATH);
+    return fail();
 }
 
 int main(int argc, char **argv) {
@@ -79,6 +101,68 @@ int main(int argc, char **argv) {
                (fcntl(plain, F_GETFD) & FD_CLOEXEC) != 0,
                (fcntl(marked, F_GETFD) & FD_CLOEXEC) != 0);
         return 0;
+    }
+    if (strcmp(op, "exec") == 0) {
+        char *args[] = {(char *)path, NULL};
+        char *env[] = {NULL};
+        execve(path, args, env);
+        return fail();
+    }
+    if (strcmp(op, "execfd") == 0) {
+        /* Reuse the reserved number for a delivered file, then exec it. */
+        int fd = open(path, O_RDONLY);
+        if (fd < 0 || dup2(fd, RESERVED_IMAGE_FD) < 0) return fail();
+        return run_execveat(RESERVED_IMAGE_FD, "");
+    }
+    if (strcmp(op, "execat") == 0) {
+        /* An absolute path is resolved without the directory descriptor. */
+        return run_execveat(RESERVED_IMAGE_FD, path);
+    }
+    if (strcmp(op, "uring") == 0) {
+        char params[120] = {0};
+        if (syscall(SYS_io_uring_setup, 1, params) < 0) return fail();
+        printf("io_uring\n");
+        return 0;
+    }
+    if (strcmp(op, "socket") == 0) {
+        if (socket(AF_UNIX, SOCK_STREAM, 0) < 0) return fail();
+        printf("socket\n");
+        return 0;
+    }
+    if (strcmp(op, "prctl") == 0) {
+        if (prctl(PR_SET_NAME, "renamed", 0, 0, 0) < 0) return fail();
+        printf("renamed\n");
+        return 0;
+    }
+    if (strcmp(op, "clone-ns") == 0) {
+        long pid = syscall(SYS_clone, CLONE_NEWUSER | SIGCHLD, 0, 0, 0, 0);
+        if (pid < 0) return fail();
+        if (pid == 0) _exit(0);
+        printf("cloned\n");
+        return 0;
+    }
+    if (strcmp(op, "fork-read") == 0) {
+        pid_t pid = fork();
+        if (pid < 0) return fail();
+        if (pid == 0) {
+            int fd = open(path, O_RDONLY);
+            int code = fd < 0 ? fail() : dump(fd);
+            fflush(stdout);
+            _exit(code);
+        }
+        int status;
+        if (waitpid(pid, &status, 0) < 0) return fail();
+        return WIFEXITED(status) ? WEXITSTATUS(status) : 4;
+    }
+    if (strcmp(op, "thread-read") == 0) {
+        pthread_t thread;
+        void *code;
+        if (pthread_create(&thread, NULL, read_in_thread, (void *)path) != 0) {
+            printf("pthread_create failed\n");
+            return 4;
+        }
+        pthread_join(thread, &code);
+        return (int)(intptr_t)code;
     }
     if (strcmp(op, "fds") == 0) {
         for (int fd = 3; fd < 1024; fd++) {
