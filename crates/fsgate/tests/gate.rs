@@ -244,3 +244,115 @@ fn grant_root_metadata_works() {
 
     assert!(gate.metadata(&granted).unwrap().is_dir());
 }
+
+#[test]
+fn narrow_drops_rights_and_denied_writes_leave_files_unchanged() {
+    let (_root, granted, _) = setup();
+    fs::write(granted.join("a.txt"), b"hello").unwrap();
+    let mut gate = Gate::new();
+    let grant = gate
+        .grant(&granted, Rights::READ | Rights::WRITE | Rights::CREATE)
+        .unwrap();
+    assert!(gate.create(granted.join("before.txt")).is_ok());
+
+    gate.narrow(grant, Rights::READ).unwrap();
+
+    let target = granted.join("after.txt");
+    match gate.create(&target).unwrap_err() {
+        GateError::RightsExceeded { missing, .. } => {
+            assert!(missing.contains(Rights::CREATE));
+            assert!(missing.contains(Rights::WRITE));
+        }
+        other => panic!("expected RightsExceeded, got {other:?}"),
+    }
+    assert!(!target.exists(), "denied create must not create the file");
+
+    // `create` truncates an existing file; the denial must leave it intact.
+    assert!(gate.create(granted.join("a.txt")).is_err());
+    assert_eq!(fs::read(granted.join("a.txt")).unwrap(), b"hello");
+
+    // The kept right still works.
+    let file = gate.open(granted.join("a.txt")).unwrap();
+    assert_eq!(read_to_string(file), "hello");
+}
+
+#[test]
+fn narrow_cannot_widen_even_back_to_the_original_rights() {
+    let (_root, granted, _) = setup();
+    let mut gate = Gate::new();
+    let all = Rights::READ | Rights::WRITE | Rights::CREATE;
+    let grant = gate.grant(&granted, all).unwrap();
+    gate.narrow(grant, Rights::READ).unwrap();
+
+    match gate.narrow(grant, all).unwrap_err() {
+        GateError::WouldWiden {
+            grant_path,
+            held,
+            extra,
+        } => {
+            assert_eq!(grant_path, granted);
+            assert_eq!(held, Rights::READ);
+            assert_eq!(extra, Rights::WRITE | Rights::CREATE);
+        }
+        other => panic!("expected WouldWiden, got {other:?}"),
+    }
+
+    // The refused call left the grant read-only.
+    let target = granted.join("planted.txt");
+    assert!(matches!(
+        gate.create(&target),
+        Err(GateError::RightsExceeded { .. })
+    ));
+    assert!(!target.exists());
+}
+
+#[test]
+fn narrowing_a_revoked_grant_is_unknown_grant() {
+    let (_root, granted, _) = setup();
+    let mut gate = Gate::new();
+    let grant = gate.grant(&granted, Rights::READ).unwrap();
+    gate.revoke(grant).unwrap();
+
+    assert!(matches!(
+        gate.narrow(grant, Rights::READ),
+        Err(GateError::UnknownGrant)
+    ));
+}
+
+#[test]
+fn narrow_keeps_the_held_directory_instead_of_reopening_the_path() {
+    let (root, granted, _) = setup();
+    fs::write(granted.join("a.txt"), b"original").unwrap();
+    let mut gate = Gate::new();
+    let grant = gate.grant(&granted, Rights::READ | Rights::WRITE).unwrap();
+
+    // Swap a different directory in under the granted name.
+    fs::rename(&granted, root.path().join("moved")).unwrap();
+    fs::create_dir(&granted).unwrap();
+    fs::write(granted.join("a.txt"), b"impostor").unwrap();
+
+    gate.narrow(grant, Rights::READ).unwrap();
+
+    // The grant still reaches the directory it opened, not the new one.
+    let file = gate.open(granted.join("a.txt")).unwrap();
+    assert_eq!(read_to_string(file), "original");
+}
+
+#[test]
+fn narrowing_to_no_rights_keeps_routing_to_the_grant() {
+    let (_root, granted, _) = setup();
+    let sub = granted.join("sub");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("a.txt"), b"sub").unwrap();
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::READ).unwrap();
+    let inner = gate.grant(&sub, Rights::READ).unwrap();
+
+    gate.narrow(inner, Rights::from_bits_truncate(0)).unwrap();
+
+    // Unlike `revoke`, the outer grant does not take over the subdirectory.
+    assert!(matches!(
+        gate.open(sub.join("a.txt")),
+        Err(GateError::RightsExceeded { .. })
+    ));
+}

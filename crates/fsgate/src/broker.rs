@@ -220,6 +220,7 @@ fn error_response(err: GateError) -> Response {
             wire.errno = source.raw_os_error();
         }
         GateError::UnknownGrant
+        | GateError::WouldWiden { .. }
         | GateError::Locked
         | GateError::LockUnsupported { .. }
         | GateError::LockFailed { .. }
