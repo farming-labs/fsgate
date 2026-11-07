@@ -47,6 +47,7 @@ fsgate-broker --experimental-intercept --grant /srv/data:r --audit --apply -- ./
 ## What fsgate does not do
 
 - It does not sandbox the network, environment, or memory. Filesystem only.
+- `lock()` does not restrict Unix domain sockets or signals. A locked process can still reach an unconfined process that opens files for it or passes it descriptors. Landlock restricts these only in ABIs newer than the v3 rules fsgate installs ([RFC 0001](docs/rfcs/0001-core-design.md#containment-lock)).
 - It does not intercept `open(2)` in unmodified binaries, except through an experimental, unreviewed launcher for static Linux x86_64 binaries behind the `experimental-intercept` feature ([M6](ROADMAP.md#m6--linux-filesystem-interception-experimental), [RFC 0004](docs/rfcs/0004-filesystem-interception.md)). That launcher is not supported yet. A preload shim remains out of scope for v1.
 - It does not support Windows in v1.
 - It is not a container runtime and does not replace one.
