@@ -13,6 +13,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,6 +55,23 @@ static void *read_in_thread(void *path) {
     return (void *)(intptr_t)(fd < 0 ? fail() : dump(fd));
 }
 
+/* Shared by the `race` op: one thread rewrites `race_path` between two
+ * paths while the main thread keeps opening it. */
+static char race_path[4096];
+static const char *race_paths[2];
+static atomic_int race_stop;
+
+static void *flip_race_path(void *unused) {
+    (void)unused;
+    size_t first = strlen(race_paths[0]) + 1;
+    size_t second = strlen(race_paths[1]) + 1;
+    while (!atomic_load(&race_stop)) {
+        memcpy(race_path, race_paths[0], first);
+        memcpy(race_path, race_paths[1], second);
+    }
+    return NULL;
+}
+
 static int run_execveat(int dirfd, const char *path) {
     char *args[] = {"worker", "fds", NULL};
     char *env[] = {NULL};
@@ -72,6 +90,42 @@ int main(int argc, char **argv) {
     if (strcmp(op, "read") == 0) {
         int fd = open(path, O_RDONLY);
         return fd < 0 ? fail() : dump(fd);
+    }
+    if (strcmp(op, "raw-open") == 0) {
+        /* The `open` syscall itself; glibc's open() uses openat. */
+        long fd = syscall(SYS_open, path, O_RDONLY);
+        return fd < 0 ? fail() : dump((int)fd);
+    }
+    if (strcmp(op, "race") == 0) {
+        /* race <granted> <secret> <rounds>: never read the secret. */
+        if (argc < 5) return 2;
+        race_paths[0] = path;
+        race_paths[1] = argv[3];
+        int rounds = atoi(argv[4]);
+        memcpy(race_path, path, strlen(path) + 1);
+        pthread_t flipper;
+        if (pthread_create(&flipper, NULL, flip_race_path, NULL) != 0) return 4;
+        int granted = 0, denied = 0;
+        for (int round = 0; round < rounds; round++) {
+            long fd = syscall(SYS_openat, AT_FDCWD, race_path, O_RDONLY);
+            if (fd < 0) {
+                denied++;
+                continue;
+            }
+            char buf[16] = {0};
+            ssize_t n = read((int)fd, buf, sizeof buf - 1);
+            close((int)fd);
+            if (n > 0 && strncmp(buf, "secret", 6) == 0) {
+                atomic_store(&race_stop, 1);
+                printf("LEAK\n");
+                return 1;
+            }
+            granted++;
+        }
+        atomic_store(&race_stop, 1);
+        pthread_join(flipper, NULL);
+        printf("ok granted=%d denied=%d\n", granted, denied);
+        return 0;
     }
     if (strcmp(op, "write") == 0) {
         int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);

@@ -559,3 +559,58 @@ fn the_broker_refuses_an_image_the_profile_rejects_in_plan_and_apply() {
     assert!(String::from_utf8_lossy(&apply.stderr).contains("needs an ELF interpreter"));
     assert!(apply.stdout.is_empty());
 }
+
+#[test]
+fn the_raw_open_syscall_is_mediated_too() {
+    let dirs = Dirs::new();
+    let path = dirs.granted("a.txt");
+    let secret = dirs.outside("secret.txt");
+
+    let granted = run_worker(dirs.gate(Rights::READ), &["raw-open", &path]);
+    let refused = run_worker(dirs.gate(Rights::READ), &["raw-open", &secret]);
+
+    assert_eq!(stdout(&granted), "inside");
+    assert_eq!(seen(&granted), [allowed("open", &path, None)]);
+    assert_eq!(stdout(&refused), format!("errno={EACCES}\n"));
+    assert_eq!(
+        seen(&refused),
+        [denied("open", &secret, AuditReason::NoGrant)]
+    );
+}
+
+#[test]
+fn a_path_rewritten_during_its_request_never_reaches_an_ungranted_file() {
+    let dirs = Dirs::new();
+    let path = dirs.granted("a.txt");
+    let secret = dirs.outside("secret.txt");
+
+    // One worker thread flips the path buffer between the granted file and
+    // the secret while another opens it. The supervisor copies the path once
+    // and authorizes only that copy, so a torn or swapped path can fail, but
+    // can never deliver the secret.
+    let outcome = run_worker(dirs.gate(Rights::READ), &["race", &path, &secret, "2000"]);
+
+    let out = stdout(&outcome);
+    assert!(!out.contains("LEAK"), "{out}");
+    let counts: Vec<u32> = out
+        .trim()
+        .strip_prefix("ok ")
+        .unwrap_or_else(|| panic!("unexpected output {out:?}"))
+        .split(' ')
+        .map(|field| field.split_once('=').unwrap().1.parse().unwrap())
+        .collect();
+    assert!(
+        counts[0] > 0 && counts[1] > 0,
+        "the race never ran both ways: {out}"
+    );
+    let secret_path = Path::new(&secret);
+    assert!(
+        outcome
+            .events
+            .iter()
+            .filter(|event| event.path.as_deref() == Some(secret_path))
+            .all(|event| event.decision == AuditDecision::Deny),
+        "an event allowed the secret"
+    );
+    assert_eq!(fs::read(&secret).unwrap(), b"secret");
+}
