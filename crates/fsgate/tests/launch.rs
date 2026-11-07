@@ -614,3 +614,93 @@ fn a_path_rewritten_during_its_request_never_reaches_an_ungranted_file() {
     );
     assert_eq!(fs::read(&secret).unwrap(), b"secret");
 }
+
+/// Sends every audit event on a channel, so a test can wait for a decision.
+struct Notify(Mutex<std::sync::mpsc::Sender<AuditEvent>>);
+
+impl AuditSink for Notify {
+    fn event(&self, event: &AuditEvent) {
+        let _ = self.0.lock().unwrap().send(event.clone());
+    }
+}
+
+#[test]
+fn a_revoked_grant_denies_later_opens_but_delivered_files_stay_usable() {
+    use std::io::Write;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dirs = Dirs::new();
+    let path = dirs.granted("a.txt");
+    let (sender, decisions) = mpsc::channel();
+    let mut gate = Gate::new();
+    let grant = gate.grant(&dirs.granted, Rights::READ).unwrap();
+    gate.set_audit_sink(Arc::new(Notify(Mutex::new(sender))));
+
+    let mut running = Launch::new(worker())
+        .args(["revoke-cycle", path.as_str()])
+        .spawn(gate)
+        .expect("spawn");
+    let mut stdin = running.take_stdin().expect("stdin pipe");
+
+    // The worker's first open has been decided and delivered.
+    let first = decisions
+        .recv_timeout(Duration::from_secs(10))
+        .expect("first decision");
+    assert_eq!(
+        (first.decision, first.reason),
+        (AuditDecision::Allow, AuditReason::Ok)
+    );
+
+    running.revoke(grant).expect("revoke while running");
+    stdin.write_all(b"x").unwrap();
+    drop(stdin);
+    let outcome = running.wait().expect("wait");
+
+    let out = String::from_utf8_lossy(&outcome.stdout);
+    assert_eq!(
+        out,
+        format!("first=inside\nsecond=errno={EACCES}\nkept=inside\n")
+    );
+    // The revoke is audited too, between the two opens.
+    let revoked = decisions
+        .recv_timeout(Duration::from_secs(10))
+        .expect("revoke event");
+    assert_eq!(
+        (revoked.op, revoked.decision, revoked.path),
+        (
+            AuditOp::Revoke,
+            AuditDecision::Allow,
+            Some(dirs.granted.clone())
+        )
+    );
+    let second = decisions
+        .recv_timeout(Duration::from_secs(10))
+        .expect("second decision");
+    assert_eq!(
+        (second.op, second.decision, second.reason, second.path),
+        (
+            AuditOp::Open,
+            AuditDecision::Deny,
+            AuditReason::NoGrant,
+            Some(PathBuf::from(&path))
+        )
+    );
+}
+
+#[test]
+fn a_killed_worker_is_reaped_by_wait() {
+    let dirs = Dirs::new();
+    let path = dirs.granted("a.txt");
+
+    // `revoke-cycle` blocks on standard input after its first open.
+    let mut running = Launch::new(worker())
+        .args(["revoke-cycle", path.as_str()])
+        .spawn(dirs.gate(Rights::READ))
+        .expect("spawn");
+    running.kill().expect("kill");
+    let outcome = running.wait().expect("wait");
+
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(outcome.status.signal(), Some(9));
+}

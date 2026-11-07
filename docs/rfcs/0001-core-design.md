@@ -58,6 +58,8 @@ Linux: build a Landlock ruleset from the grants (same directories, mapped rights
 
 Landlock applies to the calling thread and its future descendants; call `lock()` before spawning threads. Revocation removes authority from subsequent gate operations, but cannot revoke already opened files or alter an installed Landlock ruleset.
 
+The ruleset handles filesystem access rights up to Landlock ABI v3 and nothing else. At that ABI, Landlock does not restrict connecting to Unix domain sockets (abstract or pathname) or sending signals to processes outside the sandbox. A locked process can still ask an unconfined process to act on files for it, or receive descriptors from one over `SCM_RIGHTS`. A received descriptor keeps the authority it was opened with, and the ruleset does not apply to it. Newer ABIs restrict abstract socket connects and signals (v6, Linux 6.12) and pathname socket connects (v9, Linux 7.1). fsgate does not request them yet.
+
 macOS: no Landlock equivalent, so a broker process (M3) holds the grants and authorizes the worker's requests. The broker does not strip a worker's ambient filesystem authority; the embedder must provide that isolation separately. The client exposes the four filesystem operations above; the transport differs.
 
 `lock()` fails closed: if the kernel lacks Landlock ABI support, it returns an error. Callers may opt into `LockPolicy::BestEffort` explicitly; the default never degrades silently.

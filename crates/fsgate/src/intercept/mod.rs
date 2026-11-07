@@ -46,7 +46,7 @@ mod launch;
 mod sys;
 
 #[cfg(target_arch = "x86_64")]
-pub use launch::{Launch, Outcome};
+pub use launch::{Launch, Outcome, Running};
 
 /// `SYSFS_MAGIC` from `linux/magic.h`.
 const SYSFS_MAGIC: FsWord = 0x6265_6572;
