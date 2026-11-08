@@ -76,6 +76,137 @@ jobs:
       - run: cargo clippy -p fsgate --all-targets --features experimental-intercept -- -D warnings
       - run: cargo test --locked
 
+  # RFC 0004's declared kernels. `check` covers the runner's own kernel;
+  # this job boots each kernel below in a VM (virtme-ng with KVM, sharing the
+  # runner's filesystem read-only) and runs the packaged crate's tests,
+  # built with --release. A second boot without Landlock runs the
+  # unsupported-host tests, which no runner kernel can.
+  kernels:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The RFC 0004 baseline, at the 6.6 LTS release current when added.
+          - kernel: 6.6.162
+            sha256: 4aa89f3652fc131e5d39990f3bcd4b9e131028af3f315dbe83f3a8557dc06f06
+    env:
+      KERNEL: ${{ matrix.kernel }}
+      KERNEL_SHA256: ${{ matrix.sha256 }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - name: Install QEMU, the kernel build tools, and virtme-ng
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            qemu-system-x86 flex bison bc libelf-dev libssl-dev
+          pipx install virtme-ng==1.41
+      - name: Allow KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          # trigger returns before udev applies the rule.
+          sudo udevadm settle
+          ls -l /dev/kvm
+          # Without KVM, QEMU would emulate the CPU; fail instead.
+          if [ ! -w /dev/kvm ]; then
+            echo "::error::/dev/kvm is not writable; the kernels job needs KVM"
+            exit 1
+          fi
+      - id: kernel-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: kernel/bzImage
+          key: kernel-${{ matrix.kernel }}-${{ hashFiles('.github/kernels/fsgate.config') }}-virtme-ng-1.41
+      - name: Build Linux ${{ matrix.kernel }}
+        if: steps.kernel-cache.outputs.cache-hit != 'true'
+        run: |
+          curl --fail --silent --show-error --location --retry 3 --output linux.tar.xz \
+            "https://cdn.kernel.org/pub/linux/kernel/v${KERNEL%%.*}.x/linux-$KERNEL.tar.xz"
+          echo "$KERNEL_SHA256  linux.tar.xz" | sha256sum --check --strict
+          tar -xJf linux.tar.xz
+          cd "linux-$KERNEL"
+          vng --kconfig
+          fragment=../.github/kernels/fsgate.config
+          cat "$fragment" >>.config
+          make olddefconfig
+          # olddefconfig drops options whose dependencies are missing; fail if
+          # it dropped or changed one the tests need.
+          while IFS= read -r line; do
+            case $line in
+            CONFIG_*)
+              grep --quiet --line-regexp --fixed-strings "$line" .config ||
+                { echo "::error::.config lacks $line"; exit 1; }
+              ;;
+            "# CONFIG_"*" is not set")
+              name=${line#"# "}
+              name=${name%" is not set"}
+              if grep --quiet "^$name=" .config; then
+                echo "::error::.config sets $name"
+                exit 1
+              fi
+              ;;
+            esac
+          done <"$fragment"
+          make -j"$(nproc)" bzImage
+          mkdir -p ../kernel
+          cp arch/x86/boot/bzImage ../kernel/bzImage
+      # Saved right after the build, so a failing test run below still
+      # caches the kernel.
+      - if: steps.kernel-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: kernel/bzImage
+          key: ${{ steps.kernel-cache.outputs.cache-primary-key }}
+      - name: Build the packaged crate's tests with --release
+        run: |
+          # `cargo test` below builds the unpacked crate, so skip the verify build.
+          cargo package --locked --no-verify -p fsgate
+          mkdir "$RUNNER_TEMP/package" "$RUNNER_TEMP/results"
+          tar -xzf target/package/fsgate-*.crate -C "$RUNNER_TEMP/package"
+          manifest=$(echo "$RUNNER_TEMP"/package/fsgate-*/Cargo.toml)
+          cargo test --locked --release --no-run --features experimental-intercept \
+            --manifest-path "$manifest" --message-format=json >"$RUNNER_TEMP/build.json"
+          results=$RUNNER_TEMP/results
+          dirname "$manifest" >"$results/manifest-dir"
+          jq --raw-output 'select(.reason == "compiler-artifact" and .profile.test)
+            | .executable' "$RUNNER_TEMP/build.json" >"$results/tests"
+          jq --raw-output 'select(.reason == "compiler-artifact" and .profile.test
+            and .target.name == "launch") | .executable' "$RUNNER_TEMP/build.json" >"$results/launch"
+          cat "$results/tests"
+          # The library's unit tests, the broker's, and one per tests/*.rs.
+          integration=("$(dirname "$manifest")"/tests/*.rs)
+          expected=$((2 + ${#integration[@]}))
+          found=$(wc -l <"$results/tests")
+          if [ "$found" -ne "$expected" ] || [ "$(wc -l <"$results/launch")" -ne 1 ]; then
+            echo "::error::expected $expected test executables, one of them launch; found $found"
+            exit 1
+          fi
+      - name: Run the tests on Linux ${{ matrix.kernel }}
+        run: |
+          results=$RUNNER_TEMP/results
+          vng --run kernel/bzImage --user "$(id -un)" --cpus "$(nproc)" --memory 4G \
+            --rwdir "$results" \
+            --exec "$GITHUB_WORKSPACE/.github/kernels/guest-tests.sh $results supported"
+          test "$(cat "$results/supported.kernel")" = "$KERNEL"
+          test -f "$results/supported.passed"
+      - name: Run the unsupported-host tests on Linux ${{ matrix.kernel }} without Landlock
+        run: |
+          results=$RUNNER_TEMP/results
+          vng --run kernel/bzImage --user "$(id -un)" --cpus "$(nproc)" --memory 4G \
+            --rwdir "$results" --append lsm=capability \
+            --exec "$GITHUB_WORKSPACE/.github/kernels/guest-tests.sh $results no-landlock"
+          test "$(cat "$results/no-landlock.kernel")" = "$KERNEL"
+          test -f "$results/no-landlock.passed"
+
   workflows:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -88,6 +219,8 @@ jobs:
       # Require it so a runner image without shellcheck fails here.
       - run: shellcheck --version
       - run: pipx run --spec actionlint-py==1.7.12.25 actionlint
+      # Scripts the workflows call, which actionlint does not read.
+      - run: shellcheck .github/kernels/*.sh
       # Online audits use the read-only job token to check that pinned
       # action SHAs exist in their repositories and have no known advisories.
       - run: pipx run zizmor==1.32.0 .github/workflows

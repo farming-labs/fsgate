@@ -1,6 +1,6 @@
 # RFC 0004: route ordinary file opens through the broker
 
-- Status: accepted ([#4](https://github.com/farming-labs/fsgate/pull/4)); runtime unimplemented and unverified
+- Status: accepted ([#4](https://github.com/farming-labs/fsgate/pull/4)); implemented experimentally behind the `experimental-intercept` feature and tested in CI on the declared kernels; not independently reviewed or released
 - Date: 2026-11-06
 - Roadmap: [M6, after v0.1.0](../../ROADMAP.md#m6--linux-filesystem-interception-experimental)
 
@@ -21,7 +21,9 @@ enforcement remains necessary even when a call bypasses interception.
 M6 follows the initial library release (M5) and reuses the M1 resolver,
 M2 containment mechanisms, M3 broker authorization, and M4 audit sink.
 The first implementation targets Linux x86_64 native syscalls and static
-ELF binaries, with Linux 6.6 as the initial test baseline. It supports
+ELF binaries, on Linux 6.6 and later. CI tests that baseline (6.6.162,
+booted in a VM) and the GitHub runner's current kernel; versions in
+between are not tested individually. It supports
 read-only regular-file opens using absolute paths through `open`,
 `openat`, and `openat2`. Unsupported flags, resolve options, and path
 forms fail explicitly. This is a bounded compatibility target; dynamic
@@ -319,7 +321,11 @@ Do not add dependencies in this documentation change.
 
 Verify with standalone binaries that do not link fsgate, using libc calls
 and raw syscalls. Run a release build and the unpacked crate on the
-declared Linux kernels and architectures. Tests must cover:
+declared Linux kernels and architectures. CI's `kernels` job does this: it
+builds the packaged crate's tests with `--release`, boots each declared
+kernel under virtme-ng, and runs them there, then boots it again with
+`lsm=capability` to run the tests for a kernel without Landlock. Tests
+must cover:
 
 - Granted reads with exact byte checks; denied outside reads; attempted
   creation and truncation with independent checks that no file was

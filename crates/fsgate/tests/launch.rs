@@ -560,6 +560,58 @@ fn the_broker_refuses_an_image_the_profile_rejects_in_plan_and_apply() {
     assert!(apply.stdout.is_empty());
 }
 
+// The two tests below need a kernel booted without Landlock. CI's `kernels`
+// job boots its Linux 6.6 guest a second time with `lsm=capability` and runs
+// them with `--ignored`; on a kernel with Landlock they fail, because the
+// worker starts there. The worker is asked to create a marker file, which it
+// could do unconfined, so the marker's absence shows it never ran.
+
+#[test]
+#[ignore = "needs a kernel booted without Landlock; CI's kernels job runs it"]
+fn the_launcher_refuses_to_start_without_landlock() {
+    let dirs = Dirs::new();
+    let marker = dirs.granted("marker");
+    let rights = Rights::READ | Rights::WRITE | Rights::CREATE;
+    let mut launch = Launch::new(worker());
+    launch.args(["creat", &marker]);
+
+    let checked = launch.check().expect_err("check must refuse the kernel");
+    let mut gate = dirs.gate(rights);
+    let sink = Arc::new(Capture::default());
+    gate.set_audit_sink(sink.clone());
+    let err = launch.run(gate).expect_err("the worker must not start");
+
+    for err in [&checked, &err] {
+        assert_eq!(err.kind(), ErrorKind::Unsupported, "{err}");
+        assert!(err.to_string().contains("landlock is unavailable"), "{err}");
+    }
+    assert!(sink.0.lock().unwrap().is_empty());
+    assert!(!Path::new(&marker).exists());
+}
+
+#[test]
+#[ignore = "needs a kernel booted without Landlock; CI's kernels job runs it"]
+fn the_broker_refuses_to_start_without_landlock() {
+    let dirs = Dirs::new();
+    let marker = dirs.granted("marker");
+    let worker = worker().to_str().unwrap();
+
+    let plan = broker(&dirs, &["--", worker, "creat", &marker]);
+    let apply = broker(&dirs, &["--apply", "--", worker, "creat", &marker]);
+
+    let planned = String::from_utf8_lossy(&plan.stdout);
+    assert_eq!(plan.status.code(), Some(1), "{planned}");
+    assert!(
+        planned.contains("check:   refused: landlock is unavailable"),
+        "{planned}"
+    );
+    let refused = String::from_utf8_lossy(&apply.stderr);
+    assert_eq!(apply.status.code(), Some(1), "{refused}");
+    assert!(refused.contains("landlock is unavailable"), "{refused}");
+    assert!(apply.stdout.is_empty());
+    assert!(!Path::new(&marker).exists());
+}
+
 #[test]
 fn the_raw_open_syscall_is_mediated_too() {
     let dirs = Dirs::new();
