@@ -106,6 +106,97 @@ fn narrow_is_allowed_after_a_lock() {
     assert!(!target.exists());
 }
 
+/// A Linux kernel without Landlock. CI's `kernels` job boots its kernels a
+/// second time with `lsm=capability` and runs these with `--ignored`; on a
+/// kernel with Landlock they fail, because the lock works there. None needs
+/// a child, because without Landlock no lock restricts the test process.
+#[cfg(target_os = "linux")]
+mod without_landlock {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    /// A gate granting `granted/` read access, and a file outside the grant.
+    fn granted_gate() -> (TempDir, Gate, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let granted = root.path().join("granted");
+        fs::create_dir(&granted).unwrap();
+        let secret = root.path().join("secret.txt");
+        fs::write(&secret, b"secret").unwrap();
+        let mut gate = Gate::new();
+        gate.grant(&granted, Rights::READ).unwrap();
+        (root, gate, secret)
+    }
+
+    #[test]
+    #[ignore = "needs a kernel booted without Landlock; CI's kernels job runs it"]
+    fn strict_lock_fails_closed() {
+        let (root, mut gate, _secret) = granted_gate();
+
+        let err = gate.lock().unwrap_err();
+
+        assert!(
+            matches!(err, GateError::LockUnsupported { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("does not fully enforce Landlock ABI v3"),
+            "{err}"
+        );
+        // A failed lock does not end the granting phase.
+        assert_eq!(gate.restrictions(), None);
+        gate.grant(root.path(), Rights::READ)
+            .expect("the gate is still granting");
+    }
+
+    #[test]
+    #[ignore = "needs a kernel booted without Landlock; CI's kernels job runs it"]
+    fn best_effort_lock_reports_library_only() {
+        let (root, mut gate, secret) = granted_gate();
+
+        let status = gate.lock_with(LockPolicy::BestEffort).unwrap();
+
+        assert_eq!(status, LockStatus::LibraryOnly);
+        assert_eq!(gate.restrictions(), Some(Restrictions::empty()));
+        let err = gate.grant(root.path(), Rights::READ).unwrap_err();
+        assert!(matches!(err, GateError::Locked), "got {err:?}");
+        // The gate still refuses, and the status is honest about the rest:
+        // the kernel enforces nothing, so a raw read outside the grant works.
+        let err = gate.open(&secret).unwrap_err();
+        assert!(matches!(err, GateError::NoGrant { .. }), "got {err:?}");
+        assert_eq!(fs::read(&secret).unwrap(), b"secret");
+    }
+
+    #[test]
+    #[ignore = "needs a kernel booted without Landlock; CI's kernels job runs it"]
+    fn a_required_restriction_fails_even_under_best_effort() {
+        let (_root, mut gate, _secret) = granted_gate();
+
+        let options = LockOptions::new(LockPolicy::BestEffort).require(Restrictions::SIGNAL);
+        let err = gate.lock_with(options).unwrap_err();
+
+        assert!(
+            matches!(err, GateError::LockUnsupported { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("`Restrictions::SIGNAL` needs Landlock ABI v6 (Linux 6.12)"),
+            "{err}"
+        );
+        // Nothing changed, so a lock without the requirement still succeeds.
+        assert_eq!(gate.restrictions(), None);
+        assert_eq!(
+            gate.lock_with(LockPolicy::BestEffort).unwrap(),
+            LockStatus::LibraryOnly
+        );
+    }
+}
+
 /// Linux kernel enforcement, each proof run in a locked child.
 ///
 /// The RFC 0006 restriction tests read the kernel's Landlock ABI from a probe
