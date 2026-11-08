@@ -21,9 +21,9 @@ enforcement remains necessary even when a call bypasses interception.
 M6 follows the initial library release (M5) and reuses the M1 resolver,
 M2 containment mechanisms, M3 broker authorization, and M4 audit sink.
 The first implementation targets Linux x86_64 native syscalls and static
-ELF binaries, on Linux 6.6 and later. CI tests that baseline (6.6.162,
-booted in a VM) and the GitHub runner's current kernel; versions in
-between are not tested individually. It supports
+ELF binaries, on Linux 6.6 and later. CI tests that baseline (6.6.162)
+and a current stable kernel (7.3.3), both booted in a VM, and the GitHub
+runner's kernel; other versions are not tested individually. It supports
 read-only regular-file opens using absolute paths through `open`,
 `openat`, and `openat2`. Unsupported flags, resolve options, and path
 forms fail explicitly. This is a bounded compatibility target; dynamic

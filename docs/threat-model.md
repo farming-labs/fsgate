@@ -13,7 +13,7 @@ The trusted side is everything that runs before the boundary: the code that call
 
 Each section names one boundary, what it trusts, what it stops, and what it does not stop. Every row names the test that shows it, or says "none". A "none" row is a claim from the code or the kernel documentation that no fsgate test exercises.
 
-Test names are `file::test`. Files are in `crates/fsgate/tests/` unless they start with `src/`, which marks a unit test. Linux tests run in CI on the runner's kernel (Linux 7.0) and on Linux 6.6.162 booted in a VM; the [roadmap](../ROADMAP.md) records the runs. Tests under `kernel::` re-execute the test binary as a separate locked child, so the lock does not reach the test harness.
+Test names are `file::test`. Files are in `crates/fsgate/tests/` unless they start with `src/`, which marks a unit test. Linux tests run in CI on the runner's kernel (Linux 7.0) and on Linux 6.6.162 and 7.3.3, each booted in a VM; the [roadmap](../ROADMAP.md) records the runs. Tests under `kernel::` re-execute the test binary as a separate locked child, so the lock does not reach the test harness.
 
 ## 1. The gate before `lock()`
 
@@ -60,19 +60,19 @@ Test names are `file::test`. Files are in `crates/fsgate/tests/` unless they sta
 | A new grant after the lock | `GateError::Locked` | `lock.rs::best_effort_lock_ends_the_granting_phase` |
 | An ioctl on a device beneath a grant without `WRITE` (Linux 6.10+) | `EACCES`; with `WRITE`, the device answers | `lock.rs::kernel::kernel_restricts_device_ioctls` |
 | A connect to an abstract Unix socket outside the sandbox (6.12+) | `EPERM`, and the listener accepts nothing | `lock.rs::kernel::kernel_scopes_abstract_unix_sockets` |
+| A connect or datagram to a pathname Unix socket created outside the sandbox (7.1+), even beneath a grant holding every right | `EACCES`, the listener accepts nothing, and a connection made before the lock keeps working | `lock.rs::kernel::kernel_restricts_pathname_unix_sockets`, `lock.rs::kernel::a_worker_keeps_the_broker_it_connected_to_before_locking` |
 | A signal to a process outside the sandbox (6.12+) | `EPERM`, and the target stays alive | `lock.rs::kernel::kernel_scopes_signals` |
 | A thread started before the lock reading or writing outside the grants (7.0+) | `PermissionDenied`, and no file is created | `lock.rs::kernel::kernel_restricts_threads_that_predate_the_lock` |
-| Requiring a restriction the kernel does not provide | `LockUnsupported` naming it; nothing is applied, so a raw read outside still succeeds and the gate stays unlocked | the four tests above on Linux 6.6; `src/containment.rs::a_missing_requirement_names_the_kernel_that_provides_it` |
+| Requiring a restriction the kernel does not provide | `LockUnsupported` naming it; nothing is applied, so a raw read outside still succeeds and the gate stays unlocked | the restriction tests above on a kernel without each one (Linux 6.6, and the runner's for `RESOLVE_UNIX`); `src/containment.rs::a_missing_requirement_names_the_kernel_that_provides_it` |
 | A strict lock without Landlock | `LockUnsupported`, and the granting phase continues | `lock.rs::strict_lock_fails_closed_without_kernel_support` (non-Linux only); none on a Linux kernel without Landlock |
 
 **Does not stop:**
 
 | Gap | Why | Test |
 |---|---|---|
-| Connects to pathname Unix sockets | fsgate does not request `ResolveUnix` (ABI v9, Linux 7.1) yet ([M8](../ROADMAP.md#m8--containment-beyond-file-paths-linux)) | none |
-| Abstract socket connects and signals on kernels before 6.12, device ioctls before 6.10, or with the member left out through `LockOptions::restrict` | The kernel cannot restrict them, or the caller dropped them | The control mode of each test above shows the action succeeding, on Linux 7.0 with the member dropped and on Linux 6.6 |
+| Pathname socket connects on kernels before 7.1, abstract socket connects and signals before 6.12, device ioctls before 6.10, or any of these with the member left out through `LockOptions::restrict` | The kernel cannot restrict them, or the caller dropped them | The control and `unsupported` modes of each test above show the action succeeding, with the member dropped and on kernels without it |
 | Threads that already exist at `lock()` on kernels before 7.0, or with `ALL_THREADS` left out | Landlock restricts only the calling thread there | `lock.rs::kernel::kernel_restricts_threads_that_predate_the_lock`, control mode: the earlier thread reads and writes outside the grants |
-| An unconfined process acting for the locked one | Through a pathname socket, or an abstract socket or signal on older kernels, the locked process can ask another process to open files for it | none |
+| An unconfined process acting for the locked one | Over a connection made before the lock, through a pathname socket before Linux 7.1, or through an abstract socket or signal before 6.12, the locked process can ask another process to open files for it | none |
 | Descriptors opened before the lock, or received over `SCM_RIGHTS` | Landlock does not apply to an open descriptor; it keeps the access it was opened with | none |
 | `stat`, `access`, `chdir`, `flock`, `chmod`, `chown`, `setxattr`, `utime`, and `fcntl` on paths outside the grants | Landlock cannot restrict these call families ([kernel documentation](https://docs.kernel.org/userspace-api/landlock.html)). A locked process can learn whether any path exists and read its metadata, and can change the mode, times, or extended attributes of files it owns outside the grants. | none |
 | Narrowing or revoking after the lock | The installed ruleset never changes. Only operations through the gate see the change ([RFC 0005](rfcs/0005-grant-narrowing.md#kernel-enforcement)). | `lock.rs::kernel::kernel_enforces_rights_narrowed_before_the_lock` covers the gate side; none shows the raw access that remains |
@@ -151,7 +151,7 @@ Behind the `experimental-intercept` feature, `intercept::Launch` and `fsgate-bro
 | Files delivered before a revoke | They stay usable | `launch.rs::a_revoked_grant_denies_later_opens_but_delivered_files_stay_usable` |
 | Dynamic binaries, scripts, other architectures, and opens outside the read-only subset | Not mediated; refused instead | the refusal tests above |
 | A compromised supervisor | It holds the grants | none; trusted by design |
-| Kernels between 6.6 and the runner's, kernels without seccomp user notifications, and Landlock ABI below v3 | Untested ([M6](../ROADMAP.md#m6--linux-filesystem-interception-experimental)) | none |
+| Kernels other than 6.6.162, 7.3.3, and the runner's, kernels without seccomp user notifications, and Landlock ABI below v3 | Untested ([M6](../ROADMAP.md#m6--linux-filesystem-interception-experimental)) | none |
 
 ## Audit is observation, not a boundary
 

@@ -1,6 +1,6 @@
 # RFC 0006: restrict more than file paths at `lock()`
 
-- Status: accepted ([#34](https://github.com/farming-labs/fsgate/pull/34)); implemented in [#36](https://github.com/farming-labs/fsgate/pull/36) except `RESOLVE_UNIX`
+- Status: accepted ([#34](https://github.com/farming-labs/fsgate/pull/34)); implemented in [#36](https://github.com/farming-labs/fsgate/pull/36) and [#43](https://github.com/farming-labs/fsgate/pull/43)
 - Date: 2026-11-07
 - Roadmap: [M8](../../ROADMAP.md#m8--containment-beyond-file-paths-linux)
 - Builds on: [RFC 0001](0001-core-design.md#containment-lock) (containment), [ADR 0002](../decisions/0002-landlock-not-seccomp-for-paths.md)
@@ -106,8 +106,12 @@ Once in effect:
   after it are inside the domain.
 - `ALL_THREADS`: the ruleset applies to every thread of the process in
   one step, not only to the calling thread.
-- `RESOLVE_UNIX`: connecting or sending to a pathname socket fails
-  everywhere. Sockets connected before `lock()` keep working.
+- `RESOLVE_UNIX`: connecting or sending to a pathname socket created
+  outside the process's Landlock domain fails with `EACCES`, including
+  beneath a grant. Sockets connected before `lock()` keep working. The
+  kernel exempts sockets created inside the domain, but the filesystem
+  rules leave a locked process no way to create one, because no right
+  grants `MakeSock`.
 
 `all()` means every restriction this fsgate version knows. A release
 that adds one is a minor release with a changelog entry.
@@ -197,7 +201,7 @@ With `RESOLVE_UNIX` in effect, connects to pathname sockets fail after
 `lock()`. A worker that uses `BrokerGate` therefore connects before it
 locks. The connected stream keeps working, and a lost connection already
 fails closed with no reconnect. A `BrokerGate::connect` after locking
-fails with `GateError::Broker`, and its message should name this order.
+fails with `GateError::Broker`, and its message names this order.
 
 No fsgate right grants `ResolveUnix` in this RFC. Mapping it to `WRITE`,
 which is how the crate classifies it, is rejected: `WRITE` on `/tmp` is
@@ -246,16 +250,19 @@ real kernel. A control run locks with that member removed and succeeds.
   grant both see `ENOTTY`.
 - **All threads:** a thread started before `lock()` makes a raw open
   outside the grants. It fails, and no file is created.
-- **Pathname socket:** the same shape as the abstract socket test. It
-  needs Linux 7.1, and CI does not run that yet.
+- **Pathname socket:** the same shape as the abstract socket test, for
+  a connect and a datagram, with the sockets beneath a grant holding
+  every right. Each fails with `EACCES`, and a connection made before
+  the lock keeps working. A worker's broker connection is tested the
+  same way. It needs Linux 7.1; CI's `kernels` job boots 7.3.
 - **Requirements:** on the CI kernel, requiring `RESOLVE_UNIX` fails
   with `LockUnsupported`. Afterwards the process can still open files
   outside the grants (nothing was applied), and a second lock without
   that requirement succeeds.
 - **Mapping:** the effective-ABI mapping is unit-tested for every ABI.
 
-The tests pin the errno each refusal returns. CI runs on Linux 7.0, so
-everything except the pathname socket test runs there.
+The tests pin the errno each refusal returns. CI's runners boot Linux
+7.0, so everything except the pathname socket test runs there.
 
 ## Alternatives considered
 

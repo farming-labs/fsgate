@@ -53,11 +53,17 @@ pub(crate) fn apply<'a>(
         .set_compatibility(floor_level)
         .handle_access(AccessFs::from_all(ABI::V3))
         .map_err(|err| unsupported_or_failed(err, unsupported_floor))?;
-    if requested.contains(Restrictions::IOCTL_DEV) {
-        ruleset = ruleset
-            .set_compatibility(level(Restrictions::IOCTL_DEV))
-            .handle_access(AccessFs::IoctlDev)
-            .map_err(|err| member_error(Restrictions::IOCTL_DEV, err))?;
+    for (set, access) in [
+        (Restrictions::IOCTL_DEV, AccessFs::IoctlDev),
+        // RFC 0006: no right grants this one, so no rule below names it.
+        (Restrictions::RESOLVE_UNIX, AccessFs::ResolveUnix),
+    ] {
+        if requested.contains(set) {
+            ruleset = ruleset
+                .set_compatibility(level(set))
+                .handle_access(access)
+                .map_err(|err| member_error(set, err))?;
+        }
     }
     for (set, scope) in [
         (
@@ -289,6 +295,9 @@ mod tests {
             }
             if abi >= 6 {
                 set = set | Restrictions::ABSTRACT_UNIX_SOCKET | Restrictions::SIGNAL;
+            }
+            if abi >= 9 {
+                set = set | Restrictions::RESOLVE_UNIX;
             }
             set
         };

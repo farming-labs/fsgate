@@ -270,11 +270,17 @@ impl Restrictions {
     /// not only to the thread that calls `lock` and what it spawns later.
     /// Landlock ABI v8, Linux 7.0.
     pub const ALL_THREADS: Restrictions = Restrictions(1 << 3);
+    /// Connecting or sending to a pathname Unix socket created outside the
+    /// locked process and its later descendants fails with `EACCES`, even
+    /// beneath a grant: no [`Rights`] value permits it. Connections made
+    /// before the lock keep working, so a [`BrokerGate`] worker connects
+    /// before it locks. Landlock ABI v9, Linux 7.1.
+    pub const RESOLVE_UNIX: Restrictions = Restrictions(1 << 4);
 
     /// Every restriction this fsgate version knows. A release that adds
     /// one is a minor release.
     pub const fn all() -> Restrictions {
-        Restrictions(0b1111)
+        Restrictions(0b1_1111)
     }
 
     /// No restrictions.
@@ -347,7 +353,7 @@ pub(crate) struct RestrictionInfo {
 }
 
 /// Every member, in the order audit events and `Debug` list them.
-pub(crate) const RESTRICTIONS: [RestrictionInfo; 4] = [
+pub(crate) const RESTRICTIONS: [RestrictionInfo; 5] = [
     RestrictionInfo {
         set: Restrictions::IOCTL_DEV,
         name: "IOCTL_DEV",
@@ -371,6 +377,12 @@ pub(crate) const RESTRICTIONS: [RestrictionInfo; 4] = [
         name: "ALL_THREADS",
         abi: 8,
         linux: "7.0",
+    },
+    RestrictionInfo {
+        set: Restrictions::RESOLVE_UNIX,
+        name: "RESOLVE_UNIX",
+        abi: 9,
+        linux: "7.1",
     },
 ];
 
