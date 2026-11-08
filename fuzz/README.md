@@ -18,10 +18,11 @@ Needs a nightly toolchain and `cargo install cargo-fuzz --locked`.
 
 ```sh
 cd fuzz
+mkdir -p corpus/broker_requests
 cargo +nightly fuzz run broker_requests corpus/broker_requests seeds/broker_requests -- \
   -max_len=131072 -timeout=10 -max_total_time=900
 ```
 
 `corpus/` and `artifacts/` are ignored by git. If the run finds a crash, add the input from `artifacts/` as a regression test in `crates/fsgate/tests/broker.rs`, then fix the code.
 
-CI builds and lints this crate on stable. It does not run the fuzzer.
+CI builds and lints this crate on stable on every change. [`fuzz.yml`](../.github/workflows/fuzz.yml) runs this target for 15 minutes on Linux when `broker.rs` or this crate changes, and on demand. A finding fails the job and attaches the input to the run as an artifact.

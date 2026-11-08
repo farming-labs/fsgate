@@ -1,0 +1,43 @@
+name: fuzz
+
+# Fuzzing needs nightly and takes 15 minutes, so it runs when the broker's
+# decoder or its harness changes, and on demand. The check job in ci.yml
+# builds and lints the harness on every change.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - crates/fsgate/src/broker.rs
+      - fuzz/**
+      - .github/workflows/fuzz.yml
+
+permissions:
+  contents: read
+
+jobs:
+  broker-requests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      # A dated nightly, so a run can be repeated with the same compiler.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: nightly-2026-11-08
+      - run: cargo install cargo-fuzz --locked --version 0.13.2
+      - name: Fuzz the broker's request decoder
+        working-directory: fuzz
+        run: |
+          uname -srm
+          mkdir -p corpus/broker_requests
+          cargo fuzz run broker_requests corpus/broker_requests seeds/broker_requests -- \
+            -max_len=131072 -timeout=10 -max_total_time=900
+      # The input is what reproduces a finding, and the job's disk is gone
+      # once it ends.
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: broker-requests-artifacts
+          path: fuzz/artifacts/
