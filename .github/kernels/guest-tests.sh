@@ -4,7 +4,8 @@
 #
 # <results-dir> is shared read-write with the host. The host writes
 # `manifest-dir` (the unpacked crate), `tests` (every test executable, one
-# per line), and `launch` (the tests/launch.rs executable). This script
+# per line), and `no-landlock-tests` (the tests/launch.rs and tests/lock.rs
+# executables). This script
 # writes `<mode>.kernel` (the guest's kernel release) first and
 # `<mode>.passed` last. The host requires both, so a guest that stops early
 # fails the job even if virtme-ng reports success.
@@ -30,12 +31,19 @@ supported)
     done
     ;;
 no-landlock)
-    # A filter that matched nothing would pass, so require the exact count.
-    expected=2
-    output=$("$(cat "$results/launch")" --ignored without_landlock)
-    printf '%s\n' "$output"
-    if ! grep --quiet "^test result: ok\. $expected passed;" <<<"$output"; then
-        echo "expected $expected passing *_without_landlock tests" >&2
+    # A filter that matched nothing would pass, so require the exact count:
+    # two launcher tests and three lock tests.
+    expected=5
+    passed=0
+    mapfile -t tests <"$results/no-landlock-tests"
+    for test in "${tests[@]}"; do
+        output=$("$test" --ignored without_landlock)
+        printf '%s\n' "$output"
+        count=$(sed --quiet 's/^test result: ok\. \([0-9]*\) passed;.*/\1/p' <<<"$output")
+        passed=$((passed + ${count:-0}))
+    done
+    if [ "$passed" -ne "$expected" ]; then
+        echo "expected $expected passing *_without_landlock tests, got $passed" >&2
         exit 1
     fi
     ;;

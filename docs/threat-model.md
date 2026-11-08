@@ -64,7 +64,7 @@ Test names are `file::test`. Files are in `crates/fsgate/tests/` unless they sta
 | A signal to a process outside the sandbox (6.12+) | `EPERM`, and the target stays alive | `lock.rs::kernel::kernel_scopes_signals` |
 | A thread started before the lock reading or writing outside the grants (7.0+) | `PermissionDenied`, and no file is created | `lock.rs::kernel::kernel_restricts_threads_that_predate_the_lock` |
 | Requiring a restriction the kernel does not provide | `LockUnsupported` naming it; nothing is applied, so a raw read outside still succeeds and the gate stays unlocked | the restriction tests above on a kernel without each one (Linux 6.6, and the runner's for `RESOLVE_UNIX`); `src/containment.rs::a_missing_requirement_names_the_kernel_that_provides_it` |
-| A strict lock without Landlock | `LockUnsupported`, and the granting phase continues | `lock.rs::strict_lock_fails_closed_without_kernel_support` (non-Linux only); none on a Linux kernel without Landlock |
+| A strict lock without Landlock | `LockUnsupported`, and the granting phase continues | `lock.rs::strict_lock_fails_closed_without_kernel_support` (non-Linux), `lock.rs::without_landlock::strict_lock_fails_closed` (Linux booted without Landlock) |
 
 **Does not stop:**
 
