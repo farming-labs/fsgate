@@ -32,8 +32,8 @@ delivered file does not leak into programs the worker starts. Linux
 does this atomically with `MSG_CMSG_CLOEXEC`; other platforms set
 `FD_CLOEXEC` right after `recvmsg`, so a thread that forks and execs in
 that window can still inherit the descriptor.
-Requests carry no descriptors; the broker closes any that arrive without
-using them. Each receive has room for as many descriptors as one message
+Requests carry no descriptors: the first one that arrives fails the
+connection closed, before the rest of the frame is read. Each receive has room for as many descriptors as one message
 can carry (253 on Linux, 254 on macOS), because macOS installs the ones
 that do not fit without reporting them, where nothing could close them.
 A message the kernel reports truncated anyway fails the connection

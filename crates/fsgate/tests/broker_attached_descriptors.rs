@@ -14,6 +14,7 @@ use std::net::Shutdown;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 use fsgate::{Broker, Gate, Rights};
 use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
@@ -36,9 +37,7 @@ fn frame(body: &serde_json::Value) -> Vec<u8> {
     frame
 }
 
-/// Sends one request with `fds` attached, and no more, so the broker can
-/// serve the connection on this thread.
-fn send_last_request(client: &UnixStream, bytes: &[u8], fds: &[BorrowedFd<'_>]) {
+fn send_with_descriptors(client: &UnixStream, bytes: &[u8], fds: &[BorrowedFd<'_>]) {
     let mut space = vec![MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(fds.len()))];
     let mut ancillary = SendAncillaryBuffer::new(&mut space);
     assert!(ancillary.push(SendAncillaryMessage::ScmRights(fds)));
@@ -50,6 +49,12 @@ fn send_last_request(client: &UnixStream, bytes: &[u8], fds: &[BorrowedFd<'_>]) 
     )
     .expect("send the request");
     assert_eq!(sent, bytes.len());
+}
+
+/// Sends one request with `fds` attached, and no more, so the broker can
+/// serve the connection on this thread.
+fn send_last_request(client: &UnixStream, bytes: &[u8], fds: &[BorrowedFd<'_>]) {
+    send_with_descriptors(client, bytes, fds);
     client.shutdown(Shutdown::Write).unwrap();
 }
 
@@ -67,11 +72,11 @@ fn assert_peer_closed(probe: &UnixStream) {
     }
 }
 
-/// Requests carry no descriptors (RFC 0003). The broker decides one that
-/// does by its path alone, and closes every attached descriptor, even when
-/// the worker attaches as many as one message can carry.
+/// Requests carry no descriptors (RFC 0003). The broker fails a connection
+/// that attaches any, acts on nothing, and closes what it received, even
+/// as many as one message can carry.
 #[test]
-fn descriptors_attached_to_a_request_are_closed_unused() {
+fn a_request_that_carries_descriptors_fails_the_connection_closed() {
     let _serial = serial();
     let root = tempfile::tempdir().expect("create temp root");
     let granted = root.path().join("granted");
@@ -80,33 +85,58 @@ fn descriptors_attached_to_a_request_are_closed_unused() {
     fs::create_dir(root.path().join("outside")).unwrap();
     fs::write(&secret_path, b"secret").unwrap();
     let mut gate = Gate::new();
-    gate.grant(&granted, Rights::READ).unwrap();
+    gate.grant(&granted, Rights::READ | Rights::WRITE | Rights::CREATE)
+        .unwrap();
 
-    // One attached descriptor is the file the request names, outside the
-    // grant. The rest are copies of `held`, so `probe` reads end-of-file
-    // only once every one of them is closed.
+    // One attached descriptor is a file outside the grant. The rest are
+    // copies of `held`, so `probe` reads end-of-file only once every one
+    // of them is closed.
     let secret = File::open(&secret_path).unwrap();
     let (held, probe) = UnixStream::pair().unwrap();
     let mut attached = vec![secret.as_fd()];
     attached.extend(std::iter::repeat_n(held.as_fd(), MOST_PER_MESSAGE - 1));
 
+    // A request the broker would otherwise serve, with a visible effect.
+    let planted = granted.join("planted.txt");
     let (mut client, server) = UnixStream::pair().unwrap();
-    let request = serde_json::json!({ "op": "open", "path": secret_path });
+    let request = serde_json::json!({ "op": "create", "path": planted });
     send_last_request(&client, &frame(&request), &attached);
     drop(attached);
     drop(held);
 
-    Broker::new(gate)
-        .serve_conn(server)
-        .expect("the connection ends normally");
+    let err = Broker::new(gate).serve_conn(server).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidData, "{err}");
+    assert!(err.to_string().contains("requests carry none"), "{err}");
 
-    // Holding the file gave the worker no authority over its path.
     let mut response = Vec::new();
     client.read_to_end(&mut response).unwrap();
-    let response: serde_json::Value = serde_json::from_slice(&response[4..]).unwrap();
-    assert_eq!(response["result"], "error", "{response}");
-    assert_eq!(response["error"]["kind"], "no_grant", "{response}");
+    assert!(response.is_empty(), "the broker answered the request");
+    assert!(!planted.exists(), "the broker acted on the request");
     assert_peer_closed(&probe);
+}
+
+/// The first descriptor ends the connection, before the rest of the frame
+/// arrives, so a worker cannot pile them up in the broker by splitting one
+/// request across many messages.
+#[test]
+fn the_first_descriptor_ends_a_request_split_across_messages() {
+    let _serial = serial();
+    let (client, server) = UnixStream::pair().unwrap();
+    // Only for a regression, where the broker would wait for the rest of
+    // the frame. The refusal does not wait for it.
+    server
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let (held, probe) = UnixStream::pair().unwrap();
+
+    // Half of a length prefix, with the connection left open.
+    send_with_descriptors(&client, &[1, 0], &[held.as_fd()]);
+    drop(held);
+
+    let err = Broker::new(Gate::new()).serve_conn(server).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidData, "{err}");
+    assert_peer_closed(&probe);
+    drop(client);
 }
 
 /// With its descriptor table full, the broker cannot receive what a
@@ -151,6 +181,7 @@ fn a_request_whose_descriptors_cannot_be_received_fails_the_connection_closed() 
 
     let err = result.unwrap_err();
     assert_eq!(err.kind(), ErrorKind::InvalidData, "{err}");
+    assert!(err.to_string().contains("could be received"), "{err}");
     let mut response = Vec::new();
     client.read_to_end(&mut response).unwrap();
     assert!(
