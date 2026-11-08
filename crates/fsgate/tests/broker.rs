@@ -6,10 +6,10 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 
@@ -153,41 +153,106 @@ fn dead_broker_fails_every_operation_closed() {
     assert!(matches!(err, GateError::Broker { .. }), "got {err:?}");
 }
 
+/// Writes raw bytes to one broker connection as a worker would, closes the
+/// write side, and returns how the broker ended and everything it answered.
+fn serve_raw(gate: Gate, bytes: &[u8]) -> (std::io::Result<()>, Vec<u8>) {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let broker = thread::spawn(move || Broker::new(gate).serve_conn(server));
+    client.write_all(bytes).unwrap();
+    // The broker may already have hung up, which macOS reports as
+    // `NotConnected`. Either way it reads nothing more from this end.
+    match client.shutdown(std::net::Shutdown::Write) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::NotConnected => {}
+        Err(err) => panic!("shutdown failed: {err}"),
+    }
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).unwrap();
+    (broker.join().unwrap(), response)
+}
+
+/// A gate that may create files beneath `granted`, so a request the broker
+/// wrongly served would leave a file behind.
+fn writable_gate(granted: &Path) -> Gate {
+    let mut gate = Gate::new();
+    gate.grant(granted, Rights::READ | Rights::WRITE | Rights::CREATE)
+        .unwrap();
+    gate
+}
+
+fn create_request(path: &Path) -> Vec<u8> {
+    serde_json::json!({ "op": "create", "path": path })
+        .to_string()
+        .into_bytes()
+}
+
+fn frame(declared: u32, body: &[u8]) -> Vec<u8> {
+    let mut frame = declared.to_le_bytes().to_vec();
+    frame.extend_from_slice(body);
+    frame
+}
+
+fn assert_closed_without_acting(result: std::io::Result<()>, response: &[u8], planted: &Path) {
+    let err = result.expect_err("the broker accepted a protocol violation");
+    assert_eq!(err.kind(), ErrorKind::InvalidData, "{err}");
+    assert!(
+        response.is_empty(),
+        "the broker answered a protocol violation"
+    );
+    assert!(
+        !planted.exists(),
+        "the broker acted on a protocol violation"
+    );
+}
+
 /// A frame is exactly as long as its prefix says (RFC 0003). A request
 /// with more bytes than its prefix declares is a protocol violation, so the
 /// broker closes the connection without acting on any of it.
 #[test]
 fn bytes_beyond_the_declared_length_fail_the_connection_closed() {
     let (_root, granted, _) = setup();
-    let mut gate = Gate::new();
-    gate.grant(&granted, Rights::READ | Rights::WRITE | Rights::CREATE)
-        .unwrap();
     let planted = granted.join("planted.txt");
+    // Declares 2 bytes, then sends a whole request.
+    let bytes = frame(2, &create_request(&planted));
 
-    let (mut client, server) = UnixStream::pair().unwrap();
-    let broker = thread::spawn(move || Broker::new(gate).serve_conn(server));
+    let (result, response) = serve_raw(writable_gate(&granted), &bytes);
+    assert_closed_without_acting(result, &response, &planted);
+}
 
-    let body = serde_json::json!({ "op": "create", "path": planted }).to_string();
-    let mut frame = 2u32.to_le_bytes().to_vec(); // declares 2 bytes, sends more
-    frame.extend_from_slice(body.as_bytes());
-    client.write_all(&frame).unwrap();
-    // The broker may already have hung up, which macOS reports as
-    // `NotConnected`. Either way it reads nothing more from this end.
-    match client.shutdown(std::net::Shutdown::Write) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotConnected => {}
-        Err(err) => panic!("shutdown failed: {err}"),
+/// RFC 0003 caps a frame at 1 MiB. A larger prefix fails the connection
+/// before the broker reads the body.
+#[test]
+fn a_prefix_over_the_size_limit_fails_the_connection_closed() {
+    let (_root, granted, _) = setup();
+    let planted = granted.join("planted.txt");
+    let bytes = frame((1 << 20) + 1, &create_request(&planted));
+
+    let (result, response) = serve_raw(writable_gate(&granted), &bytes);
+    assert_closed_without_acting(result, &response, &planted);
+}
+
+/// A body that is not exactly one known request fails the connection
+/// instead of being guessed at, including a path that is not UTF-8.
+#[test]
+fn a_malformed_request_fails_the_connection_closed() {
+    let (_root, granted, _) = setup();
+    let planted = granted.join("planted.txt");
+    let valid = create_request(&planted);
+    let mut not_utf8 = valid.clone();
+    let inside_path = not_utf8.len() - 3; // the last `t` of `planted.txt`
+    not_utf8[inside_path] = 0xff;
+
+    let bodies: [&[u8]; 4] = [
+        &valid[..valid.len() - 1],
+        br#"{"op":"unlink","path":"/tmp"}"#,
+        br#"{"path":"/tmp"}"#,
+        &not_utf8,
+    ];
+    for body in bodies {
+        let declared = u32::try_from(body.len()).unwrap();
+        let (result, response) = serve_raw(writable_gate(&granted), &frame(declared, body));
+        assert_closed_without_acting(result, &response, &planted);
     }
-
-    let mut response = Vec::new();
-    client.read_to_end(&mut response).unwrap();
-    let err = broker.join().unwrap().unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
-    assert!(
-        response.is_empty(),
-        "the broker answered a misframed request"
-    );
-    assert!(!planted.exists(), "the broker acted on a misframed request");
 }
 
 /// End to end against the real binary, including the roadmap acceptance:

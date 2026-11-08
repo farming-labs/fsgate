@@ -121,7 +121,17 @@ Started. No part of fsgate has had an independent security review. These are the
   - Hard links and mount points beneath a grant are reachable through both the gate and the kernel rules.
 
   The document is not independently reviewed.
-- [ ] Fuzz the broker's server-side decoder: the RFC 0003 framing (length prefix, 1 MiB limit) and JSON request parsing. Acceptance: a `cargo fuzz` target over frame reassembly and request parsing, a recorded run (duration, corpus size, toolchain) without a crash, and a regression test for any crash found.
+- [x] Fuzz the broker's server-side decoder: the RFC 0003 framing (length prefix, 1 MiB limit) and JSON request parsing. Acceptance: a `cargo fuzz` target over frame reassembly and request parsing, a recorded run (duration, corpus size, toolchain) without a crash, and a regression test for any crash found.
+
+  Evidence: the `broker_requests` target in [`fuzz/`](fuzz/README.md) feeds arbitrary bytes to `Broker::serve_conn`, as a worker would. Besides panics, hangs, and sanitizer reports, it fails if a descriptor the broker sends back reads the file outside the grant. A control run, with the grant widened to cover that file, trips this check on the `..` seed.
+
+  Recorded run, with no crash, hang, or check failure:
+  - 900 seconds and 53,863,032 inputs, 59,781 per second.
+  - The corpus grew from 14 seeds to 1,393 inputs (72 KiB), and coverage from 1,109 to 2,269 counters.
+  - Toolchain: rustc 1.102.0-nightly (`f5cedb83a` 2026-11-07), cargo-fuzz 0.13.2, libfuzzer-sys 0.4.13, with AddressSanitizer, on macOS (Apple M1). libFuzzer seed 3216607579.
+  - The build combined the harness at `5d95b38` with the decoder from [#38](https://github.com/farming-labs/fsgate/pull/38) at `0c6a876`.
+
+  Reading the decoder for this task found the framing bug that #38 fixes, with its own regression test. The run found no crash, so there is no crash regression test. `broker.rs` now tests the 1 MiB limit and malformed requests directly. Not fuzzed on Linux: CI builds and lints the target on stable but does not run it.
 - [ ] Independent security review of the handle layer, containment (including M8), broker, and audit sink. Acceptance: the reviewer, scope, reviewed commit, and findings are recorded; each finding is fixed or answered; and the README status says what was reviewed.
 - [ ] Release 0.2.0 through the trusted-publishing workflow, its first real run. Acceptance: the release job's verify step matches the uploaded, crates.io, and downloaded checksums and the `.cargo_vcs_info.json` commit. Before tagging, record two maintainer decisions here: whether 0.2.0 waits for M6 and the review, and whether it includes the `experimental-intercept` feature.
 
