@@ -338,7 +338,13 @@ mod tests {
         let all = lock_event(Some(Restrictions::all()));
         assert_eq!(
             all["restrictions"],
-            serde_json::json!(["ioctl_dev", "abstract_unix_socket", "signal", "all_threads"])
+            serde_json::json!([
+                "ioctl_dev",
+                "abstract_unix_socket",
+                "signal",
+                "all_threads",
+                "resolve_unix"
+            ])
         );
         // Insertion order does not matter; the key always uses RFC order.
         let two = lock_event(Some(Restrictions::ALL_THREADS | Restrictions::IOCTL_DEV));

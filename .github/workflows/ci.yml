@@ -80,7 +80,8 @@ jobs:
       - run: cargo clippy -p fsgate --all-targets --features experimental-intercept -- -D warnings
       - run: cargo test --locked
 
-  # RFC 0004's declared kernels. `check` covers the runner's own kernel;
+  # Kernels a runner does not boot: RFC 0004's declared baseline and a kernel
+  # with RFC 0006's newest restriction. `check` covers the runner's own kernel;
   # this job boots each kernel below in a VM (virtme-ng with KVM, sharing the
   # runner's filesystem read-only) and runs the packaged crate's tests,
   # built with --release. A second boot without Landlock runs the
@@ -95,6 +96,10 @@ jobs:
           # The RFC 0004 baseline, at the 6.6 LTS release current when added.
           - kernel: 6.6.162
             sha256: 4aa89f3652fc131e5d39990f3bcd4b9e131028af3f315dbe83f3a8557dc06f06
+          # RESOLVE_UNIX needs Linux 7.1 (Landlock ABI v9); this is the stable
+          # release current when added.
+          - kernel: 7.3.3
+            sha256: 79c66dde66cd96877fcde8f7d36aec946b1f423d2b97b5a7b1751b75c764f3d1
     env:
       KERNEL: ${{ matrix.kernel }}
       KERNEL_SHA256: ${{ matrix.sha256 }}

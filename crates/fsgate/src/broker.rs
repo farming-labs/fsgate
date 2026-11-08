@@ -258,13 +258,25 @@ pub struct BrokerGate {
 impl BrokerGate {
     /// Connects to a broker's Unix socket (conventionally published to
     /// workers in the `FSGATE_BROKER_SOCKET` environment variable).
+    ///
+    /// A worker that also calls [`Gate::lock`] connects first: on Linux 7.1
+    /// and later the lock refuses new connects
+    /// ([`Restrictions::RESOLVE_UNIX`](crate::Restrictions::RESOLVE_UNIX)),
+    /// and a connection made before it keeps working.
     pub fn connect(socket: impl AsRef<Path>) -> Result<BrokerGate, GateError> {
-        let stream = UnixStream::connect(socket.as_ref()).map_err(|source| GateError::Broker {
-            message: format!(
-                "connecting to broker socket `{}` failed: {source}; \
-                 is the broker running?",
-                socket.as_ref().display()
-            ),
+        let stream = UnixStream::connect(socket.as_ref()).map_err(|source| {
+            let remedy = if source.kind() == io::ErrorKind::PermissionDenied {
+                "connect before calling `lock`, which refuses new connects on Linux 7.1 \
+                 and later, or check the socket's permissions"
+            } else {
+                "is the broker running?"
+            };
+            GateError::Broker {
+                message: format!(
+                    "connecting to broker socket `{}` failed: {source}; {remedy}",
+                    socket.as_ref().display()
+                ),
+            }
         })?;
         Ok(BrokerGate { stream })
     }

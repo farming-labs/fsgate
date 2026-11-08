@@ -113,19 +113,21 @@ fn narrow_is_allowed_after_a_lock() {
 /// provides a restriction, they prove it is enforced and run a control without
 /// it. Where it does not, they prove that requiring it fails before anything is
 /// applied and that a bare lock skips it. CI covers both: the runners boot
-/// Linux 7.0 (ABI v8) and the `kernels` job boots Linux 6.6 (ABI v4).
+/// Linux 7.0 (ABI v8) and the `kernels` job boots Linux 6.6 (ABI v4) and
+/// Linux 7.3 (ABI v9 or later).
 #[cfg(target_os = "linux")]
 mod kernel {
     use std::ffi::OsStr;
     use std::fs;
-    use std::io::ErrorKind;
+    use std::io::{ErrorKind, Read, Write};
     use std::os::linux::net::SocketAddrExt;
-    use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
+    use std::os::unix::net::{SocketAddr, UnixDatagram, UnixListener, UnixStream};
     use std::os::unix::process::ExitStatusExt;
     use std::path::PathBuf;
     use std::process::Command;
     use std::sync::{OnceLock, mpsc};
 
+    use fsgate::{Broker, BrokerGate};
     use rustix::io::Errno;
     use tempfile::TempDir;
 
@@ -338,6 +340,157 @@ mod kernel {
             );
         } else {
             result.expect("connect without the scope");
+        }
+    }
+
+    #[test]
+    fn kernel_restricts_pathname_unix_sockets() {
+        for mode in modes(9) {
+            let (_root, granted, outside) = dirs();
+            let stream = granted.join("stream.sock");
+            let datagram = granted.join("datagram.sock");
+            let listener = UnixListener::bind(&stream).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let receiver = UnixDatagram::bind(&datagram).unwrap();
+            receiver.set_nonblocking(true).unwrap();
+
+            run_child(
+                "pathname_socket_child",
+                mode,
+                &[
+                    ("FSGATE_GRANTED", granted.as_os_str()),
+                    ("FSGATE_OUTSIDE", outside.as_os_str()),
+                    ("FSGATE_STREAM", stream.as_os_str()),
+                    ("FSGATE_DATAGRAM", datagram.as_os_str()),
+                ],
+            );
+
+            // The child wrote one byte through the connection it made
+            // before locking, whatever the mode.
+            let (mut early, _) = listener.accept().expect("the connect before the lock");
+            let mut byte = [0; 1];
+            early.read_exact(&mut byte).unwrap();
+            assert_eq!(&byte, b"k", "{mode}");
+
+            let later = listener.accept();
+            let mut buffer = [0; 8];
+            let received = receiver.recv(&mut buffer);
+            if mode == "restricted" {
+                let err = later.expect_err("a restricted child reached the listener");
+                assert_eq!(err.kind(), ErrorKind::WouldBlock);
+                let err = received.expect_err("a restricted child sent a datagram");
+                assert_eq!(err.kind(), ErrorKind::WouldBlock);
+            } else {
+                assert!(later.is_ok(), "{mode} child never connected: {later:?}");
+                assert_eq!(received.unwrap(), 1, "{mode}");
+            }
+        }
+    }
+
+    #[test]
+    fn pathname_socket_child() {
+        let Some(mode) = child_mode("pathname_socket_child") else {
+            return;
+        };
+        let stream = std::env::var("FSGATE_STREAM").unwrap();
+        let datagram = std::env::var("FSGATE_DATAGRAM").unwrap();
+        let mut early = UnixStream::connect(&stream).expect("connect before the lock");
+
+        // The sockets sit beneath this grant, and it holds every right: no
+        // right permits a connect.
+        let mut gate = Gate::new();
+        gate.grant(
+            std::env::var("FSGATE_GRANTED").unwrap(),
+            Rights::READ | Rights::LIST | Rights::WRITE | Rights::CREATE,
+        )
+        .unwrap();
+        lock_for(&mut gate, Restrictions::RESOLVE_UNIX, &mode);
+
+        early.write_all(b"k").expect("the earlier connection");
+
+        let connected = UnixStream::connect(&stream);
+        let sent = UnixDatagram::unbound().unwrap().send_to(b"d", &datagram);
+        if mode == "restricted" {
+            let refused = [
+                connected.expect_err("connected after the lock"),
+                sent.expect_err("sent after the lock"),
+            ];
+            for err in refused {
+                assert_eq!(
+                    err.raw_os_error(),
+                    Some(Errno::ACCESS.raw_os_error()),
+                    "{err:?}"
+                );
+            }
+        } else {
+            connected.expect("connect without the restriction");
+            sent.expect("send without the restriction");
+        }
+    }
+
+    /// RFC 0006's order for a worker: connect to the broker, then lock.
+    #[test]
+    fn a_worker_keeps_the_broker_it_connected_to_before_locking() {
+        for mode in modes(9) {
+            let (_root, granted, outside) = dirs();
+            fs::write(granted.join("a.txt"), b"inside").unwrap();
+            let socket = granted.join("broker.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let mut served = Gate::new();
+            served.grant(&granted, Rights::READ).unwrap();
+            // One connection is served. A later connect only needs the
+            // listener to stay open, which it does until the worker hangs up.
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                Broker::new(served).serve_conn(stream)
+            });
+
+            run_child(
+                "broker_order_child",
+                mode,
+                &[
+                    ("FSGATE_GRANTED", granted.as_os_str()),
+                    ("FSGATE_OUTSIDE", outside.as_os_str()),
+                    ("FSGATE_SOCKET", socket.as_os_str()),
+                ],
+            );
+
+            server.join().unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn broker_order_child() {
+        let Some(mode) = child_mode("broker_order_child") else {
+            return;
+        };
+        let socket = std::env::var("FSGATE_SOCKET").unwrap();
+        let file = format!("{}/a.txt", std::env::var("FSGATE_GRANTED").unwrap());
+        let mut client = BrokerGate::connect(&socket).expect("connect before the lock");
+
+        let mut gate = granted_gate();
+        lock_for(&mut gate, Restrictions::RESOLVE_UNIX, &mode);
+
+        let mut content = String::new();
+        client
+            .open(&file)
+            .expect("the broker connected before the lock")
+            .read_to_string(&mut content)
+            .unwrap();
+        assert_eq!(content, "inside");
+
+        match (mode.as_str(), BrokerGate::connect(&socket)) {
+            ("restricted", Ok(_)) => panic!("connected to the broker after the lock"),
+            ("restricted", Err(GateError::Broker { message })) => {
+                assert!(
+                    message.contains("connect before calling `lock`"),
+                    "{message}"
+                );
+            }
+            ("restricted", Err(other)) => panic!("got {other:?}"),
+            (_, connected) => {
+                connected.expect("connect without the restriction");
+            }
         }
     }
 
