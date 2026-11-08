@@ -1,6 +1,6 @@
 # Threat model
 
-- Status: describes `main` at `f1468f2`, after [#36](https://github.com/farming-labs/fsgate/pull/36). Written from the code and the RFCs; not independently reviewed.
+- Status: written against `main` at `f1468f2`, after [#36](https://github.com/farming-labs/fsgate/pull/36), and updated with later changes. Written from the code and the RFCs; not independently reviewed.
 - Roadmap: [M9](../ROADMAP.md#m9--review-readiness-and-020)
 
 fsgate is for a program that runs code it does not fully trust: a plugin, a parser fed hostile input, an agent's tool call, a dependency that may be compromised. The asset is every file the program was not granted. The attacker controls that code once it runs, including native code and raw syscalls. It wants to read, write, create, or list outside the grants, or to keep authority after a grant is narrowed or revoked.
@@ -99,6 +99,7 @@ A trusted broker holds the `Gate` and serves `BrokerGate` requests over a Unix s
 | A worker that outlives its broker | Every later operation fails with `GateError::Broker`, with no reconnect | `broker.rs::dead_broker_fails_every_operation_closed`, `broker.rs::broker_binary_serves_and_dies_closed` |
 | A delivered file leaking into programs the worker runs | Received descriptors are close-on-exec | `broker.rs::delivered_descriptors_do_not_leak_into_spawned_programs` |
 | A frame over 1 MiB | The broker closes the connection | none ([M9](../ROADMAP.md#m9--review-readiness-and-020) fuzzing) |
+| A length prefix shorter than the bytes that follow it | The broker closes the connection without acting | `broker.rs::bytes_beyond_the_declared_length_fail_the_connection_closed` |
 | A malformed request or unknown operation | The broker closes the connection | none ([M9](../ROADMAP.md#m9--review-readiness-and-020) fuzzing) |
 | A path or directory entry name that is not UTF-8 | Refused, never transcoded | none |
 | Descriptors the worker attaches to a request | Closed without use | none |

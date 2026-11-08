@@ -425,7 +425,16 @@ fn read_frame(stream: &mut UnixStream) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
 
     loop {
         if let Some(total) = expected {
-            if acc.len() >= 4 + total {
+            if acc.len() > 4 + total {
+                // A lockstep peer sends nothing past a frame before its
+                // response. Extra bytes mean the prefix understates the body
+                // or the peer pipelined; acting on either would guess.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "peer sent bytes beyond the declared frame length",
+                ));
+            }
+            if acc.len() == 4 + total {
                 let frame = acc.split_off(4);
                 debug_assert!(acc.len() == 4);
                 return Ok((frame, fds));

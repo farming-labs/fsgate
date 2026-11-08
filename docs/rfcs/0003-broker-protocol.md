@@ -23,7 +23,9 @@ instead pass an inherited socketpair to `BrokerGate::from_stream`.
 
 Every message is a 4-byte little-endian length followed by that many
 bytes of JSON. Frames above 1 MiB are a protocol violation; the receiver
-fails the connection closed. A response that carries a file descriptor
+fails the connection closed. So are bytes beyond the declared length:
+nothing follows a request until its response, so a receiver that reads
+more fails the connection closed instead of acting on a guess. A response that carries a file descriptor
 attaches exactly one via `SCM_RIGHTS` ancillary data on the same message.
 The receiver marks every received descriptor close-on-exec, so a
 delivered file does not leak into programs the worker starts. Linux
