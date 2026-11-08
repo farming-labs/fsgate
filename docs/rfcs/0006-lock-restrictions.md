@@ -1,6 +1,6 @@
 # RFC 0006: restrict more than file paths at `lock()`
 
-- Status: accepted ([#34](https://github.com/farming-labs/fsgate/pull/34)); implemented in [#36](https://github.com/farming-labs/fsgate/pull/36) except `RESOLVE_UNIX`
+- Status: accepted ([#34](https://github.com/farming-labs/fsgate/pull/34)); implemented in [#36](https://github.com/farming-labs/fsgate/pull/36) and [#43](https://github.com/farming-labs/fsgate/pull/43)
 - Date: 2026-11-07
 - Roadmap: [M8](../../ROADMAP.md#m8--containment-beyond-file-paths-linux)
 - Builds on: [RFC 0001](0001-core-design.md#containment-lock) (containment), [ADR 0002](../decisions/0002-landlock-not-seccomp-for-paths.md)
