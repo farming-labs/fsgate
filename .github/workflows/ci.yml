@@ -113,8 +113,14 @@ jobs:
             sudo tee /etc/udev/rules.d/99-kvm.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          # trigger returns before udev applies the rule.
+          sudo udevadm settle
+          ls -l /dev/kvm
           # Without KVM, QEMU would emulate the CPU; fail instead.
-          test -w /dev/kvm
+          if [ ! -w /dev/kvm ]; then
+            echo "::error::/dev/kvm is not writable; the kernels job needs KVM"
+            exit 1
+          fi
       - id: kernel-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
