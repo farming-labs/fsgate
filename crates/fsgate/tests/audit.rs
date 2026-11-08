@@ -165,11 +165,16 @@ fn lifecycle_events_cover_grant_revoke_and_lock() {
 
     let grant = gate.grant(&granted, Rights::READ).unwrap();
     gate.revoke(grant).unwrap();
-    gate.lock_with(fsgate::LockPolicy::BestEffort).unwrap();
+    // On Linux this lock applies Landlock inside the test process. Leaving
+    // out ALL_THREADS confines it to this test's thread.
+    let options = fsgate::LockOptions::new(fsgate::LockPolicy::BestEffort)
+        .restrict(fsgate::Restrictions::all() - fsgate::Restrictions::ALL_THREADS);
+    gate.lock_with(options).unwrap();
     let _ = gate.grant(&granted, Rights::READ); // denied: locked
+    let _ = gate.lock(); // denied: already locked
 
-    let kinds: Vec<_> = sink
-        .events()
+    let events = sink.events();
+    let kinds: Vec<_> = events
         .iter()
         .map(|event| (event.op, event.decision, event.reason))
         .collect();
@@ -180,8 +185,18 @@ fn lifecycle_events_cover_grant_revoke_and_lock() {
             (AuditOp::Revoke, AuditDecision::Allow, AuditReason::Ok),
             (AuditOp::Lock, AuditDecision::Allow, AuditReason::Ok),
             (AuditOp::Grant, AuditDecision::Deny, AuditReason::Locked),
+            (AuditOp::Lock, AuditDecision::Deny, AuditReason::Locked),
         ]
     );
+
+    // The successful lock records the restrictions the gate reports; every
+    // other event, the refused lock included, records none (RFC 0006).
+    let applied = gate.restrictions().expect("locked");
+    assert!(!applied.contains(fsgate::Restrictions::ALL_THREADS));
+    assert_eq!(events[2].restrictions, Some(applied));
+    for (index, event) in events.iter().enumerate().filter(|(index, _)| *index != 2) {
+        assert!(event.restrictions.is_none(), "event {index}: {event:?}");
+    }
 }
 
 #[test]

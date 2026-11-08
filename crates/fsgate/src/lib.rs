@@ -44,7 +44,7 @@ pub use broker::{Broker, BrokerGate, FileStat};
 use std::fmt;
 use std::fs::File;
 use std::io;
-use std::ops::BitOr;
+use std::ops::{BitAnd, BitOr, Sub};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -212,17 +212,23 @@ pub enum GateError {
     },
 }
 
-/// How strictly [`Gate::lock`] treats missing kernel support.
+/// How strictly [`Gate::lock`] treats missing kernel support for the
+/// filesystem rules built from the grants (Landlock ABI v3).
+///
+/// The policy covers only those rules. A [`Restrictions`] member named in
+/// [`LockOptions::require`] is required under either policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LockPolicy {
-    /// Fail unless the kernel fully enforces the containment rules.
+    /// Fail unless the kernel fully enforces the filesystem rules.
     Strict,
     /// Apply whatever the platform supports and report what was achieved.
     /// Choosing this is an explicit decision to accept weaker containment.
     BestEffort,
 }
 
-/// What a successful lock actually achieved.
+/// What a successful lock achieved for the filesystem rules.
+///
+/// [`Gate::restrictions`] reports the [`Restrictions`] separately.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LockStatus {
     /// The kernel enforces the grants against all code in the thread family.
@@ -231,6 +237,222 @@ pub enum LockStatus {
     PartiallyEnforced,
     /// Only the library's own checks apply; the kernel enforces nothing.
     LibraryOnly,
+}
+
+/// Kernel restrictions [`Gate::lock`] applies beyond the filesystem rules
+/// built from the grants ([RFC 0006]).
+///
+/// Each needs a Landlock ABI newer than the v3 the filesystem rules need.
+/// A bare [`lock`](Gate::lock) requests all of them and applies those the
+/// running kernel supports; [`Gate::restrictions`] reports which took
+/// effect, and [`LockOptions`] drops or requires individual members.
+///
+/// [RFC 0006]: https://github.com/farming-labs/fsgate/blob/main/docs/rfcs/0006-lock-restrictions.md
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Restrictions(u8);
+
+impl Restrictions {
+    /// Character and block devices opened after the lock accept ioctls
+    /// only beneath a grant holding [`Rights::WRITE`], apart from the
+    /// generic commands Landlock always allows. Devices opened before the
+    /// lock, such as an inherited terminal, are unaffected. Landlock ABI
+    /// v5, Linux 6.10.
+    pub const IOCTL_DEV: Restrictions = Restrictions(1);
+    /// Connecting or sending to an abstract Unix socket created outside
+    /// the locked process and its later descendants fails. Landlock ABI v6,
+    /// Linux 6.12.
+    pub const ABSTRACT_UNIX_SOCKET: Restrictions = Restrictions(1 << 1);
+    /// Signalling a process outside the locked process and its later
+    /// descendants fails. That includes the parent and anything spawned
+    /// before the lock. Landlock ABI v6, Linux 6.12.
+    pub const SIGNAL: Restrictions = Restrictions(1 << 2);
+    /// The ruleset applies to every thread of the process in one step,
+    /// not only to the thread that calls `lock` and what it spawns later.
+    /// Landlock ABI v8, Linux 7.0.
+    pub const ALL_THREADS: Restrictions = Restrictions(1 << 3);
+
+    /// Every restriction this fsgate version knows. A release that adds
+    /// one is a minor release.
+    pub const fn all() -> Restrictions {
+        Restrictions(0b1111)
+    }
+
+    /// No restrictions.
+    pub const fn empty() -> Restrictions {
+        Restrictions(0)
+    }
+
+    /// Returns true when every restriction in `other` is in `self`.
+    pub const fn contains(self, other: Restrictions) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Returns true when the set holds no restriction.
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl BitOr for Restrictions {
+    type Output = Restrictions;
+
+    fn bitor(self, rhs: Restrictions) -> Restrictions {
+        Restrictions(self.0 | rhs.0)
+    }
+}
+
+impl BitAnd for Restrictions {
+    type Output = Restrictions;
+
+    fn bitand(self, rhs: Restrictions) -> Restrictions {
+        Restrictions(self.0 & rhs.0)
+    }
+}
+
+/// Set difference: the restrictions in `self` that are not in `rhs`.
+impl Sub for Restrictions {
+    type Output = Restrictions;
+
+    fn sub(self, rhs: Restrictions) -> Restrictions {
+        Restrictions(self.0 & !rhs.0)
+    }
+}
+
+impl fmt::Debug for Restrictions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut first = true;
+        for info in RESTRICTIONS {
+            if self.contains(info.set) {
+                if !first {
+                    f.write_str(" | ")?;
+                }
+                f.write_str(info.name)?;
+                first = false;
+            }
+        }
+        if first {
+            f.write_str("(none)")?;
+        }
+        Ok(())
+    }
+}
+
+/// One [`Restrictions`] member: its name, the Landlock ABI it needs, and
+/// the first Linux release with that ABI.
+pub(crate) struct RestrictionInfo {
+    pub(crate) set: Restrictions,
+    pub(crate) name: &'static str,
+    pub(crate) abi: u8,
+    pub(crate) linux: &'static str,
+}
+
+/// Every member, in the order audit events and `Debug` list them.
+pub(crate) const RESTRICTIONS: [RestrictionInfo; 4] = [
+    RestrictionInfo {
+        set: Restrictions::IOCTL_DEV,
+        name: "IOCTL_DEV",
+        abi: 5,
+        linux: "6.10",
+    },
+    RestrictionInfo {
+        set: Restrictions::ABSTRACT_UNIX_SOCKET,
+        name: "ABSTRACT_UNIX_SOCKET",
+        abi: 6,
+        linux: "6.12",
+    },
+    RestrictionInfo {
+        set: Restrictions::SIGNAL,
+        name: "SIGNAL",
+        abi: 6,
+        linux: "6.12",
+    },
+    RestrictionInfo {
+        set: Restrictions::ALL_THREADS,
+        name: "ALL_THREADS",
+        abi: 8,
+        linux: "7.0",
+    },
+];
+
+/// How [`Gate::lock_with`] applies containment ([RFC 0006]).
+///
+/// A [`LockPolicy`] converts into options that request every
+/// [`Restrictions`] member and require none, so
+/// `lock_with(LockPolicy::BestEffort)` keeps working.
+///
+/// ```
+/// use fsgate::{LockOptions, LockPolicy, Restrictions};
+///
+/// // Keep abstract sockets reachable (an X11 client, say), and fail
+/// // unless the kernel can stop signals to outside processes.
+/// let options = LockOptions::new(LockPolicy::Strict)
+///     .restrict(Restrictions::all() - Restrictions::ABSTRACT_UNIX_SOCKET)
+///     .require(Restrictions::SIGNAL);
+/// # let _ = options;
+/// ```
+///
+/// [RFC 0006]: https://github.com/farming-labs/fsgate/blob/main/docs/rfcs/0006-lock-restrictions.md
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LockOptions {
+    policy: LockPolicy,
+    restrict: Restrictions,
+    require: Restrictions,
+}
+
+impl LockOptions {
+    /// Options with `policy` for the filesystem rules, requesting every
+    /// restriction and requiring none.
+    pub const fn new(policy: LockPolicy) -> LockOptions {
+        LockOptions {
+            policy,
+            restrict: Restrictions::all(),
+            require: Restrictions::empty(),
+        }
+    }
+
+    /// Sets the restrictions to request. Members the kernel does not
+    /// support are skipped, and [`Gate::restrictions`] leaves them out.
+    #[must_use]
+    pub const fn restrict(mut self, set: Restrictions) -> LockOptions {
+        self.restrict = set;
+        self
+    }
+
+    /// Sets restrictions that must take effect. Without kernel support for
+    /// one, the lock fails with [`GateError::LockUnsupported`] before
+    /// applying anything. Required members are requested even when
+    /// [`restrict`](LockOptions::restrict) leaves them out, and they bind
+    /// under [`LockPolicy::BestEffort`] too.
+    #[must_use]
+    pub const fn require(mut self, set: Restrictions) -> LockOptions {
+        self.require = set;
+        self
+    }
+
+    pub(crate) const fn policy(self) -> LockPolicy {
+        self.policy
+    }
+
+    pub(crate) const fn requested(self) -> Restrictions {
+        Restrictions(self.restrict.0 | self.require.0)
+    }
+
+    pub(crate) const fn required(self) -> Restrictions {
+        self.require
+    }
+}
+
+/// Strict about the filesystem rules, requesting every restriction.
+impl Default for LockOptions {
+    fn default() -> LockOptions {
+        LockOptions::new(LockPolicy::Strict)
+    }
+}
+
+impl From<LockPolicy> for LockOptions {
+    fn from(policy: LockPolicy) -> LockOptions {
+        LockOptions::new(policy)
+    }
 }
 
 /// Handle to one grant inside a [`Gate`], used to narrow or revoke it.
@@ -259,6 +481,7 @@ pub struct Gate {
     id: u64,
     grants: Vec<Option<GrantEntry>>,
     locked: bool,
+    restrictions: Option<Restrictions>,
     audit: Option<Arc<dyn AuditSink>>,
 }
 
@@ -270,6 +493,7 @@ impl Gate {
             id: NEXT_GATE_ID.fetch_add(1, Ordering::Relaxed),
             grants: Vec::new(),
             locked: false,
+            restrictions: None,
             audit: None,
         }
     }
@@ -346,8 +570,9 @@ impl Gate {
         })
     }
 
-    /// Ends the granting phase and applies kernel containment, strictly:
-    /// equivalent to [`lock_with(LockPolicy::Strict)`](Gate::lock_with).
+    /// Ends the granting phase and applies kernel containment with
+    /// [`LockOptions::default`]: strict about the filesystem rules, and
+    /// requesting every [`Restrictions`] member.
     ///
     /// Irreversible. After a successful lock, [`grant`](Gate::grant) and a
     /// second `lock` fail with [`GateError::Locked`].
@@ -355,21 +580,30 @@ impl Gate {
     /// On Linux this loads a Landlock ruleset covering every live grant
     /// (bound to the held descriptors, not path names), so filesystem
     /// access outside the grants fails at the kernel even for code that
-    /// never touches this `Gate`. Landlock applies to the calling thread
-    /// and everything it spawns afterwards — call `lock` on the main
-    /// thread before spawning threads. On platforms without Landlock a
-    /// strict lock fails with [`GateError::LockUnsupported`].
+    /// never touches this `Gate`. The ruleset also applies each
+    /// [`Restrictions`] member the kernel supports, and
+    /// [`restrictions`](Gate::restrictions) reports which took effect. On
+    /// Linux 7.0 and later it covers every thread of the process
+    /// ([`Restrictions::ALL_THREADS`]); on older kernels it covers the
+    /// calling thread and what it spawns afterwards, so call `lock` before
+    /// spawning threads. On platforms without Landlock a strict lock fails
+    /// with [`GateError::LockUnsupported`].
     pub fn lock(&mut self) -> Result<LockStatus, GateError> {
-        self.lock_with(LockPolicy::Strict)
+        self.lock_with(LockOptions::default())
     }
 
-    /// Ends the granting phase with an explicit [`LockPolicy`].
+    /// Ends the granting phase with explicit [`LockOptions`]. A
+    /// [`LockPolicy`] converts into options that request every restriction.
     ///
-    /// `BestEffort` applies whatever the platform supports and reports the
-    /// achieved level as a [`LockStatus`]; it never fails just because the
-    /// kernel cannot enforce. The library-level lock (no new grants) is
-    /// applied in every case.
-    pub fn lock_with(&mut self, policy: LockPolicy) -> Result<LockStatus, GateError> {
+    /// `BestEffort` applies whatever filesystem rules the platform supports
+    /// and reports the achieved level as a [`LockStatus`]; it never fails
+    /// just because the kernel cannot enforce them. A restriction named in
+    /// [`LockOptions::require`] is never best effort: without kernel
+    /// support for it, the lock fails before anything is applied, leaving
+    /// the process unrestricted and the gate unlocked. Every successful
+    /// lock also applies the library-level lock (no new grants).
+    pub fn lock_with(&mut self, options: impl Into<LockOptions>) -> Result<LockStatus, GateError> {
+        let options = options.into();
         if self.locked {
             self.emit(
                 AuditOp::Lock,
@@ -381,8 +615,8 @@ impl Gate {
             );
             return Err(GateError::Locked);
         }
-        let status = match containment::apply(self.grants.iter().flatten(), policy) {
-            Ok(status) => status,
+        let applied = match containment::apply(self.grants.iter().flatten(), options) {
+            Ok(applied) => applied,
             Err(err) => {
                 self.emit(
                     AuditOp::Lock,
@@ -396,15 +630,16 @@ impl Gate {
             }
         };
         self.locked = true;
-        self.emit(
-            AuditOp::Lock,
-            None,
-            None,
-            AuditDecision::Allow,
-            AuditReason::Ok,
-            None,
-        );
-        Ok(status)
+        self.restrictions = Some(applied.restrictions);
+        self.emit_lock(applied.restrictions);
+        Ok(applied.status)
+    }
+
+    /// The [`Restrictions`] the kernel applied at [`lock`](Gate::lock), or
+    /// `None` until a lock succeeds. Empty where Landlock is missing or too
+    /// old for any of them.
+    pub fn restrictions(&self) -> Option<Restrictions> {
+        self.restrictions
     }
 
     /// Revokes a grant. Subsequent operations under it fail with
@@ -731,6 +966,7 @@ impl Gate {
                 path: path.map(Path::to_path_buf),
                 grant,
                 rights: None,
+                restrictions: None,
                 decision,
                 reason,
                 errno,
@@ -758,8 +994,29 @@ impl Gate {
                 path: path.map(Path::to_path_buf),
                 grant,
                 rights: Some(rights),
+                restrictions: None,
                 decision,
                 reason,
+                errno: None,
+                syscall: None,
+                notification: None,
+            });
+        }
+    }
+
+    /// [`emit`](Gate::emit) for a successful `lock`, recording the
+    /// restrictions that took effect.
+    fn emit_lock(&self, restrictions: Restrictions) {
+        if let Some(sink) = &self.audit {
+            sink.event(&AuditEvent {
+                ts: SystemTime::now(),
+                op: AuditOp::Lock,
+                path: None,
+                grant: None,
+                rights: None,
+                restrictions: Some(restrictions),
+                decision: AuditDecision::Allow,
+                reason: AuditReason::Ok,
                 errno: None,
                 syscall: None,
                 notification: None,

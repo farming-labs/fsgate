@@ -5,7 +5,7 @@
 //! with `FSGATE_LOCK_CHILD=1`) because Landlock restrictions cannot be
 //! removed once applied and would poison the rest of the suite.
 
-use fsgate::{Gate, GateError, LockPolicy, LockStatus, Rights};
+use fsgate::{Gate, GateError, LockOptions, LockPolicy, LockStatus, Restrictions, Rights};
 
 #[cfg(not(target_os = "linux"))]
 #[test]
@@ -29,16 +29,57 @@ fn best_effort_lock_ends_the_granting_phase() {
     let mut gate = Gate::new();
     gate.grant(dir.path(), Rights::READ).unwrap();
 
-    let status = gate.lock_with(LockPolicy::BestEffort).unwrap();
+    // On Linux this lock applies Landlock inside the test process. Leaving
+    // out ALL_THREADS confines it to this test's thread.
+    let options = LockOptions::new(LockPolicy::BestEffort)
+        .restrict(Restrictions::all() - Restrictions::ALL_THREADS);
+    let status = gate.lock_with(options).unwrap();
     #[cfg(not(target_os = "linux"))]
-    assert_eq!(status, LockStatus::LibraryOnly);
+    {
+        assert_eq!(status, LockStatus::LibraryOnly);
+        assert_eq!(gate.restrictions(), Some(Restrictions::empty()));
+    }
     #[cfg(target_os = "linux")]
-    let _ = status; // level depends on the kernel; the child test pins it
+    {
+        let _ = status; // level depends on the kernel; the child tests pin it
+        let applied = gate.restrictions().expect("locked");
+        assert!(!applied.contains(Restrictions::ALL_THREADS), "{applied:?}");
+    }
 
     let err = gate.grant(dir.path(), Rights::READ).unwrap_err();
     assert!(matches!(err, GateError::Locked), "got {err:?}");
     let err = gate.lock_with(LockPolicy::BestEffort).unwrap_err();
     assert!(matches!(err, GateError::Locked), "got {err:?}");
+}
+
+/// A required restriction binds even under `BestEffort`, and a lock that
+/// cannot meet it changes nothing (RFC 0006).
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn a_required_restriction_fails_without_kernel_support() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut gate = Gate::new();
+    gate.grant(dir.path(), Rights::READ).unwrap();
+
+    let options = LockOptions::new(LockPolicy::BestEffort).require(Restrictions::SIGNAL);
+    let err = gate.lock_with(options).unwrap_err();
+    assert!(
+        matches!(err, GateError::LockUnsupported { .. }),
+        "got {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("`Restrictions::SIGNAL` needs Landlock ABI v6 (Linux 6.12)"),
+        "{message}"
+    );
+
+    // Nothing changed: the gate is still granting, and a lock without the
+    // requirement succeeds.
+    assert_eq!(gate.restrictions(), None);
+    assert!(gate.grant(dir.path(), Rights::READ).is_ok());
+    let status = gate.lock_with(LockPolicy::BestEffort).unwrap();
+    assert_eq!(status, LockStatus::LibraryOnly);
+    assert_eq!(gate.restrictions(), Some(Restrictions::empty()));
 }
 
 /// Linux runs the same check in a locked child (`kernel` below), because a
@@ -65,13 +106,383 @@ fn narrow_is_allowed_after_a_lock() {
     assert!(!target.exists());
 }
 
+/// Linux kernel enforcement, each proof run in a locked child.
+///
+/// The RFC 0006 restriction tests read the kernel's Landlock ABI from a probe
+/// child that uses the `landlock` crate directly, not fsgate. Where the kernel
+/// provides a restriction, they prove it is enforced and run a control without
+/// it. Where it does not, they prove that requiring it fails before anything is
+/// applied and that a bare lock skips it. CI covers both: the runners boot
+/// Linux 7.0 (ABI v8) and the `kernels` job boots Linux 6.6 (ABI v4).
 #[cfg(target_os = "linux")]
 mod kernel {
+    use std::ffi::OsStr;
     use std::fs;
     use std::io::ErrorKind;
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
+    use std::os::unix::process::ExitStatusExt;
+    use std::path::PathBuf;
     use std::process::Command;
+    use std::sync::{OnceLock, mpsc};
+
+    use rustix::io::Errno;
+    use tempfile::TempDir;
 
     use super::*;
+
+    /// A command that re-executes this test binary to run one child scenario.
+    fn child_command(scenario: &str, mode: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", &format!("kernel::{scenario}"), "--nocapture"])
+            .env("FSGATE_CHILD", scenario)
+            .env("FSGATE_MODE", mode);
+        command
+    }
+
+    /// Runs one child scenario in `mode` and requires it to succeed.
+    fn run_child(scenario: &str, mode: &str, envs: &[(&str, &OsStr)]) {
+        let status = child_command(scenario, mode)
+            .envs(envs.iter().copied())
+            .status()
+            .expect("spawn locked child");
+        assert!(status.success(), "{scenario} ({mode}) failed: {status}");
+    }
+
+    /// The mode a child scenario runs in, or `None` outside its child.
+    fn child_mode(scenario: &str) -> Option<String> {
+        if std::env::var_os("FSGATE_CHILD")? != scenario {
+            return None;
+        }
+        let mode = std::env::var("FSGATE_MODE").expect("FSGATE_MODE");
+        // Children run with --nocapture, so CI logs show which branch ran.
+        eprintln!("{scenario}: mode {mode}");
+        Some(mode)
+    }
+
+    /// The running kernel's Landlock ABI, as the `landlock` crate reports it
+    /// after restricting a throwaway child. fsgate's own mapping from ABI to
+    /// restrictions is not involved, so the tests can check it.
+    fn kernel_abi() -> u8 {
+        static ABI: OnceLock<u8> = OnceLock::new();
+        *ABI.get_or_init(|| {
+            let output = child_command("abi_probe_child", "probe")
+                .output()
+                .expect("spawn the ABI probe");
+            assert!(output.status.success(), "ABI probe failed: {output:?}");
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .find_map(|line| line.strip_prefix("FSGATE_LANDLOCK_ABI="))
+                .expect("the probe prints its ABI")
+                .parse()
+                .expect("the ABI is a number")
+        })
+    }
+
+    #[test]
+    fn abi_probe_child() {
+        use landlock::{ABI, Access, AccessFs, LandlockStatus, Ruleset, RulesetAttr};
+
+        if child_mode("abi_probe_child").is_none() {
+            return;
+        }
+        let status = Ruleset::default()
+            .handle_access(AccessFs::from_all(ABI::V1))
+            .unwrap()
+            .create()
+            .unwrap()
+            .restrict_self()
+            .unwrap();
+        let abi = match status.landlock {
+            LandlockStatus::Available { effective_abi, .. } => [
+                ABI::V1,
+                ABI::V2,
+                ABI::V3,
+                ABI::V4,
+                ABI::V5,
+                ABI::V6,
+                ABI::V7,
+                ABI::V8,
+                ABI::V9,
+            ]
+            .into_iter()
+            .filter(|known| effective_abi >= *known)
+            .count(),
+            _ => 0,
+        };
+        println!("FSGATE_LANDLOCK_ABI={abi}");
+    }
+
+    /// The modes to run for a restriction that needs Landlock ABI `needed`:
+    /// with and without it where the kernel provides it, `unsupported` where
+    /// it does not.
+    fn modes(needed: u8) -> Vec<&'static str> {
+        if kernel_abi() >= needed {
+            vec!["control", "restricted"]
+        } else {
+            vec!["unsupported"]
+        }
+    }
+
+    /// A temporary `granted/` and `outside/secret.txt`.
+    fn dirs() -> (TempDir, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let granted = root.path().join("granted");
+        let outside = root.path().join("outside");
+        fs::create_dir(&granted).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), b"secret").unwrap();
+        (root, granted, outside)
+    }
+
+    /// Locks strictly for `mode`:
+    /// - `control` leaves `member` out;
+    /// - `unsupported` requires `member` on a kernel without it, proves the
+    ///   lock fails before anything is applied, then locks without it;
+    /// - every other mode requires `member`.
+    ///
+    /// In every mode the filesystem rules end up enforced.
+    fn lock_for(gate: &mut Gate, member: Restrictions, mode: &str) {
+        let secret = format!("{}/secret.txt", std::env::var("FSGATE_OUTSIDE").unwrap());
+        let status = match mode {
+            "control" => {
+                gate.lock_with(LockOptions::default().restrict(Restrictions::all() - member))
+            }
+            "unsupported" => {
+                let err = gate
+                    .lock_with(LockOptions::default().require(member))
+                    .expect_err("a required restriction the kernel lacks");
+                assert!(
+                    matches!(err, GateError::LockUnsupported { .. }),
+                    "got {err:?}"
+                );
+                let name = format!("`Restrictions::{member:?}`");
+                assert!(err.to_string().contains(&name), "{err}");
+                // Nothing was applied: the gate is unlocked, and the kernel
+                // still allows a raw read outside the grants.
+                assert_eq!(gate.restrictions(), None);
+                fs::read(&secret).expect("a failed lock applied nothing");
+                gate.lock()
+            }
+            _ => gate.lock_with(LockOptions::default().require(member)),
+        };
+        assert_eq!(status.expect("strict lock"), LockStatus::FullyEnforced);
+        let applied = gate.restrictions().expect("locked");
+        assert_eq!(
+            applied.contains(member),
+            mode != "control" && mode != "unsupported",
+            "mode {mode}, applied {applied:?}"
+        );
+        let err = fs::read(&secret).expect_err("read outside the grants after the lock");
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    }
+
+    /// A gate granting `FSGATE_GRANTED` read access.
+    fn granted_gate() -> Gate {
+        let mut gate = Gate::new();
+        gate.grant(std::env::var("FSGATE_GRANTED").unwrap(), Rights::READ)
+            .unwrap();
+        gate
+    }
+
+    #[test]
+    fn kernel_scopes_abstract_unix_sockets() {
+        for mode in modes(6) {
+            let (_root, granted, outside) = dirs();
+            let name = format!("fsgate-test-{}-{mode}", std::process::id());
+            let address = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+            let listener = UnixListener::bind_addr(&address).unwrap();
+            listener.set_nonblocking(true).unwrap();
+
+            run_child(
+                "abstract_socket_child",
+                mode,
+                &[
+                    ("FSGATE_GRANTED", granted.as_os_str()),
+                    ("FSGATE_OUTSIDE", outside.as_os_str()),
+                    ("FSGATE_ABSTRACT", OsStr::new(&name)),
+                ],
+            );
+
+            let accepted = listener.accept();
+            if mode == "restricted" {
+                let err = accepted.expect_err("a restricted child reached the listener");
+                assert_eq!(err.kind(), ErrorKind::WouldBlock);
+            } else {
+                assert!(
+                    accepted.is_ok(),
+                    "{mode} child never connected: {accepted:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn abstract_socket_child() {
+        let Some(mode) = child_mode("abstract_socket_child") else {
+            return;
+        };
+        let mut gate = granted_gate();
+        lock_for(&mut gate, Restrictions::ABSTRACT_UNIX_SOCKET, &mode);
+
+        let name = std::env::var("FSGATE_ABSTRACT").unwrap();
+        let address = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let result = UnixStream::connect_addr(&address);
+        if mode == "restricted" {
+            let err = result.expect_err("connected outside the domain");
+            assert_eq!(
+                err.raw_os_error(),
+                Some(Errno::PERM.raw_os_error()),
+                "{err:?}"
+            );
+        } else {
+            result.expect("connect without the scope");
+        }
+    }
+
+    #[test]
+    fn kernel_scopes_signals() {
+        for mode in modes(6) {
+            let (_root, granted, outside) = dirs();
+            // Spawned by this unlocked process, so outside the child's domain.
+            let mut victim = Command::new("sleep").arg("30").spawn().unwrap();
+            let pid = victim.id().to_string();
+
+            run_child(
+                "signal_child",
+                mode,
+                &[
+                    ("FSGATE_GRANTED", granted.as_os_str()),
+                    ("FSGATE_OUTSIDE", outside.as_os_str()),
+                    ("FSGATE_VICTIM", OsStr::new(&pid)),
+                ],
+            );
+
+            if mode == "restricted" {
+                let still = victim.try_wait().unwrap();
+                victim.kill().unwrap();
+                victim.wait().unwrap();
+                assert!(
+                    still.is_none(),
+                    "a restricted child signalled outside its domain"
+                );
+            } else {
+                let exit = victim.wait().unwrap();
+                assert_eq!(exit.signal(), Some(rustix::process::Signal::TERM.as_raw()));
+            }
+        }
+    }
+
+    #[test]
+    fn signal_child() {
+        let Some(mode) = child_mode("signal_child") else {
+            return;
+        };
+        let mut gate = granted_gate();
+        lock_for(&mut gate, Restrictions::SIGNAL, &mode);
+
+        let raw: i32 = std::env::var("FSGATE_VICTIM").unwrap().parse().unwrap();
+        let pid = rustix::process::Pid::from_raw(raw).expect("nonzero pid");
+        let result = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+        if mode == "restricted" {
+            assert_eq!(result, Err(Errno::PERM));
+        } else {
+            result.expect("signal without the scope");
+        }
+    }
+
+    #[test]
+    fn kernel_restricts_device_ioctls() {
+        let mut modes = modes(5);
+        if modes.contains(&"restricted") {
+            modes.push("write");
+        }
+        for mode in modes {
+            let (_root, _granted, outside) = dirs();
+            run_child(
+                "ioctl_child",
+                mode,
+                &[("FSGATE_OUTSIDE", outside.as_os_str())],
+            );
+        }
+    }
+
+    #[test]
+    fn ioctl_child() {
+        let Some(mode) = child_mode("ioctl_child") else {
+            return;
+        };
+        let rights = if mode == "write" {
+            Rights::READ | Rights::WRITE
+        } else {
+            Rights::READ
+        };
+        let mut gate = Gate::new();
+        gate.grant("/dev", rights).unwrap();
+        lock_for(&mut gate, Restrictions::IOCTL_DEV, &mode);
+
+        // Opened after the lock, beneath the grant. `/dev/null` is no
+        // terminal, so an ioctl that reaches the driver fails with ENOTTY.
+        let null = fs::File::open("/dev/null").unwrap();
+        let result = rustix::termios::tcgetattr(&null);
+        let expected = if mode == "restricted" {
+            Errno::ACCESS
+        } else {
+            Errno::NOTTY
+        };
+        assert_eq!(result.err(), Some(expected), "mode {mode}");
+    }
+
+    #[test]
+    fn kernel_restricts_threads_that_predate_the_lock() {
+        for mode in modes(8) {
+            let (_root, granted, outside) = dirs();
+            run_child(
+                "thread_child",
+                mode,
+                &[
+                    ("FSGATE_GRANTED", granted.as_os_str()),
+                    ("FSGATE_OUTSIDE", outside.as_os_str()),
+                ],
+            );
+
+            let planted = outside.join(format!("{mode}.txt"));
+            assert_eq!(planted.exists(), mode != "restricted", "{planted:?}");
+            assert_eq!(fs::read(outside.join("secret.txt")).unwrap(), b"secret");
+        }
+    }
+
+    #[test]
+    fn thread_child() {
+        let Some(mode) = child_mode("thread_child") else {
+            return;
+        };
+        let outside = std::env::var("FSGATE_OUTSIDE").unwrap();
+        let planted = format!("{outside}/{mode}.txt");
+
+        // Started before the lock and parked until after it.
+        let (go, wait) = mpsc::channel::<()>();
+        let sibling = std::thread::spawn(move || {
+            wait.recv().unwrap();
+            let read = fs::read(format!("{outside}/secret.txt"));
+            let write = fs::write(&planted, b"x");
+            (read.map(|_| ()), write)
+        });
+
+        let mut gate = granted_gate();
+        lock_for(&mut gate, Restrictions::ALL_THREADS, &mode);
+        go.send(()).unwrap();
+        let (read, write) = sibling.join().unwrap();
+
+        if mode == "restricted" {
+            assert_eq!(read.unwrap_err().kind(), ErrorKind::PermissionDenied);
+            assert_eq!(write.unwrap_err().kind(), ErrorKind::PermissionDenied);
+        } else {
+            read.expect("a sibling outside the lock reads outside the grants");
+            write.expect("a sibling outside the lock writes outside the grants");
+        }
+    }
 
     /// Parent half: sets up directories, re-executes this binary as a
     /// locked child, and requires it to succeed.

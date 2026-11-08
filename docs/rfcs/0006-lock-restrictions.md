@@ -1,6 +1,6 @@
 # RFC 0006: restrict more than file paths at `lock()`
 
-- Status: accepted ([#34](https://github.com/farming-labs/fsgate/pull/34)); unimplemented
+- Status: accepted ([#34](https://github.com/farming-labs/fsgate/pull/34)); implemented in [#36](https://github.com/farming-labs/fsgate/pull/36) except `RESOLVE_UNIX`
 - Date: 2026-11-07
 - Roadmap: [M8](../../ROADMAP.md#m8--containment-beyond-file-paths-linux)
 - Builds on: [RFC 0001](0001-core-design.md#containment-lock) (containment), [ADR 0002](../decisions/0002-landlock-not-seccomp-for-paths.md)
@@ -150,8 +150,8 @@ impl Gate {
 
 The error names the missing restriction, the kernel that provides it,
 and the fix, for example: "`Restrictions::SIGNAL` needs Landlock ABI v6
-(Linux 6.12) but this kernel provides v3; remove it from
-`LockOptions::require` or run on a newer kernel".
+(Linux 6.12), which this system does not provide; remove it from
+`LockOptions::require` or run on a newer Linux kernel".
 
 ### Failing before anything is applied
 
@@ -275,10 +275,10 @@ everything except the pathname socket test runs there.
 
 ## Open questions
 
-- Does the crate reject an unsupported `all_threads()` under
-  `HardRequirement` before `restrict_self()`? If it only reports it
-  afterwards, a required `ALL_THREADS` needs a separate check first. The
-  implementation verifies this.
+- ~~Does the crate reject an unsupported `all_threads()` under
+  `HardRequirement` before `restrict_self()`?~~ Resolved: yes.
+  `landlock` 0.4.7 checks the flag's compatibility when it is set, so a
+  required `ALL_THREADS` fails before anything is applied.
 - Does the signal scope affect signals the kernel sends on the process's
   behalf, such as `SIGCHLD` at exit or `F_SETOWN` I/O signals? The tests
   record the observed behavior, and the docs state it.

@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::Rights;
+use crate::{Restrictions, Rights};
 
 /// Receives every allow/deny decision a [`Gate`](crate::Gate) makes.
 ///
@@ -152,6 +152,9 @@ pub struct AuditEvent {
     /// decision; `None` when no grant was created or matched, and for
     /// every other operation.
     pub rights: Option<Rights>,
+    /// For a successful `lock`, the [`Restrictions`] that took effect;
+    /// `None` for a refused lock and every other operation.
+    pub restrictions: Option<Restrictions>,
     /// Allow or deny.
     pub decision: AuditDecision,
     /// Why.
@@ -179,6 +182,7 @@ impl AuditEvent {
             "path": self.path.as_ref().map(|path| path.to_string_lossy()),
             "grant": self.grant,
             "rights": self.rights.map(right_names),
+            "restrictions": self.restrictions.map(restriction_names),
             "decision": self.decision.as_str(),
             "reason": self.reason.as_str(),
             "errno": self.errno,
@@ -248,6 +252,16 @@ impl AuditEvent {
 struct ExtensibleTypesDoctest;
 
 /// The RFC 0002 wire names of `rights`, in a fixed order.
+/// RFC 0006 restriction names for the `restrictions` key, in the fixed
+/// order of [`crate::RESTRICTIONS`].
+fn restriction_names(restrictions: Restrictions) -> Vec<String> {
+    crate::RESTRICTIONS
+        .iter()
+        .filter(|info| restrictions.contains(info.set))
+        .map(|info| info.name.to_ascii_lowercase())
+        .collect()
+}
+
 fn right_names(rights: Rights) -> Vec<&'static str> {
     [
         (Rights::READ, "read"),
@@ -300,5 +314,41 @@ mod tests {
         // Leap-year day: 2024-02-29T12:34:56.789Z
         let ts = UNIX_EPOCH + Duration::from_millis(1_709_210_096_789);
         assert_eq!(rfc3339_millis(ts), "2024-02-29T12:34:56.789Z");
+    }
+
+    fn lock_event(restrictions: Option<Restrictions>) -> serde_json::Value {
+        let event = AuditEvent {
+            ts: UNIX_EPOCH,
+            op: AuditOp::Lock,
+            path: None,
+            grant: None,
+            rights: None,
+            restrictions,
+            decision: AuditDecision::Allow,
+            reason: AuditReason::Ok,
+            errno: None,
+            syscall: None,
+            notification: None,
+        };
+        serde_json::from_str(&event.to_json_line()).unwrap()
+    }
+
+    #[test]
+    fn restrictions_key_lists_names_in_rfc_order() {
+        let all = lock_event(Some(Restrictions::all()));
+        assert_eq!(
+            all["restrictions"],
+            serde_json::json!(["ioctl_dev", "abstract_unix_socket", "signal", "all_threads"])
+        );
+        // Insertion order does not matter; the key always uses RFC order.
+        let two = lock_event(Some(Restrictions::ALL_THREADS | Restrictions::IOCTL_DEV));
+        assert_eq!(
+            two["restrictions"],
+            serde_json::json!(["ioctl_dev", "all_threads"])
+        );
+        let none = lock_event(Some(Restrictions::empty()));
+        assert_eq!(none["restrictions"], serde_json::json!([]));
+        let refused = lock_event(None);
+        assert!(refused["restrictions"].is_null());
     }
 }
