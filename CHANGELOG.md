@@ -21,6 +21,7 @@
 
 ### Fixed
 
+- On macOS, descriptors a worker attached to a request could stay open in the broker for good. The broker received at most 8 descriptors per read, and macOS installs the ones that do not fit without reporting them, so the broker never closed them, and they were not close-on-exec. A worker could fill the broker's descriptor table, and programs the broker process started afterward inherited them. Each read now has room for as many descriptors as one message can carry, and a message the kernel reports truncated fails the connection closed. Linux closes descriptors that do not fit, so it was not affected.
 - The broker acts only on a frame exactly as long as its prefix declares. It used to treat every byte after the 4-byte prefix as the request, so a request whose prefix understated its length was still served. The broker still authorized it, so this let a worker do nothing it could not do with a correct frame, but anything that framed by the prefix saw a different request from the one served. Bytes beyond the declared length now fail the connection closed, as RFC 0003 requires.
 - A strict lock on a kernel without Landlock ABI v3 fails before applying anything. It used to apply a partial ruleset, then report `LockUnsupported` with the gate still unlocked, so a retry stacked a second ruleset.
 

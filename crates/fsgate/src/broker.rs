@@ -27,6 +27,12 @@ use crate::{Gate, GateError, Rights};
 /// violation and fails the connection closed.
 const MAX_FRAME_BYTES: usize = 1 << 20;
 
+/// Room for as many descriptors as one message can carry: 253 on Linux
+/// (`SCM_MAX_FD`), 254 on macOS. A receive buffer with less truncates
+/// them, and macOS still installs the ones that do not fit without
+/// reporting them, so nothing could ever close them.
+const MAX_FDS_PER_MESSAGE: usize = 254;
+
 /// Received descriptors must not survive `exec`, like every file std
 /// opens. Linux marks them close-on-exec atomically inside `recvmsg`;
 /// other platforms mark them right after it (see [`read_frame`]).
@@ -452,8 +458,10 @@ fn read_frame(stream: &mut UnixStream) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
         }
 
         let mut buf = [0u8; 65536];
-        let mut space =
-            vec![std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(8))];
+        let mut space = vec![
+            std::mem::MaybeUninit::<u8>::uninit();
+            rustix::cmsg_space!(ScmRights(MAX_FDS_PER_MESSAGE))
+        ];
         let mut ancillary = rustix::net::RecvAncillaryBuffer::new(&mut space);
         let received = rustix::net::recvmsg(
             &*stream,
@@ -471,6 +479,16 @@ fn read_frame(stream: &mut UnixStream) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
                     fds.push(fd);
                 }
             }
+        }
+        if received.flags.contains(rustix::net::ReturnFlags::CTRUNC) {
+            // The buffer holds every descriptor Linux and macOS let one
+            // message carry, so this is another platform or a full
+            // descriptor table. Descriptors that did not fit may be open
+            // here unreported; only the reported ones can be closed.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "peer attached more descriptors than could be received",
+            ));
         }
         if received.bytes == 0 {
             return Err(io::Error::new(

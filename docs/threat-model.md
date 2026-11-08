@@ -103,7 +103,7 @@ A trusted broker holds the `Gate` and serves `BrokerGate` requests over a Unix s
 | A malformed request, an unknown or missing operation, or a request path that is not UTF-8 | The broker closes the connection without acting | `broker.rs::a_malformed_request_fails_the_connection_closed` |
 | A directory entry name that is not UTF-8 | Refused, never transcoded | none |
 | Arbitrary bytes from the worker | No panic, hang, sanitizer report, or delivered descriptor outside the grant in the recorded fuzzing run | the [`broker_requests` fuzz target](../fuzz/README.md), not a test; run recorded in [M9](../ROADMAP.md#m9--review-readiness-and-020) |
-| Descriptors the worker attaches to a request | Closed without use | none |
+| Descriptors the worker attaches to a request | Closed without use, even as many as one message can carry. A message the kernel reports truncated, as when the broker's descriptor table is full, fails the connection closed. | `broker_attached_descriptors.rs::descriptors_attached_to_a_request_are_closed_unused`, `broker_attached_descriptors.rs::a_request_whose_descriptors_cannot_be_received_fails_the_connection_closed` (Linux only) |
 
 **Does not stop:**
 
@@ -111,6 +111,7 @@ A trusted broker holds the `Gate` and serves `BrokerGate` requests over a Unix s
 |---|---|---|
 | Another process connecting to the socket | It gets the grants. `fsgate-broker` binds with the process umask and checks no peer credentials. | none |
 | Many connections at once | Each one gets a thread and buffers up to about 1 MiB, with no limit on connections | none |
+| A request split across many messages, each carrying descriptors | The broker holds every descriptor until the frame is complete, so one connection can fill the broker's descriptor table | none |
 | A worker the embedder did not isolate | It can open files directly. As the same user, it can also signal the broker, or trace it where the system's ptrace policy allows. | none; the embedder's job |
 | Files already delivered | They stay usable; the broker keeps no way to take them back | none |
 | A fork and exec racing a receive on macOS | `FD_CLOEXEC` is set just after `recvmsg`, so a program started in that window inherits the descriptor ([RFC 0003](rfcs/0003-broker-protocol.md#framing)) | none |

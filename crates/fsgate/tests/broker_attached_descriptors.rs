@@ -1,0 +1,162 @@
+//! Descriptors a worker attaches to a request. A test binary of its own:
+//! these tests watch which descriptors stay open, and the Linux one lowers
+//! the process's descriptor limit, so nothing else may start programs or
+//! open files meanwhile. macOS marks received descriptors close-on-exec
+//! only after `recvmsg` returns, so a program started then would inherit
+//! one. The tests take `SERIAL` so they do not overlap each other either.
+
+#![cfg(unix)]
+
+use std::fs::{self, File};
+use std::io::{ErrorKind, IoSlice, Read};
+use std::mem::MaybeUninit;
+use std::net::Shutdown;
+use std::os::fd::{AsFd, BorrowedFd};
+use std::os::unix::net::UnixStream;
+use std::sync::{Mutex, MutexGuard};
+
+use fsgate::{Broker, Gate, Rights};
+use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
+
+/// The most descriptors Linux lets one message carry (`SCM_MAX_FD`).
+/// macOS allows 254.
+const MOST_PER_MESSAGE: usize = 253;
+
+fn serial() -> MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn frame(body: &serde_json::Value) -> Vec<u8> {
+    let body = body.to_string();
+    let mut frame = (body.len() as u32).to_le_bytes().to_vec();
+    frame.extend_from_slice(body.as_bytes());
+    frame
+}
+
+/// Sends one request with `fds` attached, and no more, so the broker can
+/// serve the connection on this thread.
+fn send_last_request(client: &UnixStream, bytes: &[u8], fds: &[BorrowedFd<'_>]) {
+    let mut space = vec![MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(fds.len()))];
+    let mut ancillary = SendAncillaryBuffer::new(&mut space);
+    assert!(ancillary.push(SendAncillaryMessage::ScmRights(fds)));
+    let sent = rustix::net::sendmsg(
+        client,
+        &[IoSlice::new(bytes)],
+        &mut ancillary,
+        SendFlags::empty(),
+    )
+    .expect("send the request");
+    assert_eq!(sent, bytes.len());
+    client.shutdown(Shutdown::Write).unwrap();
+}
+
+/// Panics unless every copy of `probe`'s peer has been closed.
+fn assert_peer_closed(probe: &UnixStream) {
+    probe.set_nonblocking(true).unwrap();
+    let mut probe = probe;
+    match probe.read(&mut [0u8; 1]) {
+        Ok(0) => {}
+        Ok(_) => panic!("nothing writes to the probe"),
+        Err(err) if err.kind() == ErrorKind::WouldBlock => {
+            panic!("a descriptor the worker attached is still open")
+        }
+        Err(err) => panic!("reading the probe failed: {err}"),
+    }
+}
+
+/// Requests carry no descriptors (RFC 0003). The broker decides one that
+/// does by its path alone, and closes every attached descriptor, even when
+/// the worker attaches as many as one message can carry.
+#[test]
+fn descriptors_attached_to_a_request_are_closed_unused() {
+    let _serial = serial();
+    let root = tempfile::tempdir().expect("create temp root");
+    let granted = root.path().join("granted");
+    let secret_path = root.path().join("outside/secret.txt");
+    fs::create_dir(&granted).unwrap();
+    fs::create_dir(root.path().join("outside")).unwrap();
+    fs::write(&secret_path, b"secret").unwrap();
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::READ).unwrap();
+
+    // One attached descriptor is the file the request names, outside the
+    // grant. The rest are copies of `held`, so `probe` reads end-of-file
+    // only once every one of them is closed.
+    let secret = File::open(&secret_path).unwrap();
+    let (held, probe) = UnixStream::pair().unwrap();
+    let mut attached = vec![secret.as_fd()];
+    attached.extend(std::iter::repeat_n(held.as_fd(), MOST_PER_MESSAGE - 1));
+
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let request = serde_json::json!({ "op": "open", "path": secret_path });
+    send_last_request(&client, &frame(&request), &attached);
+    drop(attached);
+    drop(held);
+
+    Broker::new(gate)
+        .serve_conn(server)
+        .expect("the connection ends normally");
+
+    // Holding the file gave the worker no authority over its path.
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).unwrap();
+    let response: serde_json::Value = serde_json::from_slice(&response[4..]).unwrap();
+    assert_eq!(response["result"], "error", "{response}");
+    assert_eq!(response["error"]["kind"], "no_grant", "{response}");
+    assert_peer_closed(&probe);
+}
+
+/// With its descriptor table full, the broker cannot receive what a
+/// request carries, and the kernel reports the message truncated. The
+/// broker fails the connection closed instead of serving a message it
+/// could not fully receive.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_request_whose_descriptors_cannot_be_received_fails_the_connection_closed() {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
+    let _serial = serial();
+    let (held, probe) = UnixStream::pair().unwrap();
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let request = serde_json::json!({ "op": "metadata", "path": "/" });
+    send_last_request(&client, &frame(&request), &[held.as_fd(); MOST_PER_MESSAGE]);
+    drop(held);
+
+    // No descriptor numbers above the highest open one, so `recvmsg` can
+    // install only the few that fit in gaps below it.
+    let highest = fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .map(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        })
+        .max()
+        .unwrap();
+    let saved = getrlimit(Resource::Nofile);
+    let limited = Rlimit {
+        current: Some(highest + 1),
+        maximum: saved.maximum,
+    };
+    setrlimit(Resource::Nofile, limited).unwrap();
+    let result = Broker::new(Gate::new()).serve_conn(server);
+    setrlimit(Resource::Nofile, saved).unwrap();
+
+    let err = result.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidData, "{err}");
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).unwrap();
+    assert!(
+        response.is_empty(),
+        "the broker served a request it could not fully receive"
+    );
+    // The kernel closed what it could not install; the broker closed the rest.
+    assert_peer_closed(&probe);
+}
