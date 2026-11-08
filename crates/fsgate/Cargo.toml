@@ -23,6 +23,10 @@ thiserror = "2.0.21"
 [dev-dependencies]
 tempfile = "3.27.0"
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# Safe `kill` and `tcgetattr` for the RFC 0006 locked-child tests.
+rustix = { version = "1.1.6", features = ["process", "termios"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.7"
 libc = { version = "0.2.191", optional = true }
