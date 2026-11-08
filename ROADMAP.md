@@ -110,9 +110,17 @@ Design accepted in [RFC 0006](docs/rfcs/0006-lock-restrictions.md). Everything e
 
 ## M9 — review readiness and 0.2.0
 
-Proposed; not started. No part of fsgate has had an independent security review. These are the steps between the current state and a release someone can rely on.
+Started. No part of fsgate has had an independent security review. These are the steps between the current state and a release someone can rely on.
 
-- [ ] Threat model: one document naming each boundary (the gate before `lock()`, the locked process, the broker and its worker, the experimental launcher), what each trusts, and what each does not stop. Acceptance: the README and RFC limit statements link to it, and every listed attack names the test that covers it or says that none does.
+- [x] Threat model: one document naming each boundary (the gate before `lock()`, the locked process, the broker and its worker, the experimental launcher), what each trusts, and what each does not stop. Acceptance: the README and RFC limit statements link to it, and every listed attack names the test that covers it or says that none does.
+
+  Evidence: [docs/threat-model.md](docs/threat-model.md). The README and RFCs 0001 to 0004 and 0006 link to it. Every row names a test or says "none", and each named test exists at the commit the document describes. Writing it found gaps that no fsgate test covers:
+  - The broker does not authenticate who connects, and it accepts any number of connections.
+  - Neither the 1 MiB frame limit nor a malformed request has a test. The fuzzing task below covers both.
+  - Landlock cannot restrict `stat`, `chmod`, `utime`, or `setxattr`, so a locked process can read metadata anywhere and change the mode of files it owns outside the grants.
+  - Hard links and mount points beneath a grant are reachable through both the gate and the kernel rules.
+
+  The document is not independently reviewed.
 - [ ] Fuzz the broker's server-side decoder: the RFC 0003 framing (length prefix, 1 MiB limit) and JSON request parsing. Acceptance: a `cargo fuzz` target over frame reassembly and request parsing, a recorded run (duration, corpus size, toolchain) without a crash, and a regression test for any crash found.
 - [ ] Independent security review of the handle layer, containment (including M8), broker, and audit sink. Acceptance: the reviewer, scope, reviewed commit, and findings are recorded; each finding is fixed or answered; and the README status says what was reviewed.
 - [ ] Release 0.2.0 through the trusted-publishing workflow, its first real run. Acceptance: the release job's verify step matches the uploaded, crates.io, and downloaded checksums and the `.cargo_vcs_info.json` commit. Before tagging, record two maintainer decisions here: whether 0.2.0 waits for M6 and the review, and whether it includes the `experimental-intercept` feature.

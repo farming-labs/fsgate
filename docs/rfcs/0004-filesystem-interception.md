@@ -272,6 +272,9 @@ adding a syscall requires a compatibility test and a boundary review.
 | Inherited descriptors and writable mappings | Only explicit pipe endpoints survive startup. Exec removes launcher mappings; brokered regular files are read-only. |
 | Supervisor exit | The child has closed its listener copy, so no stale listener keeps future opens waiting for a nonexistent supervisor. Previously granted handles remain valid. |
 
+The [threat model](../threat-model.md#4-the-experimental-launcher-linux-x86_64)
+maps these routes to the tests that cover them.
+
 ## Alternatives
 
 - **Landlock alone:** retain it for direct enforcement. It does not route

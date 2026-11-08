@@ -66,6 +66,11 @@ or local fallback; a worker that outlives its broker has no filesystem.
 
 ## Non-goals
 
+Authenticating the peer: whoever can connect to the socket has the
+broker's grants, and the embedder must isolate the worker. The
+[threat model](../threat-model.md#3-the-broker-and-its-worker) lists
+these limits with their tests.
+
 Non-UTF-8 paths (revisit if a real embedder needs them), multiplexed or
 pipelined requests, streaming directory iteration, and cross-machine
 transport. The protocol is same-host, version-locked to the crate.
