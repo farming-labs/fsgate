@@ -58,4 +58,4 @@ pub trait AuditSink: Send + Sync {
 
 ## Non-goals
 
-Signing or tamper-evidence of the log (the embedder's storage problem), rate limiting, and sampling. Nothing in the sink can veto or alter a decision; audit is observation only.
+Signing or tamper-evidence of the log (the embedder's storage problem), rate limiting, and sampling. Nothing in the sink can veto or alter a decision; audit is observation only ([threat model](../threat-model.md#audit-is-observation-not-a-boundary)).

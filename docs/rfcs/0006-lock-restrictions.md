@@ -64,6 +64,9 @@ a second Landlock domain on top.
 - A right that permits connecting to pathname sockets after `lock()`
   (see [Pathname sockets and the broker](#pathname-sockets-and-the-broker)).
 
+The [threat model](../threat-model.md#2-the-locked-process-linux) lists
+what a locked process can still do, with the test behind each claim.
+
 ## Design
 
 ### Restrictions

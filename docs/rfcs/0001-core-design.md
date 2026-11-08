@@ -74,7 +74,7 @@ Every allow and deny emits one structured event: operation, requested path, matc
 
 ## Non-goals (v1)
 
-LD_PRELOAD interposition, Windows, quotas, network capabilities, in-process multi-tenant separation (a Gate does not defend against other code in the same address space until `lock()` — that is what `lock()` and the broker are for).
+LD_PRELOAD interposition, Windows, quotas, network capabilities, in-process multi-tenant separation (a Gate does not defend against other code in the same address space until `lock()` — that is what `lock()` and the broker are for). The [threat model](../threat-model.md) lists what each boundary does not stop, with the test behind each claim.
 
 ## Alternatives considered
 
