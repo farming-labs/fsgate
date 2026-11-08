@@ -1,0 +1,25 @@
+[package]
+name = "fsgate-fuzz"
+version = "0.0.0"
+description = "cargo-fuzz targets for fsgate; not published."
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+fsgate = { path = "../crates/fsgate" }
+libfuzzer-sys = "0.4.13"
+rustix = { version = "1.1.6", features = ["net", "process"] }
+
+[[bin]]
+name = "broker_requests"
+path = "fuzz_targets/broker_requests.rs"
+test = false
+doc = false
+bench = false
+
+# Its own workspace, so the fsgate workspace and its lockfile stay as they are.
+[workspace]
+members = ["."]
