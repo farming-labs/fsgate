@@ -171,7 +171,13 @@ fn bytes_beyond_the_declared_length_fail_the_connection_closed() {
     let mut frame = 2u32.to_le_bytes().to_vec(); // declares 2 bytes, sends more
     frame.extend_from_slice(body.as_bytes());
     client.write_all(&frame).unwrap();
-    client.shutdown(std::net::Shutdown::Write).unwrap();
+    // The broker may already have hung up, which macOS reports as
+    // `NotConnected`. Either way it reads nothing more from this end.
+    match client.shutdown(std::net::Shutdown::Write) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotConnected => {}
+        Err(err) => panic!("shutdown failed: {err}"),
+    }
 
     let mut response = Vec::new();
     client.read_to_end(&mut response).unwrap();
