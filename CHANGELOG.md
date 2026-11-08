@@ -21,6 +21,7 @@
 
 ### Fixed
 
+- The broker acts only on a frame exactly as long as its prefix declares. It used to treat every byte after the 4-byte prefix as the request, so a request whose prefix understated its length was still served. The broker still authorized it, so this let a worker do nothing it could not do with a correct frame, but anything that framed by the prefix saw a different request from the one served. Bytes beyond the declared length now fail the connection closed, as RFC 0003 requires.
 - A strict lock on a kernel without Landlock ABI v3 fails before applying anything. It used to apply a partial ruleset, then report `LockUnsupported` with the gate still unlocked, so a retry stacked a second ruleset.
 
 ## 0.1.1 (2026-11-07)

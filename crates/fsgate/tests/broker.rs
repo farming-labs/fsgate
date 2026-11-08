@@ -153,6 +153,37 @@ fn dead_broker_fails_every_operation_closed() {
     assert!(matches!(err, GateError::Broker { .. }), "got {err:?}");
 }
 
+/// A frame is exactly as long as its prefix says (RFC 0003). A request
+/// with more bytes than its prefix declares is a protocol violation, so the
+/// broker closes the connection without acting on any of it.
+#[test]
+fn bytes_beyond_the_declared_length_fail_the_connection_closed() {
+    let (_root, granted, _) = setup();
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::READ | Rights::WRITE | Rights::CREATE)
+        .unwrap();
+    let planted = granted.join("planted.txt");
+
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let broker = thread::spawn(move || Broker::new(gate).serve_conn(server));
+
+    let body = serde_json::json!({ "op": "create", "path": planted }).to_string();
+    let mut frame = 2u32.to_le_bytes().to_vec(); // declares 2 bytes, sends more
+    frame.extend_from_slice(body.as_bytes());
+    client.write_all(&frame).unwrap();
+    client.shutdown(std::net::Shutdown::Write).unwrap();
+
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).unwrap();
+    let err = broker.join().unwrap().unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+    assert!(
+        response.is_empty(),
+        "the broker answered a misframed request"
+    );
+    assert!(!planted.exists(), "the broker acted on a misframed request");
+}
+
 /// End to end against the real binary, including the roadmap acceptance:
 /// killing the broker fails all subsequent operations closed.
 #[test]
