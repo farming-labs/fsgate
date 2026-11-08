@@ -138,6 +138,32 @@ fn metadata_and_read_dir_cross_the_wire() {
     assert_eq!(entries, vec!["a.txt".to_string()]);
 }
 
+/// Names cross this transport as UTF-8 (RFC 0003). A directory holding a
+/// name that is not is refused as a whole, never listed with a lossy
+/// name, which could name a different file. Linux only: APFS refuses to
+/// create such a name.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_directory_entry_name_that_is_not_utf8_is_refused() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let (_root, granted, _) = setup();
+    let latin1 = std::ffi::OsStr::from_bytes(b"caf\xe9.txt");
+    fs::write(granted.join(latin1), b"latin-1").unwrap();
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::READ | Rights::LIST).unwrap();
+    let (mut client, _server) = brokered(gate);
+
+    match client.read_dir(&granted).unwrap_err() {
+        GateError::Broker { message } => {
+            assert!(message.contains("not valid UTF-8"), "{message}")
+        }
+        other => panic!("expected a broker error, got {other:?}"),
+    }
+    // A refusal, not a lost connection: the next request is served.
+    assert!(client.metadata(granted.join("a.txt")).unwrap().is_file);
+}
+
 #[test]
 fn dead_broker_fails_every_operation_closed() {
     let (_root, granted, _) = setup();

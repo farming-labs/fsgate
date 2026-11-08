@@ -101,7 +101,7 @@ A trusted broker holds the `Gate` and serves `BrokerGate` requests over a Unix s
 | A frame over 1 MiB | The broker closes the connection before reading the body | `broker.rs::a_prefix_over_the_size_limit_fails_the_connection_closed` |
 | A length prefix shorter than the bytes that follow it | The broker closes the connection without acting | `broker.rs::bytes_beyond_the_declared_length_fail_the_connection_closed` |
 | A malformed request, an unknown or missing operation, or a request path that is not UTF-8 | The broker closes the connection without acting | `broker.rs::a_malformed_request_fails_the_connection_closed` |
-| A directory entry name that is not UTF-8 | Refused, never transcoded | none |
+| A directory entry name that is not UTF-8 | Refused, never transcoded | `broker.rs::a_directory_entry_name_that_is_not_utf8_is_refused` (Linux only; APFS refuses such names) |
 | Arbitrary bytes from the worker | No panic, hang, sanitizer report, or delivered descriptor outside the grant in the recorded fuzzing run | the [`broker_requests` fuzz target](../fuzz/README.md), not a test; run recorded in [M9](../ROADMAP.md#m9--review-readiness-and-020) |
 | Descriptors the worker attaches to a request | Closed without use | none |
 
