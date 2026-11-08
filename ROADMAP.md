@@ -132,13 +132,21 @@ Started. No part of fsgate has had an independent security review. These are the
 
   Evidence: the `broker_requests` target in [`fuzz/`](fuzz/README.md) feeds arbitrary bytes to `Broker::serve_conn`, as a worker would. Besides panics, hangs, and sanitizer reports, it fails if a descriptor the broker sends back reads the file outside the grant. A control run, with the grant widened to cover that file, trips this check on the `..` seed.
 
-  Recorded run, with no crash, hang, or check failure:
+  Recorded run on macOS, with no crash, hang, or check failure:
   - 900 seconds and 53,863,032 inputs, 59,781 per second.
   - The corpus grew from 14 seeds to 1,393 inputs (72 KiB), and coverage from 1,109 to 2,269 counters.
   - Toolchain: rustc 1.102.0-nightly (`f5cedb83a` 2026-11-07), cargo-fuzz 0.13.2, libfuzzer-sys 0.4.13, with AddressSanitizer, on macOS (Apple M1). libFuzzer seed 3216607579.
   - The build combined the harness at `5d95b38` with the decoder from [#38](https://github.com/farming-labs/fsgate/pull/38) at `0c6a876`.
 
-  Reading the decoder for this task found the framing bug that #38 fixes, with its own regression test. The run found no crash, so there is no crash regression test. `broker.rs` now tests the 1 MiB limit and malformed requests directly. Not fuzzed on Linux: CI builds and lints the target on stable but does not run it.
+  Reading the decoder for this task found the framing bug that #38 fixes, with its own regression test. The run found no crash, so there is no crash regression test. `broker.rs` now tests the 1 MiB limit and malformed requests directly.
+
+  Recorded run on Linux, [in CI](https://github.com/farming-labs/fsgate/actions/runs/42469046454), also with no crash, hang, or check failure:
+  - 901 seconds and 15,559,663 inputs, 17,269 per second.
+  - The corpus grew from 14 seeds to 1,274 inputs (82 KiB), and coverage from 969 to 2,027 counters.
+  - Toolchain: the same rustc, cargo-fuzz, and libfuzzer-sys as the macOS run, with AddressSanitizer, on Linux 7.0.0-1019-azure x86_64. libFuzzer seed 2985355736.
+  - The build is `d9aca86`, which includes the broker's descriptor fix from [#40](https://github.com/farming-labs/fsgate/pull/40).
+
+  [`fuzz.yml`](.github/workflows/fuzz.yml) repeats this run when `broker.rs` or the harness changes. The control run was on macOS only.
 - [ ] Independent security review of the handle layer, containment (including M8), broker, and audit sink. Acceptance: the reviewer, scope, reviewed commit, and findings are recorded; each finding is fixed or answered; and the README status says what was reviewed.
 - [ ] Release 0.2.0 through the trusted-publishing workflow, its first real run. Acceptance: the release job's verify step matches the uploaded, crates.io, and downloaded checksums and the `.cargo_vcs_info.json` commit. Before tagging, record two maintainer decisions here: whether 0.2.0 waits for M6 and the review, and whether it includes the `experimental-intercept` feature.
 
