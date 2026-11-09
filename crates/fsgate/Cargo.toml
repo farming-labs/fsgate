@@ -1,6 +1,6 @@
 [package]
 name = "fsgate"
-version = "0.1.1"
+version = "0.2.0"
 description = "Filesystem authority as directory handles granted up front, enforced by the kernel."
 readme = "README.md"
 edition.workspace = true
@@ -40,5 +40,6 @@ libc = "0.2.191"
 # Experimental and Linux only: the RFC 0004 interception profile, meaning
 # `Gate::open_regular_strict`, `Gate::open_intercepted`, and, on x86_64, the
 # `intercept::Launch` launcher. Not covered by semver; it may change or
-# disappear in any release.
+# disappear in any release. It builds only from the repository, whose
+# `.cargo/config.toml` allows it; the published crate refuses it.
 experimental-intercept = ["rustix/event", "rustix/fs", "dep:libc", "dep:rustix-linux-procfs"]

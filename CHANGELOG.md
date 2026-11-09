@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (unreleased)
+
+Not independently reviewed. Everything behind the `experimental-intercept` feature is not part of this release: it builds only from the repository, and the published crate refuses the feature with a compile error. The experimental entries below describe the repository.
 
 ### Added
 
