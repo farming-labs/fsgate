@@ -7,13 +7,15 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::num::NonZeroUsize;
 use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
+use std::time::{Duration, Instant};
 
-use fsgate::{Broker, BrokerGate, Gate, GateError, Rights};
+use fsgate::{Broker, BrokerGate, Gate, GateError, Rights, ServeOptions};
 use tempfile::TempDir;
 
 fn setup() -> (TempDir, PathBuf, PathBuf) {
@@ -278,6 +280,90 @@ fn a_malformed_request_fails_the_connection_closed() {
         let declared = u32::try_from(body.len()).unwrap();
         let (result, response) = serve_raw(writable_gate(&granted), &frame(declared, body));
         assert_closed_without_acting(result, &response, &planted);
+    }
+}
+
+/// Serves `gate` on a new socket at `path`. `serve_with` blocks for the
+/// life of the listener, so its thread lasts until the test binary exits.
+fn serving(gate: Gate, path: &Path, options: ServeOptions) {
+    let listener = UnixListener::bind(path).unwrap();
+    thread::spawn(move || Broker::new(gate).serve_with(&listener, options));
+}
+
+fn own_uid() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
+/// CI has one user, so this admits only a uid other than the test's own.
+/// That exercises the kernel's real credentials without a second account.
+#[test]
+fn a_peer_of_another_user_gets_no_answer() {
+    let (root, granted, _) = setup();
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::READ | Rights::WRITE | Rights::CREATE)
+        .unwrap();
+    let socket = root.path().join("broker.sock");
+    let options = ServeOptions::default().allow_peer_uids([own_uid().wrapping_add(1)]);
+    serving(gate, &socket, options);
+
+    let planted = granted.join("planted.txt");
+    let mut client = BrokerGate::connect(&socket).unwrap();
+    let err = client.create(&planted).unwrap_err();
+    assert!(matches!(err, GateError::Broker { .. }), "got {err:?}");
+    assert!(!planted.exists(), "the broker served a refused peer");
+}
+
+#[test]
+fn an_admitted_peer_is_served() {
+    for options in [
+        ServeOptions::default(),
+        ServeOptions::default().allow_peer_uids([own_uid()]),
+        ServeOptions::default().any_peer(),
+    ] {
+        let (root, granted, _) = setup();
+        let mut gate = Gate::new();
+        gate.grant(&granted, Rights::READ).unwrap();
+        let socket = root.path().join("broker.sock");
+        serving(gate, &socket, options.clone());
+
+        let mut client = BrokerGate::connect(&socket).unwrap();
+        let stat = client.metadata(granted.join("a.txt"));
+        assert!(stat.unwrap().is_file, "not served under {options:?}");
+    }
+}
+
+#[test]
+fn connections_past_the_limit_are_closed_until_one_ends() {
+    let (root, granted, _) = setup();
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::READ).unwrap();
+    let socket = root.path().join("broker.sock");
+    let options = ServeOptions::default().max_connections(NonZeroUsize::MIN);
+    serving(gate, &socket, options);
+    let file = granted.join("a.txt");
+
+    // An answered request shows the broker has taken this connection.
+    let mut first = BrokerGate::connect(&socket).unwrap();
+    assert!(first.metadata(&file).unwrap().is_file);
+
+    let mut second = BrokerGate::connect(&socket).unwrap();
+    let err = second.metadata(&file).unwrap_err();
+    assert!(matches!(err, GateError::Broker { .. }), "got {err:?}");
+
+    // The slot frees once the broker sees the hang-up, and nothing reports
+    // that, so a new connection is retried until the deadline.
+    drop(first);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut next = BrokerGate::connect(&socket).unwrap();
+        match next.metadata(&file) {
+            Ok(stat) => {
+                assert!(stat.is_file);
+                break;
+            }
+            Err(GateError::Broker { .. }) if Instant::now() < deadline => thread::yield_now(),
+            Err(err) => panic!("the slot was never freed: {err:?}"),
+        }
     }
 }
 

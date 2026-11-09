@@ -53,7 +53,7 @@ fsgate-broker --experimental-intercept --grant /srv/data:r --audit --apply -- ./
 - It does not sandbox the network, environment, or memory. Filesystem only.
 - On kernels before Linux 7.1, `lock()` does not restrict connects to pathname Unix sockets, and before 6.12 it does not restrict abstract sockets or signals either. Through those, a locked process can still reach an unconfined process that opens files for it or passes it descriptors ([RFC 0001](docs/rfcs/0001-core-design.md#containment-lock)).
 - `lock()` does not restrict file metadata. Landlock cannot restrict `stat`, `chmod`, `chown`, `utime`, or `setxattr`, so a locked process can tell whether any path exists and change the mode of files it owns outside the grants. A hard link or mount beneath a grant reaches whatever it points to, through the gate and the kernel rules alike.
-- The broker does not authenticate peers. Any process that can connect to its socket has its grants.
+- The broker does not tell processes of one user apart. `Broker::serve` refuses other users by default, but any process of the broker's user that can reach a socket has its grants.
 - It does not intercept `open(2)` in unmodified binaries, except through an experimental, unreviewed launcher for static Linux x86_64 binaries behind the `experimental-intercept` feature ([M6](ROADMAP.md#m6--linux-filesystem-interception-experimental), [RFC 0004](docs/rfcs/0004-filesystem-interception.md)). That launcher is not supported yet. A preload shim remains out of scope for v1.
 - It does not support Windows in v1.
 - It is not a container runtime and does not replace one.

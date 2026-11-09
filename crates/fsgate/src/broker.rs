@@ -15,9 +15,11 @@
 
 use std::fs::File;
 use std::io::{self, IoSlice, IoSliceMut, Write};
+use std::num::NonZeroUsize;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -99,6 +101,113 @@ pub struct FileStat {
     pub len: u64,
 }
 
+/// How [`Broker::serve_with`] admits connections ([RFC 0007]).
+///
+/// The default admits peers running as the broker's effective user, and
+/// at most 64 connections at once.
+///
+/// [RFC 0007]: https://github.com/farming-labs/fsgate/blob/main/docs/rfcs/0007-broker-peers.md
+#[derive(Clone, Debug)]
+pub struct ServeOptions {
+    peers: Peers,
+    max_connections: NonZeroUsize,
+}
+
+#[derive(Clone, Debug)]
+enum Peers {
+    BrokerUser,
+    Uids(Vec<u32>),
+    Any,
+}
+
+impl Default for ServeOptions {
+    fn default() -> ServeOptions {
+        ServeOptions {
+            peers: Peers::BrokerUser,
+            max_connections: NonZeroUsize::new(64).expect("64 is not zero"),
+        }
+    }
+}
+
+impl ServeOptions {
+    /// Admits exactly these peer uids, replacing the default of the
+    /// broker's own user. For a worker that runs as another user.
+    #[must_use]
+    pub fn allow_peer_uids(mut self, uids: impl IntoIterator<Item = u32>) -> ServeOptions {
+        self.peers = Peers::Uids(uids.into_iter().collect());
+        self
+    }
+
+    /// Admits every peer that can reach the socket, without checking who
+    /// it is. Needed to serve at all on a platform where fsgate cannot
+    /// read a peer's identity.
+    #[must_use]
+    pub fn any_peer(mut self) -> ServeOptions {
+        self.peers = Peers::Any;
+        self
+    }
+
+    /// Sets how many connections are served at once. Past this, each new
+    /// connection is closed at once, and its worker fails closed with
+    /// [`GateError::Broker`].
+    #[must_use]
+    pub fn max_connections(mut self, limit: NonZeroUsize) -> ServeOptions {
+        self.max_connections = limit;
+        self
+    }
+
+    /// The uids to admit, or `None` to admit every peer.
+    fn allowed_uids(&self) -> io::Result<Option<Vec<u32>>> {
+        match &self.peers {
+            Peers::Any => Ok(None),
+            _ if !CAN_READ_PEER_UID => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "fsgate cannot read a peer's identity on this platform; \
+                 pass `ServeOptions::any_peer` to serve without the check",
+            )),
+            Peers::BrokerUser => Ok(Some(vec![rustix::process::geteuid().as_raw()])),
+            Peers::Uids(uids) => Ok(Some(uids.clone())),
+        }
+    }
+}
+
+const CAN_READ_PEER_UID: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos"
+));
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    Ok(rustix::net::sockopt::socket_peercred(stream)?.uid.as_raw())
+}
+
+#[cfg(target_os = "macos")]
+use crate::broker_sys::peer_uid;
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn peer_uid(_stream: &UnixStream) -> io::Result<u32> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+/// Whether to serve this connection. A peer whose identity cannot be read
+/// is refused.
+fn is_admitted(stream: &UnixStream, allowed: Option<&[u32]>) -> bool {
+    match allowed {
+        None => true,
+        Some(allowed) => peer_uid(stream).is_ok_and(|uid| allowed.contains(&uid)),
+    }
+}
+
+/// One served connection, counted until it ends, even by a panic.
+struct Slot<'a>(&'a AtomicUsize);
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Serves a [`Gate`] to broker clients. The gate's own resolution and
 /// rights checks authorize every request; the broker adds no policy.
 pub struct Broker {
@@ -111,16 +220,39 @@ impl Broker {
         Broker { gate }
     }
 
-    /// Accepts connections forever, serving each on its own thread.
-    /// Returns only when the listener fails.
+    /// Accepts connections forever with [`ServeOptions::default`]: peers
+    /// of the broker's own user, and at most 64 at once. Returns only when
+    /// the listener fails.
     pub fn serve(&self, listener: &UnixListener) -> io::Result<()> {
+        self.serve_with(listener, ServeOptions::default())
+    }
+
+    /// Accepts connections forever, serving each admitted one on its own
+    /// thread. A connection that is not admitted is closed with no answer.
+    /// Returns only when the listener fails, or at once with
+    /// [`io::ErrorKind::Unsupported`] if `options` needs a peer's identity
+    /// and this platform cannot provide it.
+    pub fn serve_with(&self, listener: &UnixListener, options: ServeOptions) -> io::Result<()> {
+        let allowed = options.allowed_uids()?;
+        let active = AtomicUsize::new(0);
+        let active = &active;
         std::thread::scope(|scope| {
             loop {
                 let (stream, _) = match listener.accept() {
                     Ok(conn) => conn,
                     Err(err) => return Err(err),
                 };
+                // Checked first, so a refused peer cannot use up the limit.
+                if !is_admitted(&stream, allowed.as_deref()) {
+                    continue;
+                }
+                if active.load(Ordering::Acquire) >= options.max_connections.get() {
+                    continue;
+                }
+                // Only this thread adds, so the count cannot pass the limit.
+                active.fetch_add(1, Ordering::AcqRel);
                 scope.spawn(move || {
+                    let _slot = Slot(active);
                     // A failed connection only ends that connection.
                     let _ = self.serve_conn(stream);
                 });

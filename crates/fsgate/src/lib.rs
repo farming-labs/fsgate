@@ -33,13 +33,15 @@
 mod audit;
 #[cfg(unix)]
 mod broker;
+#[cfg(unix)]
+mod broker_sys;
 mod containment;
 #[cfg(all(feature = "experimental-intercept", target_os = "linux"))]
 pub mod intercept;
 
 pub use audit::{AuditDecision, AuditEvent, AuditOp, AuditReason, AuditSink};
 #[cfg(unix)]
-pub use broker::{Broker, BrokerGate, FileStat};
+pub use broker::{Broker, BrokerGate, FileStat, ServeOptions};
 
 use std::fmt;
 use std::fs::File;
