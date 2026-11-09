@@ -1,6 +1,6 @@
 # RFC 0007: decide who can reach the broker
 
-- Status: accepted ([#46](https://github.com/farming-labs/fsgate/pull/46))
+- Status: accepted ([#46](https://github.com/farming-labs/fsgate/pull/46)); implemented in [#47](https://github.com/farming-labs/fsgate/pull/47) and [#48](https://github.com/farming-labs/fsgate/pull/48)
 - Date: 2026-11-08
 - Roadmap: [M9](../../ROADMAP.md#m9--review-readiness-and-020)
 - Builds on: [RFC 0003](0003-broker-protocol.md) (broker protocol), the [threat model](../threat-model.md#3-the-broker-and-its-worker)
@@ -26,7 +26,7 @@ review (M9) will start here. These should be settled before it.
 ## Goals
 
 - `fsgate-broker` can give its command a connection no other process can
-  reach, with no name in the filesystem.
+  connect to, with no name in the filesystem.
 - A pathname socket from `fsgate-broker` is owner-only whatever the umask,
   with no moment when it is looser.
 - `Broker::serve` refuses peers running as another user unless the
@@ -57,7 +57,9 @@ command, naming the descriptor in `FSGATE_BROKER_FD`:
 fsgate-broker --grant /srv/data:rl -- ./worker
 ```
 
-No other process can reach it, because it has no name. It needs no
+No other process can connect to it, because it has no name. Programs the
+command starts before it adopts the connection inherit it too, and a
+process allowed to trace the worker or broker can copy it. It needs no
 `pre_exec`, so no `unsafe` in the broker: the parent clears close-on-exec
 on the child's end just before spawning and closes its copy afterwards
 (measured on macOS). `fsgate-broker` starts only that one program.
@@ -73,8 +75,8 @@ The worker adopts it with a new constructor:
 let mut gate = BrokerGate::from_inherited()?;
 ```
 
-`from_inherited` reads `FSGATE_BROKER_FD`, checks that the number names a
-Unix stream socket, marks it close-on-exec so the worker's own children do
+`from_inherited` reads `FSGATE_BROKER_FD`, checks that the number names an
+inherited Unix stream socket, marks it close-on-exec so the worker's own children do
 not inherit it, and fails with `GateError::Broker` and the remedy
 otherwise. A second call fails, because a descriptor can have only one
 owner. Turning the number into an `OwnedFd` is `unsafe`, so it goes in an

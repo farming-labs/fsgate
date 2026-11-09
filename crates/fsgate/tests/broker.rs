@@ -8,6 +8,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -369,6 +370,41 @@ fn broker_binary_serves_and_dies_closed() {
     broker.wait().expect("reap broker");
     let err = client.open(granted.join("a.txt")).unwrap_err();
     assert!(matches!(err, GateError::Broker { .. }), "got {err:?}");
+}
+
+/// The real binary under the loosest umask. The command exits when the
+/// test closes its standard input.
+#[test]
+fn a_socket_is_owner_only_whatever_the_umask() {
+    let (root, granted, _) = setup();
+    let socket = root.path().join("broker.sock");
+    let mut broker = Command::new("sh")
+        .args(["-c", "umask 000; exec \"$@\"", "sh"])
+        .arg(env!("CARGO_BIN_EXE_fsgate-broker"))
+        .args(["--grant", &format!("{}:r", granted.display())])
+        .args(["--socket", &socket.display().to_string()])
+        .args(["--", "sh", "-c", "echo ready; read line; exit 0"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn fsgate-broker");
+
+    let mut ready = String::new();
+    BufReader::new(broker.stdout.take().expect("piped stdout"))
+        .read_line(&mut ready)
+        .expect("read the broker command's output");
+    assert_eq!(
+        ready, "ready\n",
+        "broker exited before starting its command"
+    );
+
+    let mode = fs::metadata(&socket).unwrap().permissions().mode() & 0o7777;
+    let mut client = BrokerGate::connect(&socket).unwrap();
+    assert!(client.metadata(granted.join("a.txt")).unwrap().is_file);
+
+    drop(broker.stdin.take());
+    broker.wait().expect("reap broker");
+    assert_eq!(mode, 0o600, "socket mode was {mode:o}");
 }
 
 fn broker_usage(args: &[&str]) -> std::process::Output {

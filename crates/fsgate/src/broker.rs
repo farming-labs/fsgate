@@ -16,10 +16,10 @@
 use std::fs::File;
 use std::io::{self, IoSlice, IoSliceMut, Write};
 use std::num::NonZeroUsize;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -456,6 +456,46 @@ impl BrokerGate {
         }
     }
 
+    /// Adopts the connection that `fsgate-broker`, run without `--socket`,
+    /// named in the `FSGATE_BROKER_FD` environment variable ([RFC 0007]).
+    ///
+    /// No other process can connect to it, because it has no name in the
+    /// filesystem, and it needs no connect, so it works after
+    /// [`Gate::lock`]. Programs this process starts after this call do not
+    /// inherit it. Adopt it first, because programs started before do.
+    ///
+    /// # Errors
+    ///
+    /// [`GateError::Broker`] if the variable is missing, does not name an
+    /// inherited Unix stream socket, or was already adopted: a descriptor
+    /// has one owner. A descriptor that is refused stays open.
+    ///
+    /// [RFC 0007]: https://github.com/farming-labs/fsgate/blob/main/docs/rfcs/0007-broker-peers.md
+    pub fn from_inherited() -> Result<BrokerGate, GateError> {
+        static ADOPTED: AtomicBool = AtomicBool::new(false);
+
+        let value = std::env::var("FSGATE_BROKER_FD")
+            .map_err(|_| not_inherited("`FSGATE_BROKER_FD` is not set".into()))?;
+        // Numbers 0 to 2 are standard streams, never the connection.
+        let raw = value
+            .parse::<RawFd>()
+            .ok()
+            .filter(|number| *number > 2)
+            .ok_or_else(|| not_inherited(format!("`FSGATE_BROKER_FD` is `{value}`")))?;
+        if ADOPTED.swap(true, Ordering::AcqRel) {
+            return Err(GateError::Broker {
+                message: "the inherited broker connection was already adopted; \
+                          keep the first `BrokerGate`"
+                    .into(),
+            });
+        }
+        let stream = crate::broker_sys::adopt_unix_stream(raw).map_err(|source| {
+            ADOPTED.store(false, Ordering::Release);
+            not_inherited(format!("`FSGATE_BROKER_FD` is `{value}`: {source}"))
+        })?;
+        Ok(BrokerGate::from_stream(stream))
+    }
+
     /// Opens an existing file for reading via the broker.
     pub fn open(&mut self, path: impl AsRef<Path>) -> Result<File, GateError> {
         let path = utf8_path(path.as_ref())?;
@@ -513,6 +553,15 @@ impl BrokerGate {
             return Err(remote_error(error));
         }
         Ok((response, fds))
+    }
+}
+
+fn not_inherited(problem: String) -> GateError {
+    GateError::Broker {
+        message: format!(
+            "no inherited broker connection: {problem}; \
+             start this program with `fsgate-broker` and no `--socket`"
+        ),
     }
 }
 

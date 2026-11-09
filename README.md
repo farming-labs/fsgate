@@ -33,11 +33,11 @@ Two layers:
 `lock_with(LockPolicy::BestEffort)` explicitly permits weaker filesystem rules and returns the achieved `LockStatus`: `FullyEnforced`, `PartiallyEnforced`, or `LibraryOnly`. `gate.restrictions()` reports which of the newer restrictions took effect. `lock_with(LockOptions::default().require(Restrictions::SIGNAL))` fails unless the kernel provides one; `.restrict(Restrictions::all() - Restrictions::ABSTRACT_UNIX_SOCKET)` drops one, for example for an X11 client. A lock that fails changes nothing. `narrow(grant, rights)` removes rights from a live grant and keeps its held handle; `revoke(grant)` removes the grant. Both affect future gate operations, and neither invalidates files already opened. Before `lock()`, the kernel rules are built from what remains; after it, the installed rules do not change.
 
 ```text
-fsgate-broker --grant /srv/data:rl --socket /tmp/app.sock -- ./worker
-# worker: BrokerGate::connect(env FSGATE_BROKER_SOCKET) → open/create/metadata/read_dir
+fsgate-broker --grant /srv/data:rl -- ./worker
+# worker: BrokerGate::from_inherited() → open/create/metadata/read_dir
 ```
 
-A worker that also calls `lock()` connects to the broker first: on Linux 7.1 and later, the lock refuses new connects to Unix sockets created outside it, and a connection made before it keeps working.
+The worker inherits a connection with no name in the filesystem, so no other process can connect to it, and it keeps working after `lock()`. Programs it starts before calling `from_inherited` inherit the connection too, so adopt it first. A worker that needs several connections passes `--socket <path>` and calls `BrokerGate::connect` with `FSGATE_BROKER_SOCKET`. That socket is owner-only whatever the umask. A worker that also calls `lock()` connects to it first: on Linux 7.1 and later, the lock refuses new connects to Unix sockets created outside it, and a connection made before it keeps working.
 
 Experimental and unsupported, Linux x86_64 only: built with `--features experimental-intercept`, `fsgate-broker --experimental-intercept` runs an unmodified static binary and answers its `open`/`openat`/`openat2` calls from the grants ([RFC 0004](docs/rfcs/0004-filesystem-interception.md)). Without `--apply` it only prints the plan; it never falls back to running the worker unconfined. It needs Landlock ABI 3 and seccomp user notifications, and refuses to start without them. The worker must be a static, native x86_64 ELF. Only read-only opens of regular files by absolute path are mediated: relative paths, writes, creation, and syscalls outside the profile fail with `EOPNOTSUPP`, and every symlink fails with `ELOOP`. CI runs these tests from a release build of the packaged crate on Linux 6.6 and 7.3, each booted in a VM (and booted again without Landlock), and on the runner's own kernel.
 
@@ -53,7 +53,7 @@ fsgate-broker --experimental-intercept --grant /srv/data:r --audit --apply -- ./
 - It does not sandbox the network, environment, or memory. Filesystem only.
 - On kernels before Linux 7.1, `lock()` does not restrict connects to pathname Unix sockets, and before 6.12 it does not restrict abstract sockets or signals either. Through those, a locked process can still reach an unconfined process that opens files for it or passes it descriptors ([RFC 0001](docs/rfcs/0001-core-design.md#containment-lock)).
 - `lock()` does not restrict file metadata. Landlock cannot restrict `stat`, `chmod`, `chown`, `utime`, or `setxattr`, so a locked process can tell whether any path exists and change the mode of files it owns outside the grants. A hard link or mount beneath a grant reaches whatever it points to, through the gate and the kernel rules alike.
-- The broker does not tell processes of one user apart. `Broker::serve` refuses other users by default, but any process of the broker's user that can reach a socket has its grants.
+- On a socket path, the broker does not tell processes of one user apart. `Broker::serve` refuses other users by default, but any process of the broker's user that can reach the socket has its grants. An inherited connection does not have this gap.
 - It does not intercept `open(2)` in unmodified binaries, except through an experimental, unreviewed launcher for static Linux x86_64 binaries behind the `experimental-intercept` feature ([M6](ROADMAP.md#m6--linux-filesystem-interception-experimental), [RFC 0004](docs/rfcs/0004-filesystem-interception.md)). That launcher is not supported yet. A preload shim remains out of scope for v1.
 - It does not support Windows in v1.
 - It is not a container runtime and does not replace one.
