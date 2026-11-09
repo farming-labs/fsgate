@@ -7,7 +7,7 @@ fsgate is for a program that runs code it does not fully trust: a plugin, a pars
 
 The trusted side is everything that runs before the boundary: the code that calls `grant` and `lock`, the broker process, the launcher's supervisor, and the kernel.
 
-**Each boundary below is a separate guarantee.** The gate alone is not a sandbox, and neither is the broker. The process is contained only after `lock()` on Linux, or when the embedder isolates a broker's worker.
+**Each boundary below is a separate guarantee.** The gate alone is not a sandbox, and neither is the broker. The process is contained only after `lock()` on Linux, when `fsgate-broker` confines its worker on Linux, or when the embedder isolates a worker it serves.
 
 ## Reading the tables
 
@@ -82,13 +82,13 @@ Test names are `file::test`. Files are in `crates/fsgate/tests/` unless they sta
 
 ## 3. The broker and its worker
 
-A trusted broker holds the `Gate` and serves `BrokerGate` requests over a Unix socket, returning opened files over `SCM_RIGHTS` ([RFC 0003](rfcs/0003-broker-protocol.md)). Without `--socket`, `fsgate-broker` passes the command an inherited connection and names it in `FSGATE_BROKER_FD`. With `--socket`, it binds an owner-only socket at that path, starts the command with `FSGATE_BROKER_SOCKET` set, and removes the socket when the command exits.
+A trusted broker holds the `Gate` and serves `BrokerGate` requests over a Unix socket, returning opened files over `SCM_RIGHTS` ([RFC 0003](rfcs/0003-broker-protocol.md)). Without `--socket`, `fsgate-broker` passes the command an inherited connection and names it in `FSGATE_BROKER_FD`. With `--unconfined --socket`, it binds an owner-only socket at that path, starts the command with `FSGATE_BROKER_SOCKET` set, and removes the socket when the command exits. Unless given `--unconfined`, it confines the command on Linux ([RFC 0008](rfcs/0008-confine-broker-worker.md)) and refuses to start it elsewhere.
 
 **Trusts:**
 
 - The broker process and its gate.
 - Every process of an admitted user that can connect to a socket. `Broker::serve` admits the broker's own user by default, and at most 64 connections. `serve_conn` checks nothing, because its caller chose the stream. Whoever is admitted has the grants.
-- The embedder, to isolate the worker. The broker does not remove the worker's ambient filesystem authority. `fsgate-broker` starts the command as the same user, with the same environment and filesystem access as itself.
+- The embedder, to isolate a worker it serves through the library. `Broker` does not remove a worker's ambient filesystem authority. `fsgate-broker --unconfined` starts the command as the same user, with the same environment and filesystem access as itself.
 
 **Stops:**
 
@@ -109,6 +109,13 @@ A trusted broker holds the `Gate` and serves `BrokerGate` requests over a Unix s
 | Another user connecting to an `fsgate-broker --socket` path, whatever the umask | The socket is `0600` before it accepts connections | `broker.rs::a_socket_is_owner_only_whatever_the_umask` |
 | A peer of another user connecting through `Broker::serve` | Closed with no answer and no side effect, unless the embedder admits that uid | `broker_serve.rs::a_peer_of_another_user_gets_no_answer` |
 | More connections than the limit through `Broker::serve` | Each one past the limit (64 by default) is closed at once, and served again once a slot frees | `broker_serve.rs::connections_past_the_limit_are_closed_until_one_ends` |
+| A confined worker, or a program it starts, opening files directly (Linux) | `EACCES`, and no file is created. The grants never become worker rules, so a granted file is refused too. | `broker_confined.rs::kernel::a_confined_worker_cannot_reach_files_on_its_own`, `broker_confined.rs::kernel::a_granted_file_comes_only_through_the_broker`, `broker_confined.rs::kernel::a_direct_path_can_be_read_and_nothing_beside_it` |
+| A worker that cannot be confined | It does not start unless the command line says `--unconfined` | `broker_confined.rs::the_broker_refuses_to_start_a_worker_without_landlock` (on Linux booted with `lsm=capability`), `broker_confined.rs::a_platform_that_cannot_confine_refuses_to_start_the_worker` (macOS) |
+| Descriptors the broker's parent left open reaching a confined worker | Closed when the worker starts, since Landlock does not restrict what was opened before it | `broker_confined.rs::kernel::a_descriptor_the_parent_left_open_is_closed_in_the_worker` |
+| Secrets in the broker's environment reaching a confined worker | It gets only the names given with `--env` | `broker_confined.rs::kernel::a_confined_worker_inherits_only_the_named_variables` |
+| A confined worker typing into the user's terminal with `TIOCSTI` | It leads its own session, so it has no controlling terminal | `broker_confined.rs::kernel::a_confined_worker_leads_its_own_session`, which checks the session and not the ioctl |
+| A confined worker inspecting its broker | The kernel's ptrace check refuses it, and `no_new_privs` keeps set-ID programs from helping | `broker_confined.rs::kernel::a_confined_worker_cannot_inspect_its_broker`, through `/proc/<pid>/environ` and not `PTRACE_ATTACH` |
+| A confined worker outliving a killed broker | The kernel kills it | `broker_confined.rs::kernel::killing_the_broker_kills_a_confined_worker` |
 
 **Does not stop:**
 
@@ -120,7 +127,10 @@ A trusted broker holds the `Gate` and serves `BrokerGate` requests over a Unix s
 | A process allowed to trace the worker or the broker | It can copy an inherited connection, as with `pidfd_getfd`, where the system's ptrace policy allows | none |
 | A full descriptor table when accepting | New connections wait in the listen backlog, with no error, until a descriptor frees. The broker keeps serving the connections it has. | `broker_serve.rs::a_full_descriptor_table_does_not_stop_the_broker` |
 | Idle connections up to the limit | An admitted peer can hold every slot. There is no idle timeout, because a worker may be idle between requests. | none |
-| A worker the embedder did not isolate | It can open files directly. As the same user, it can also signal the broker, or trace it where the system's ptrace policy allows. | none; the embedder's job |
+| A worker started with `--unconfined`, or served through the library and not isolated | It can open files directly. As the same user, it can also signal the broker, or trace it where the system's ptrace policy allows. | none; the operator's or embedder's job |
+| A compromised confined worker using its own connection | It gets whatever the grants allow; the broker cannot tell it from a healthy worker | none; by design |
+| A confined worker reading its runtime paths | Anything beneath `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, and `--direct` paths is readable, and those opens are not audited | none; by design |
+| A confined worker, beyond files | It keeps the network and can read file metadata anywhere. Before Linux 6.12 it can signal the broker and connect to abstract sockets; before 7.1 it can connect to pathname sockets. | none; see [section 2](#2-the-locked-process-linux) |
 | Files already delivered | They stay usable; the broker keeps no way to take them back | none |
 | A fork and exec racing a receive on macOS | `FD_CLOEXEC` is set just after `recvmsg`, so a program started in that window inherits the descriptor ([RFC 0003](rfcs/0003-broker-protocol.md#framing)) | none |
 | Changing policy while serving | `Broker::new` takes the gate, so a serving broker cannot revoke or narrow | none |
