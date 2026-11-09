@@ -5,8 +5,8 @@
 //! ```
 //!
 //! Rights letters: `r` read, `w` write, `c` create, `l` list.
-//! Without `--socket`, the child inherits a connection no other process can
-//! reach, names it in `FSGATE_BROKER_FD`, and adopts it with
+//! Without `--socket`, the child inherits a connection with no name in the
+//! filesystem, finds it in `FSGATE_BROKER_FD`, and adopts it with
 //! `fsgate::BrokerGate::from_inherited`. With `--socket`, the broker creates
 //! an owner-only socket at that path and the child receives the path in
 //! `FSGATE_BROKER_SOCKET`. The broker exits with the child's exit code; when
@@ -101,7 +101,7 @@ fn gate_from(grants: &[(PathBuf, Rights)]) -> Result<Gate, String> {
 }
 
 /// Serves the command over a socketpair it inherits. The connection has no
-/// name, so no other process can reach it.
+/// name, so no other process can connect to it.
 fn run_inherited(grants: &[(PathBuf, Rights)], command: &[String]) -> Result<ExitCode, String> {
     let broker = Broker::new(gate_from(grants)?);
     let (broker_end, worker_end) = UnixStream::pair()
@@ -163,8 +163,16 @@ fn run(args: SocketArgs) -> Result<ExitCode, String> {
     let broker = Broker::new(gate);
     std::thread::scope(|scope| {
         scope.spawn(|| {
-            // Ends when the listener errors, e.g. at process exit.
-            let _ = broker.serve(&listener);
+            // A broker that stopped accepting would leave workers hanging.
+            // Exiting fails them closed instead.
+            if let Err(err) = broker.serve(&listener) {
+                eprintln!(
+                    "fsgate-broker: serving `{}` failed: {err}; workers now fail closed",
+                    args.socket.display()
+                );
+                let _ = fs::remove_file(&args.socket);
+                std::process::exit(1);
+            }
         });
 
         let status = Command::new(&args.command[0])

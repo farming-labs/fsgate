@@ -10,7 +10,10 @@ use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::process::{Command, Stdio};
 
 use fsgate::{BrokerGate, GateError};
+#[cfg(target_os = "linux")]
+use fsgate::{Gate, LockPolicy, Rights};
 use rustix::io::FdFlags;
+use rustix::net::{AddressFamily, SocketType};
 
 fn in_child(scenario: &str) -> bool {
     env::var_os("FSGATE_CHILD").is_some_and(|child| child == scenario)
@@ -35,8 +38,8 @@ fn child_would_inherit(number: &str) -> bool {
         .success()
 }
 
-#[test]
-fn a_worker_is_served_over_an_inherited_connection() {
+/// Runs `scenario` as the command of the real broker, granted `granted/`.
+fn run_under_broker(scenario: &str) -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
     let granted = root.path().join("granted");
     let outside = root.path().join("outside");
@@ -47,7 +50,7 @@ fn a_worker_is_served_over_an_inherited_connection() {
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_fsgate-broker"));
     command.args(["--grant", &format!("{}:r", granted.display()), "--"]);
-    child_args(&mut command, "worker_scenario");
+    child_args(&mut command, scenario);
     let output = command
         .env("FSGATE_GRANTED", &granted)
         .env("FSGATE_OUTSIDE", &outside)
@@ -66,6 +69,12 @@ fn a_worker_is_served_over_an_inherited_connection() {
         stdout.contains("1 passed"),
         "the worker did not run: {stdout}"
     );
+    root
+}
+
+#[test]
+fn a_worker_is_served_over_an_inherited_connection() {
+    let root = run_under_broker("worker_scenario");
 
     // The connection has no name in the filesystem.
     let mut names: Vec<_> = fs::read_dir(root.path())
@@ -74,6 +83,29 @@ fn a_worker_is_served_over_an_inherited_connection() {
         .collect();
     names.sort();
     assert_eq!(names, ["granted", "outside"]);
+}
+
+/// From Linux 7.1 a lock refuses new connects to sockets created outside
+/// it, and an inherited connection is not a connect.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_inherited_connection_works_after_lock() {
+    run_under_broker("locked_worker_scenario");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn locked_worker_scenario() {
+    if !in_child("locked_worker_scenario") {
+        return;
+    }
+    let granted = env::var("FSGATE_GRANTED").unwrap();
+    let mut own = Gate::new();
+    own.grant(&granted, Rights::READ).unwrap();
+    own.lock_with(LockPolicy::BestEffort).expect("lock");
+
+    let mut gate = BrokerGate::from_inherited().expect("adopt after the lock");
+    assert!(gate.metadata(format!("{granted}/a.txt")).unwrap().is_file);
 }
 
 #[test]
@@ -146,6 +178,10 @@ fn from_inherited_refuses_anything_but_an_inherited_connection() {
 
     let file = File::open(env::current_exe().unwrap()).unwrap();
     assert_refused(Some(&inheritable(file.as_fd())), true, Stdio::null());
+
+    // A stream socket, so only its family can be why it is refused.
+    let inet = rustix::net::socket(AddressFamily::INET, SocketType::STREAM, None).unwrap();
+    assert_refused(Some(&inheritable(inet.as_fd())), true, Stdio::null());
 
     let (datagram, _peer) = UnixDatagram::pair().unwrap();
     assert_refused(Some(&inheritable(datagram.as_fd())), true, Stdio::null());

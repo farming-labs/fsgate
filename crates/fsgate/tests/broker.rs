@@ -291,6 +291,31 @@ fn serving(gate: Gate, path: &Path, options: ServeOptions) {
     thread::spawn(move || Broker::new(gate).serve_with(&listener, options));
 }
 
+/// Sends `bytes` on a new connection and returns everything the broker
+/// answers. The broker may hang up first, which each platform reports
+/// differently on the write and the read.
+fn raw_answer(socket: &Path, bytes: &[u8]) -> Vec<u8> {
+    let hung_up = |err: &std::io::Error| {
+        matches!(
+            err.kind(),
+            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::NotConnected
+        )
+    };
+    let mut stream = UnixStream::connect(socket).unwrap();
+    match stream.write_all(bytes) {
+        Ok(()) => {}
+        Err(err) if hung_up(&err) => {}
+        Err(err) => panic!("writing failed: {err}"),
+    }
+    let mut answer = Vec::new();
+    match stream.read_to_end(&mut answer) {
+        Ok(_) => {}
+        Err(err) if hung_up(&err) => {}
+        Err(err) => panic!("reading failed: {err}"),
+    }
+    answer
+}
+
 fn own_uid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
@@ -308,9 +333,9 @@ fn a_peer_of_another_user_gets_no_answer() {
     serving(gate, &socket, options);
 
     let planted = granted.join("planted.txt");
-    let mut client = BrokerGate::connect(&socket).unwrap();
-    let err = client.create(&planted).unwrap_err();
-    assert!(matches!(err, GateError::Broker { .. }), "got {err:?}");
+    let body = create_request(&planted);
+    let answer = raw_answer(&socket, &frame(body.len() as u32, &body));
+    assert!(answer.is_empty(), "the broker answered a refused peer");
     assert!(!planted.exists(), "the broker served a refused peer");
 }
 
@@ -347,9 +372,9 @@ fn connections_past_the_limit_are_closed_until_one_ends() {
     let mut first = BrokerGate::connect(&socket).unwrap();
     assert!(first.metadata(&file).unwrap().is_file);
 
-    let mut second = BrokerGate::connect(&socket).unwrap();
-    let err = second.metadata(&file).unwrap_err();
-    assert!(matches!(err, GateError::Broker { .. }), "got {err:?}");
+    let body = serde_json::json!({ "op": "metadata", "path": file }).to_string();
+    let answer = raw_answer(&socket, &frame(body.len() as u32, body.as_bytes()));
+    assert!(answer.is_empty(), "the broker answered past its limit");
 
     // The slot frees once the broker sees the hang-up, and nothing reports
     // that, so a new connection is retried until the deadline.

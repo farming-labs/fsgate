@@ -429,15 +429,16 @@ impl BrokerGate {
     /// Adopts the connection that `fsgate-broker`, run without `--socket`,
     /// named in the `FSGATE_BROKER_FD` environment variable ([RFC 0007]).
     ///
-    /// No other process can reach this connection, because it has no name
-    /// in the filesystem, and it needs no connect, so it works after
-    /// [`Gate::lock`]. Programs this process starts do not inherit it.
+    /// No other process can connect to it, because it has no name in the
+    /// filesystem, and it needs no connect, so it works after
+    /// [`Gate::lock`]. Programs this process starts after this call do not
+    /// inherit it. Adopt it first, because programs started before do.
     ///
     /// # Errors
     ///
     /// [`GateError::Broker`] if the variable is missing, does not name an
-    /// open Unix stream socket, or was already adopted: a descriptor has
-    /// one owner. A descriptor that is refused stays open.
+    /// inherited Unix stream socket, or was already adopted: a descriptor
+    /// has one owner. A descriptor that is refused stays open.
     ///
     /// [RFC 0007]: https://github.com/farming-labs/fsgate/blob/main/docs/rfcs/0007-broker-peers.md
     pub fn from_inherited() -> Result<BrokerGate, GateError> {
