@@ -36,6 +36,14 @@ jobs:
           tar -xzf target/package/fsgate-*.crate -C "$package_dir"
           test -f "$package_dir"/fsgate-*/LICENSE
           cargo test --locked --manifest-path "$package_dir"/fsgate-*/Cargo.toml
+          # Outside the repository `.cargo/config.toml` does not apply, so the
+          # experimental launcher must refuse to build.
+          cd "$package_dir"/fsgate-*
+          if cargo check --locked --features experimental-intercept 2>"$package_dir/refused"; then
+            echo "::error::the packaged crate built the experimental launcher"
+            exit 1
+          fi
+          grep --quiet "not part of this release" "$package_dir/refused"
       # The fuzz crate is its own workspace, and fuzzing needs nightly
       # (fuzz/README.md). Build and lint it on stable so it cannot rot.
       - run: cargo fmt --manifest-path fuzz/Cargo.toml --check

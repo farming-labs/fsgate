@@ -36,8 +36,9 @@ only with merged PR evidence.
 ## Verify the candidate
 
 Run from the workspace root. Packaging and publishing name `-p fsgate`
-explicitly. The experimental interception code builds only with
-`--features experimental-intercept`, so CI also checks that feature on
+explicitly. The experimental interception code builds only from this repository, with
+`--features experimental-intercept`. `.cargo/config.toml` allows it there,
+and CI checks that the packaged crate refuses it. CI also checks that feature on
 Linux, and its `kernels` job runs the packaged crate's tests on each
 declared kernel in a VM; run its tests on Linux x86_64 with a C compiler
 and static libc.

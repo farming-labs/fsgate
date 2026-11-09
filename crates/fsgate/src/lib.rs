@@ -30,6 +30,15 @@
 //! worker that holds no filesystem authority of its own, passing
 //! descriptors over a Unix socket to a [`BrokerGate`].
 
+// The experimental launcher (RFC 0004) is unreviewed and not part of a
+// release. The repository's `.cargo/config.toml` sets this cfg, and is not
+// in the published crate.
+#[cfg(all(feature = "experimental-intercept", not(fsgate_repository_build)))]
+compile_error!(
+    "`experimental-intercept` is not part of this release; build fsgate from its repository to \
+     use the experimental launcher"
+);
+
 mod audit;
 #[cfg(unix)]
 mod broker;

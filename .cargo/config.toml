@@ -1,0 +1,5 @@
+# Lets the experimental launcher (RFC 0004) build from this repository. The
+# published crate does not contain this file, so there the feature stops with
+# a compile error. See `crates/fsgate/src/lib.rs`.
+[build]
+rustflags = ["--cfg", "fsgate_repository_build"]
