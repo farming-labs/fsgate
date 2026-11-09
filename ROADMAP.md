@@ -147,10 +147,12 @@ Started. No part of fsgate has had an independent security review. These are the
   - The build is `d9aca86`, which includes the broker's descriptor fix from [#40](https://github.com/farming-labs/fsgate/pull/40).
 
   [`fuzz.yml`](.github/workflows/fuzz.yml) repeats this run when `broker.rs` or the harness changes. The control run was on macOS only.
+- [ ] [RFC 0007](docs/rfcs/0007-broker-peers.md): decide who can reach the broker: an inherited connection and owner-only sockets for `fsgate-broker`, and a peer check and connection limit in `Broker::serve`. Acceptance: the RFC is accepted with its open questions answered.
+- [ ] Implement RFC 0007. Acceptance: the RFC's tests pass on Linux and macOS, and the threat model's rows for other processes and for many connections cite them.
 - [ ] Independent security review of the handle layer, containment (including M8), broker, and audit sink. Acceptance: the reviewer, scope, reviewed commit, and findings are recorded; each finding is fixed or answered; and the README status says what was reviewed.
 - [ ] Release 0.2.0 through the trusted-publishing workflow, its first real run. Acceptance: the release job's verify step matches the uploaded, crates.io, and downloaded checksums and the `.cargo_vcs_info.json` commit. Before tagging, record two maintainer decisions here: whether 0.2.0 waits for M6 and the review, and whether it includes the `experimental-intercept` feature.
 
-Order: M8 first, because it changes what `lock()` means for existing users and its `LockStatus` change needs a minor release anyway. Then the threat model and fuzzing, then the review, then 0.2.0. M6's tasks are all done ([#35](https://github.com/farming-labs/fsgate/pull/35) closed the last); it remains unreviewed and unreleased.
+Order: M8 first, because it changes what `lock()` means for existing users and its `LockStatus` change needs a minor release anyway. Then the threat model and fuzzing, then RFC 0007, so the reviewer sees the final broker, then the review, then 0.2.0. M6's tasks are all done ([#35](https://github.com/farming-labs/fsgate/pull/35) closed the last); it remains unreviewed and unreleased.
 
 ## Out of scope for v1
 
