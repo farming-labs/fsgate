@@ -1,16 +1,30 @@
 //! Serve granted directories to a child command over a Unix socket.
 //!
 //! ```text
-//! fsgate-broker --grant <path>:<rights> [--grant ...] [--socket <path>] -- <command> [args...]
+//! fsgate-broker --grant <path>:<rights> [--grant ...] [--direct <path>:<rights> ...] \
+//!     [--env <name> ...] -- <command> [args...]
+//! fsgate-broker --unconfined --grant <path>:<rights> [--grant ...] [--socket <path>] \
+//!     -- <command> [args...]
 //! ```
 //!
 //! Rights letters: `r` read, `w` write, `c` create, `l` list.
-//! Without `--socket`, the child inherits a connection with no name in the
-//! filesystem, finds it in `FSGATE_BROKER_FD`, and adopts it with
-//! `fsgate::BrokerGate::from_inherited`. With `--socket`, the broker creates
-//! an owner-only socket at that path and the child receives the path in
-//! `FSGATE_BROKER_SOCKET`. The broker exits with the child's exit code; when
-//! the broker dies, every child filesystem operation fails closed.
+//! The child inherits a connection with no name in the filesystem, finds it
+//! in `FSGATE_BROKER_FD`, and adopts it with
+//! `fsgate::BrokerGate::from_inherited`. The broker exits with the child's
+//! exit code; when the broker dies, every child filesystem operation fails
+//! closed.
+//!
+//! On Linux the child is confined (RFC 0008): it can reach data only through
+//! the broker, it can still open the files an ordinary program needs to
+//! start, and it inherits no environment beyond the names given with `--env`.
+//! `--direct` adds a path the child may open itself, with the letters `r`,
+//! `l`, and `x` (execute); those opens are not audited. If confinement cannot
+//! be applied, on macOS or on a kernel without Landlock ABI v3, the child
+//! does not start.
+//!
+//! `--unconfined` starts the child with this process's own environment and
+//! filesystem access. `--socket`, which needs it, creates an owner-only
+//! socket at that path and passes the path in `FSGATE_BROKER_SOCKET`.
 //!
 //! Experimental interception mode (RFC 0004; built with the
 //! `experimental-intercept` feature, Linux x86_64 only, unsupported):
@@ -41,6 +55,29 @@ use std::process::{Command, ExitCode};
 
 use fsgate::{Broker, Gate, Rights};
 
+#[cfg(target_os = "linux")]
+#[path = "fsgate-broker/confine.rs"]
+mod confine;
+
+#[cfg(not(target_os = "linux"))]
+mod confine {
+    use std::os::fd::RawFd;
+    use std::process::Command;
+
+    pub(super) fn command(
+        _: RawFd,
+        _: &[String],
+        _: &[String],
+        _: &[String],
+    ) -> Result<Command, String> {
+        Err(
+            "this platform has no way for `fsgate-broker` to confine a worker; \
+             pass `--unconfined` to run it without confinement"
+                .into(),
+        )
+    }
+}
+
 struct Args {
     grants: Vec<(PathBuf, Rights)>,
     mode: Mode,
@@ -49,15 +86,33 @@ struct Args {
 
 enum Mode {
     /// Serve the grants to the command over a connection it inherits.
-    Inherited,
+    Inherited(Start),
     /// Serve the grants over a Unix socket at this path.
     Socket(PathBuf),
     /// Experimental: intercept the worker's file opens (RFC 0004).
     Intercept { apply: bool, audit: bool },
 }
 
+/// How the command of [`Mode::Inherited`] starts.
+enum Start {
+    /// Confined (RFC 0008), with these validated `--direct` specs and
+    /// `--env` names.
+    Confined {
+        direct: Vec<String>,
+        env: Vec<String>,
+    },
+    /// With this process's own environment and filesystem access.
+    Unconfined,
+}
+
 fn main() -> ExitCode {
-    let args = match parse_args(std::env::args().skip(1)) {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(target_os = "linux")]
+    if argv.first().is_some_and(|first| first == confine::ENTRY) {
+        return confine::main(argv.into_iter().skip(1));
+    }
+
+    let args = match parse_args(argv.into_iter()) {
         Ok(args) => args,
         Err(message) => {
             eprintln!("fsgate-broker: {message}");
@@ -72,7 +127,7 @@ fn main() -> ExitCode {
         command,
     } = args;
     let result = match mode {
-        Mode::Inherited => run_inherited(&grants, &command),
+        Mode::Inherited(start) => run_inherited(&grants, &command, start),
         Mode::Socket(socket) => run(SocketArgs {
             grants,
             socket,
@@ -102,7 +157,11 @@ fn gate_from(grants: &[(PathBuf, Rights)]) -> Result<Gate, String> {
 
 /// Serves the command over a socketpair it inherits. The connection has no
 /// name, so no other process can connect to it.
-fn run_inherited(grants: &[(PathBuf, Rights)], command: &[String]) -> Result<ExitCode, String> {
+fn run_inherited(
+    grants: &[(PathBuf, Rights)],
+    command: &[String],
+    start: Start,
+) -> Result<ExitCode, String> {
     let broker = Broker::new(gate_from(grants)?);
     let (broker_end, worker_end) = UnixStream::pair()
         .map_err(|err| format!("creating the worker's connection failed: {err}"))?;
@@ -111,9 +170,19 @@ fn run_inherited(grants: &[(PathBuf, Rights)], command: &[String]) -> Result<Exi
     rustix::io::fcntl_setfd(&worker_end, rustix::io::FdFlags::empty())
         .map_err(|err| format!("preparing the worker's connection failed: {err}"))?;
 
-    let mut child = Command::new(&command[0])
-        .args(&command[1..])
-        .env("FSGATE_BROKER_FD", worker_end.as_raw_fd().to_string())
+    let mut worker = match start {
+        Start::Confined { direct, env } => {
+            confine::command(worker_end.as_raw_fd(), &direct, &env, command)?
+        }
+        Start::Unconfined => {
+            let mut worker = Command::new(&command[0]);
+            worker
+                .args(&command[1..])
+                .env("FSGATE_BROKER_FD", worker_end.as_raw_fd().to_string());
+            worker
+        }
+    };
+    let mut child = worker
         .spawn()
         .map_err(|err| format!("spawning `{}` failed: {err}", command[0]))?;
     // Held open here, the broker would never see the worker hang up.
@@ -201,10 +270,13 @@ struct SocketArgs {
 }
 
 const USAGE: &str = "usage: fsgate-broker --grant <path>:<rights> [--grant ...] \
+                     [--direct <path>:<rights> ...] [--env <name> ...] -- <command> [args...]\n\
+                     \x20      fsgate-broker --unconfined --grant <path>:<rights> [--grant ...] \
                      [--socket <path>] -- <command> [args...]\n\
                      \x20      fsgate-broker --experimental-intercept --grant <path>:<rights> [--grant ...] \
                      [--audit] [--apply] -- <static-binary> [args...]\n\
-                     rights letters: r read, w write, c create, l list";
+                     rights letters: r read, w write, c create, l list; \
+                     for --direct: r read, l list, x execute";
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut grants = Vec::new();
@@ -212,6 +284,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut intercept = false;
     let mut apply = false;
     let mut audit = false;
+    let mut unconfined = false;
+    let mut direct = Vec::new();
+    let mut env = Vec::new();
     let mut command = Vec::new();
 
     while let Some(arg) = args.next() {
@@ -223,6 +298,22 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--socket" => {
                 let path = args.next().ok_or("`--socket` needs a path")?;
                 socket = Some(PathBuf::from(path));
+            }
+            "--unconfined" => unconfined = true,
+            "--direct" => {
+                let spec = args.next().ok_or("`--direct` needs `<path>:<rights>`")?;
+                parse_direct(&spec)?;
+                direct.push(spec);
+            }
+            "--env" => {
+                let name = args.next().ok_or("`--env` needs a variable name")?;
+                if name.is_empty() || name.contains('=') {
+                    return Err(format!(
+                        "`--env` takes a variable name, not `{name}`; \
+                         set the variable in the broker's environment"
+                    ));
+                }
+                env.push(name);
             }
             "--experimental-intercept" => intercept = true,
             "--apply" => apply = true,
@@ -242,18 +333,40 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     if command.is_empty() {
         return Err("a command after `--` is required".into());
     }
+    let shapes_confinement = !direct.is_empty() || !env.is_empty();
+    if unconfined && shapes_confinement {
+        return Err(
+            "`--direct` and `--env` describe a confined worker; drop them or drop `--unconfined`"
+                .into(),
+        );
+    }
     let mode = match (intercept, socket) {
         (true, Some(_)) => {
             return Err(
                 "`--socket` and `--experimental-intercept` are separate modes; pass one".into(),
             );
         }
+        (true, None) if unconfined || shapes_confinement => {
+            return Err(
+                "`--experimental-intercept` has its own worker profile; drop `--unconfined`, \
+                 `--direct`, and `--env`"
+                    .into(),
+            );
+        }
         (true, None) => Mode::Intercept { apply, audit },
         (false, _) if apply || audit => {
             return Err("`--apply` and `--audit` need `--experimental-intercept`".into());
         }
+        (false, Some(_)) if !unconfined => {
+            return Err(
+                "a worker that connects to `--socket` cannot be confined, because a confined \
+                 worker makes no new connections; drop `--socket` or pass `--unconfined`"
+                    .into(),
+            );
+        }
         (false, Some(socket)) => Mode::Socket(socket),
-        (false, None) => Mode::Inherited,
+        (false, None) if unconfined => Mode::Inherited(Start::Unconfined),
+        (false, None) => Mode::Inherited(Start::Confined { direct, env }),
     };
     Ok(Args {
         grants,
@@ -285,6 +398,25 @@ fn parse_grant(spec: &str) -> Result<(PathBuf, Rights), String> {
         return Err(format!("grant `{spec}` names no rights"));
     }
     Ok((PathBuf::from(path), rights))
+}
+
+/// Splits a `--direct` spec into its path and its letters, which are `r`,
+/// `l`, and `x`. A write the worker makes directly is one the broker never
+/// sees, so there is no `w` or `c`.
+fn parse_direct(spec: &str) -> Result<(PathBuf, &str), String> {
+    let (path, letters) = spec
+        .rsplit_once(':')
+        .ok_or_else(|| format!("`--direct {spec}` is not `<path>:<rights>`"))?;
+    if letters.is_empty() {
+        return Err(format!("`--direct {spec}` names no rights"));
+    }
+    if let Some(other) = letters.chars().find(|letter| !"rlx".contains(*letter)) {
+        return Err(format!(
+            "unknown rights letter `{other}` in `--direct {spec}`; use r, l, x, \
+             and `--grant` for anything the worker writes"
+        ));
+    }
+    Ok((PathBuf::from(path), letters))
 }
 
 #[cfg(all(

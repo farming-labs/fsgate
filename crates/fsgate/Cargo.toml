@@ -29,7 +29,8 @@ rustix = { version = "1.1.6", features = ["process", "termios"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.7"
-libc = { version = "0.2.191", optional = true }
+# `close_range` for the worker `fsgate-broker` confines (RFC 0008).
+libc = "0.2.191"
 rustix-linux-procfs = { version = "0.1.1", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -42,4 +43,4 @@ libc = "0.2.191"
 # `intercept::Launch` launcher. Not covered by semver; it may change or
 # disappear in any release. It builds only from the repository, whose
 # `.cargo/config.toml` allows it; the published crate refuses it.
-experimental-intercept = ["rustix/event", "rustix/fs", "dep:libc", "dep:rustix-linux-procfs"]
+experimental-intercept = ["rustix/event", "rustix/fs", "dep:rustix-linux-procfs"]

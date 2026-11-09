@@ -80,8 +80,9 @@ or local fallback; a worker that outlives its broker has no filesystem.
 
 Authenticating the peer beyond its user: [RFC 0007](0007-broker-peers.md)
 adds a uid check to `Broker::serve`, and any process of an admitted user
-that can connect has the broker's grants. The embedder must isolate the
-worker. The
+that can connect has the broker's grants. An embedder must isolate its
+worker; on Linux `fsgate-broker` confines the worker it starts
+([RFC 0008](0008-confine-broker-worker.md)). The
 [threat model](../threat-model.md#3-the-broker-and-its-worker) lists
 these limits with their tests.
 

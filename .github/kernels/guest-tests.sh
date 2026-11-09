@@ -4,8 +4,8 @@
 #
 # <results-dir> is shared read-write with the host. The host writes
 # `manifest-dir` (the unpacked crate), `tests` (every test executable, one
-# per line), and `no-landlock-tests` (the tests/launch.rs and tests/lock.rs
-# executables). This script
+# per line), and `no-landlock-tests` (the tests/launch.rs, tests/lock.rs, and
+# tests/broker_confined.rs executables). This script
 # writes `<mode>.kernel` (the guest's kernel release) first and
 # `<mode>.passed` last. The host requires both, so a guest that stops early
 # fails the job even if virtme-ng reports success.
@@ -32,8 +32,8 @@ supported)
     ;;
 no-landlock)
     # A filter that matched nothing would pass, so require the exact count:
-    # two launcher tests and three lock tests.
-    expected=5
+    # two launcher tests, three lock tests, and one confined broker test.
+    expected=6
     passed=0
     mapfile -t tests <"$results/no-landlock-tests"
     for test in "${tests[@]}"; do
