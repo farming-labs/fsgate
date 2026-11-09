@@ -1,14 +1,16 @@
 //! Serve granted directories to a child command over a Unix socket.
 //!
 //! ```text
-//! fsgate-broker --grant <path>:<rights> [--grant ...] --socket <path> -- <command> [args...]
+//! fsgate-broker --grant <path>:<rights> [--grant ...] [--socket <path>] -- <command> [args...]
 //! ```
 //!
 //! Rights letters: `r` read, `w` write, `c` create, `l` list.
-//! The child receives the socket path in `FSGATE_BROKER_SOCKET` and talks
-//! to it with `fsgate::BrokerGate`. The broker exits with the child's
-//! exit code; when the broker dies, every child filesystem operation
-//! fails closed.
+//! Without `--socket`, the child inherits a connection no other process can
+//! reach, names it in `FSGATE_BROKER_FD`, and adopts it with
+//! `fsgate::BrokerGate::from_inherited`. With `--socket`, the broker creates
+//! an owner-only socket at that path and the child receives the path in
+//! `FSGATE_BROKER_SOCKET`. The broker exits with the child's exit code; when
+//! the broker dies, every child filesystem operation fails closed.
 //!
 //! Experimental interception mode (RFC 0004; built with the
 //! `experimental-intercept` feature, Linux x86_64 only, unsupported):
@@ -29,8 +31,12 @@
 //! 2 for usage errors, 3 when the interception profile refuses the worker
 //! image.
 
-use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
+use std::fs::{self, Permissions};
+use std::io;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use fsgate::{Broker, Gate, Rights};
@@ -42,6 +48,8 @@ struct Args {
 }
 
 enum Mode {
+    /// Serve the grants to the command over a connection it inherits.
+    Inherited,
     /// Serve the grants over a Unix socket at this path.
     Socket(PathBuf),
     /// Experimental: intercept the worker's file opens (RFC 0004).
@@ -63,30 +71,89 @@ fn main() -> ExitCode {
         mode,
         command,
     } = args;
-    match mode {
-        Mode::Socket(socket) => match run(SocketArgs {
+    let result = match mode {
+        Mode::Inherited => run_inherited(&grants, &command),
+        Mode::Socket(socket) => run(SocketArgs {
             grants,
             socket,
             command,
-        }) {
-            Ok(code) => code,
-            Err(message) => {
-                eprintln!("fsgate-broker: {message}");
-                ExitCode::from(1)
-            }
-        },
-        Mode::Intercept { apply, audit } => intercept::run(&grants, &command, apply, audit),
+        }),
+        Mode::Intercept { apply, audit } => {
+            return intercept::run(&grants, &command, apply, audit);
+        }
+    };
+    match result {
+        Ok(code) => code,
+        Err(message) => {
+            eprintln!("fsgate-broker: {message}");
+            ExitCode::from(1)
+        }
     }
 }
 
-fn run(args: SocketArgs) -> Result<ExitCode, String> {
+fn gate_from(grants: &[(PathBuf, Rights)]) -> Result<Gate, String> {
     let mut gate = Gate::new();
-    for (path, rights) in &args.grants {
+    for (path, rights) in grants {
         gate.grant(path, *rights)
             .map_err(|err| format!("granting `{}` failed: {err}", path.display()))?;
     }
+    Ok(gate)
+}
 
-    let listener = UnixListener::bind(&args.socket).map_err(|err| {
+/// Serves the command over a socketpair it inherits. The connection has no
+/// name, so no other process can reach it.
+fn run_inherited(grants: &[(PathBuf, Rights)], command: &[String]) -> Result<ExitCode, String> {
+    let broker = Broker::new(gate_from(grants)?);
+    let (broker_end, worker_end) = UnixStream::pair()
+        .map_err(|err| format!("creating the worker's connection failed: {err}"))?;
+    // std makes both ends close-on-exec. Clearing that on the worker's end
+    // lets the command inherit it, and this process starts nothing else.
+    rustix::io::fcntl_setfd(&worker_end, rustix::io::FdFlags::empty())
+        .map_err(|err| format!("preparing the worker's connection failed: {err}"))?;
+
+    let mut child = Command::new(&command[0])
+        .args(&command[1..])
+        .env("FSGATE_BROKER_FD", worker_end.as_raw_fd().to_string())
+        .spawn()
+        .map_err(|err| format!("spawning `{}` failed: {err}", command[0]))?;
+    // Held open here, the broker would never see the worker hang up.
+    drop(worker_end);
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            // A failed connection fails the worker closed; it does not end
+            // the broker, which waits for the worker's exit code.
+            let _ = broker.serve_conn(broker_end);
+        });
+        let status = child
+            .wait()
+            .map_err(|err| format!("waiting for `{}` failed: {err}", command[0]))?;
+        std::process::exit(status.code().unwrap_or(1))
+    })
+}
+
+/// Creates an owner-only socket at `path`. A connect before `listen` is
+/// refused, so setting the mode between `bind` and `listen` means the
+/// socket is never reachable while the umask's looser mode applies.
+fn bind_owner_only(path: &Path) -> io::Result<UnixListener> {
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketType};
+
+    let socket = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None)?;
+    rustix::io::fcntl_setfd(&socket, rustix::io::FdFlags::CLOEXEC)?;
+    rustix::net::bind(&socket, &SocketAddrUnix::new(path)?)?;
+    let ready = fs::set_permissions(path, Permissions::from_mode(0o600))
+        .and_then(|()| Ok(rustix::net::listen(&socket, 128)?));
+    if let Err(err) = ready {
+        let _ = fs::remove_file(path);
+        return Err(err);
+    }
+    Ok(UnixListener::from(socket))
+}
+
+fn run(args: SocketArgs) -> Result<ExitCode, String> {
+    let gate = gate_from(&args.grants)?;
+
+    let listener = bind_owner_only(&args.socket).map_err(|err| {
         format!(
             "binding socket `{}` failed: {err}; remove a stale socket file first",
             args.socket.display()
@@ -126,7 +193,7 @@ struct SocketArgs {
 }
 
 const USAGE: &str = "usage: fsgate-broker --grant <path>:<rights> [--grant ...] \
-                     --socket <path> -- <command> [args...]\n\
+                     [--socket <path>] -- <command> [args...]\n\
                      \x20      fsgate-broker --experimental-intercept --grant <path>:<rights> [--grant ...] \
                      [--audit] [--apply] -- <static-binary> [args...]\n\
                      rights letters: r read, w write, c create, l list";
@@ -178,7 +245,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             return Err("`--apply` and `--audit` need `--experimental-intercept`".into());
         }
         (false, Some(socket)) => Mode::Socket(socket),
-        (false, None) => return Err("`--socket` is required".into()),
+        (false, None) => Mode::Inherited,
     };
     Ok(Args {
         grants,

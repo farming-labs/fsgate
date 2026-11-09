@@ -1,6 +1,6 @@
 # RFC 0007: decide who can reach the broker
 
-- Status: accepted ([#46](https://github.com/farming-labs/fsgate/pull/46))
+- Status: accepted ([#46](https://github.com/farming-labs/fsgate/pull/46)); implemented in [#47](https://github.com/farming-labs/fsgate/pull/47) and [#48](https://github.com/farming-labs/fsgate/pull/48)
 - Date: 2026-11-08
 - Roadmap: [M9](../../ROADMAP.md#m9--review-readiness-and-020)
 - Builds on: [RFC 0003](0003-broker-protocol.md) (broker protocol), the [threat model](../threat-model.md#3-the-broker-and-its-worker)
