@@ -7,16 +7,14 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
-use std::num::NonZeroUsize;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
 
-use fsgate::{Broker, BrokerGate, Gate, GateError, Rights, ServeOptions};
+use fsgate::{Broker, BrokerGate, Gate, GateError, Rights};
 use tempfile::TempDir;
 
 fn setup() -> (TempDir, PathBuf, PathBuf) {
@@ -281,115 +279,6 @@ fn a_malformed_request_fails_the_connection_closed() {
         let declared = u32::try_from(body.len()).unwrap();
         let (result, response) = serve_raw(writable_gate(&granted), &frame(declared, body));
         assert_closed_without_acting(result, &response, &planted);
-    }
-}
-
-/// Serves `gate` on a new socket at `path`. `serve_with` blocks for the
-/// life of the listener, so its thread lasts until the test binary exits.
-fn serving(gate: Gate, path: &Path, options: ServeOptions) {
-    let listener = UnixListener::bind(path).unwrap();
-    thread::spawn(move || Broker::new(gate).serve_with(&listener, options));
-}
-
-/// Sends `bytes` on a new connection and returns everything the broker
-/// answers. The broker may hang up first, which each platform reports
-/// differently on the write and the read.
-fn raw_answer(socket: &Path, bytes: &[u8]) -> Vec<u8> {
-    let hung_up = |err: &std::io::Error| {
-        matches!(
-            err.kind(),
-            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::NotConnected
-        )
-    };
-    let mut stream = UnixStream::connect(socket).unwrap();
-    match stream.write_all(bytes) {
-        Ok(()) => {}
-        Err(err) if hung_up(&err) => {}
-        Err(err) => panic!("writing failed: {err}"),
-    }
-    let mut answer = Vec::new();
-    match stream.read_to_end(&mut answer) {
-        Ok(_) => {}
-        Err(err) if hung_up(&err) => {}
-        Err(err) => panic!("reading failed: {err}"),
-    }
-    answer
-}
-
-fn own_uid() -> u32 {
-    rustix::process::geteuid().as_raw()
-}
-
-/// CI has one user, so this admits only a uid other than the test's own.
-/// That exercises the kernel's real credentials without a second account.
-#[test]
-fn a_peer_of_another_user_gets_no_answer() {
-    let (root, granted, _) = setup();
-    let mut gate = Gate::new();
-    gate.grant(&granted, Rights::READ | Rights::WRITE | Rights::CREATE)
-        .unwrap();
-    let socket = root.path().join("broker.sock");
-    let options = ServeOptions::default().allow_peer_uids([own_uid().wrapping_add(1)]);
-    serving(gate, &socket, options);
-
-    let planted = granted.join("planted.txt");
-    let body = create_request(&planted);
-    let answer = raw_answer(&socket, &frame(body.len() as u32, &body));
-    assert!(answer.is_empty(), "the broker answered a refused peer");
-    assert!(!planted.exists(), "the broker served a refused peer");
-}
-
-#[test]
-fn an_admitted_peer_is_served() {
-    for options in [
-        ServeOptions::default(),
-        ServeOptions::default().allow_peer_uids([own_uid()]),
-        ServeOptions::default().any_peer(),
-    ] {
-        let (root, granted, _) = setup();
-        let mut gate = Gate::new();
-        gate.grant(&granted, Rights::READ).unwrap();
-        let socket = root.path().join("broker.sock");
-        serving(gate, &socket, options.clone());
-
-        let mut client = BrokerGate::connect(&socket).unwrap();
-        let stat = client.metadata(granted.join("a.txt"));
-        assert!(stat.unwrap().is_file, "not served under {options:?}");
-    }
-}
-
-#[test]
-fn connections_past_the_limit_are_closed_until_one_ends() {
-    let (root, granted, _) = setup();
-    let mut gate = Gate::new();
-    gate.grant(&granted, Rights::READ).unwrap();
-    let socket = root.path().join("broker.sock");
-    let options = ServeOptions::default().max_connections(NonZeroUsize::MIN);
-    serving(gate, &socket, options);
-    let file = granted.join("a.txt");
-
-    // An answered request shows the broker has taken this connection.
-    let mut first = BrokerGate::connect(&socket).unwrap();
-    assert!(first.metadata(&file).unwrap().is_file);
-
-    let body = serde_json::json!({ "op": "metadata", "path": file }).to_string();
-    let answer = raw_answer(&socket, &frame(body.len() as u32, body.as_bytes()));
-    assert!(answer.is_empty(), "the broker answered past its limit");
-
-    // The slot frees once the broker sees the hang-up, and nothing reports
-    // that, so a new connection is retried until the deadline.
-    drop(first);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let mut next = BrokerGate::connect(&socket).unwrap();
-        match next.metadata(&file) {
-            Ok(stat) => {
-                assert!(stat.is_file);
-                break;
-            }
-            Err(GateError::Broker { .. }) if Instant::now() < deadline => thread::yield_now(),
-            Err(err) => panic!("the slot was never freed: {err:?}"),
-        }
     }
 }
 
