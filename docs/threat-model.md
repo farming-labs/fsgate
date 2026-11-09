@@ -104,8 +104,8 @@ A trusted broker holds the `Gate` and serves `BrokerGate` requests over a Unix s
 | A directory entry name that is not UTF-8 | Refused, never transcoded | `broker.rs::a_directory_entry_name_that_is_not_utf8_is_refused` (Linux only; APFS refuses such names) |
 | Arbitrary bytes from the worker | No panic, hang, sanitizer report, or delivered descriptor outside the grant in the recorded fuzzing runs on macOS and Linux | the [`broker_requests` fuzz target](../fuzz/README.md), not a test; runs recorded in [M9](../ROADMAP.md#m9--review-readiness-and-020) |
 | Descriptors the worker attaches to a request, even split across many messages | The broker closes the connection without acting at the first one, and closes what it received, even as many as one message can carry. A message the kernel reports truncated, as when the broker's descriptor table is full, fails the connection closed. | `broker_attached_descriptors.rs::a_request_that_carries_descriptors_fails_the_connection_closed`, `broker_attached_descriptors.rs::the_first_descriptor_ends_a_request_split_across_messages`, `broker_attached_descriptors.rs::a_request_whose_descriptors_cannot_be_received_fails_the_connection_closed` (Linux only) |
-| A peer of another user connecting through `Broker::serve` | Closed with no answer and no side effect, unless the embedder admits that uid | `broker.rs::a_peer_of_another_user_gets_no_answer` |
-| More connections than the limit through `Broker::serve` | Each one past the limit (64 by default) is closed at once, and served again once a slot frees | `broker.rs::connections_past_the_limit_are_closed_until_one_ends` |
+| A peer of another user connecting through `Broker::serve` | Closed with no answer and no side effect, unless the embedder admits that uid | `broker_serve.rs::a_peer_of_another_user_gets_no_answer` |
+| More connections than the limit through `Broker::serve` | Each one past the limit (64 by default) is closed at once, and served again once a slot frees | `broker_serve.rs::connections_past_the_limit_are_closed_until_one_ends` |
 
 **Does not stop:**
 
@@ -113,6 +113,7 @@ A trusted broker holds the `Gate` and serves `BrokerGate` requests over a Unix s
 |---|---|---|
 | Another process of an admitted user connecting to the socket | It gets the grants: `Broker::serve` checks the peer's user, not its program. `fsgate-broker` binds with the process umask, and `serve_conn` checks nothing because its caller chose the stream. | none |
 | A peer in another user namespace whose uid does not map into the broker's | Linux reports an unmapped uid as the overflow uid ([`user_namespaces(7)`](https://man7.org/linux/man-pages/man7/user_namespaces.7.html)), 65534 by default, so a broker running as that uid would admit it | none; from the man page, not run |
+| A full descriptor table when accepting | New connections wait in the listen backlog, with no error, until a descriptor frees. The broker keeps serving the connections it has. | `broker_serve.rs::a_full_descriptor_table_does_not_stop_the_broker` |
 | Idle connections up to the limit | An admitted peer can hold every slot. There is no idle timeout, because a worker may be idle between requests. | none |
 | A worker the embedder did not isolate | It can open files directly. As the same user, it can also signal the broker, or trace it where the system's ptrace policy allows. | none; the embedder's job |
 | Files already delivered | They stay usable; the broker keeps no way to take them back | none |

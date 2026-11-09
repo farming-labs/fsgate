@@ -20,6 +20,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -199,6 +200,20 @@ fn is_admitted(stream: &UnixStream, allowed: Option<&[u32]>) -> bool {
     }
 }
 
+/// How long `serve` waits before retrying after running out of a resource.
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+
+/// Whether `accept` failed for lack of something that can come back, as
+/// opposed to the listener itself failing.
+fn is_temporary(err: &io::Error) -> bool {
+    use rustix::io::Errno;
+
+    matches!(
+        Errno::from_io_error(err),
+        Some(Errno::MFILE | Errno::NFILE | Errno::NOBUFS | Errno::NOMEM | Errno::CONNABORTED)
+    )
+}
+
 /// One served connection, counted until it ends, even by a panic.
 struct Slot<'a>(&'a AtomicUsize);
 
@@ -229,9 +244,10 @@ impl Broker {
 
     /// Accepts connections forever, serving each admitted one on its own
     /// thread. A connection that is not admitted is closed with no answer.
-    /// Returns only when the listener fails, or at once with
-    /// [`io::ErrorKind::Unsupported`] if `options` needs a peer's identity
-    /// and this platform cannot provide it.
+    /// While the process is out of descriptors, new connections wait in
+    /// the listen backlog. Returns only when the listener fails, or at once
+    /// with [`io::ErrorKind::Unsupported`] if `options` needs a peer's
+    /// identity and this platform cannot provide it.
     pub fn serve_with(&self, listener: &UnixListener, options: ServeOptions) -> io::Result<()> {
         let allowed = options.allowed_uids()?;
         let active = AtomicUsize::new(0);
@@ -240,6 +256,13 @@ impl Broker {
             loop {
                 let (stream, _) = match listener.accept() {
                     Ok(conn) => conn,
+                    // Connections being served can free what ran out, and
+                    // the new one waits in the listen backlog. Retrying at
+                    // once would spin.
+                    Err(err) if is_temporary(&err) => {
+                        std::thread::sleep(ACCEPT_RETRY);
+                        continue;
+                    }
                     Err(err) => return Err(err),
                 };
                 // Checked first, so a refused peer cannot use up the limit.
