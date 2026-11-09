@@ -1,6 +1,6 @@
 # RFC 0008: confine the worker `fsgate-broker` starts
 
-- Status: accepted; implementation not yet merged
+- Status: accepted and implemented in [#51](https://github.com/farming-labs/fsgate/pull/51)
 - Date: 2026-11-09
 - Roadmap: [M9](../../ROADMAP.md#m9--review-readiness-and-020)
 - Builds on: [RFC 0003](0003-broker-protocol.md) (broker protocol), [RFC 0004](0004-filesystem-interception.md) (the launcher's worker profile), [RFC 0006](0006-lock-restrictions.md) (restrictions at `lock()`), [RFC 0007](0007-broker-peers.md) (the inherited connection), the [threat model](../threat-model.md#3-the-broker-and-its-worker)
@@ -243,6 +243,7 @@ Accepted by the maintainer, with these answers:
 
 ## Open question
 
-Is the default path list right? CI's systems are its first measurement,
-and some layouts will need `--direct`, such as NixOS with
+Is the default path list right? It starts dynamically linked programs on
+CI's Ubuntu 26.04 systems, and that is all it has been measured on. Some
+layouts will need `--direct`, such as NixOS with
 `--direct /nix/store:rlx`.

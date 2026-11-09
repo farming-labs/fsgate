@@ -149,8 +149,16 @@ Started. No part of fsgate has had an independent security review. These are the
   [`fuzz.yml`](.github/workflows/fuzz.yml) repeats this run when `broker.rs` or the harness changes. The control run was on macOS only.
 - [x] [RFC 0007](docs/rfcs/0007-broker-peers.md) ([#46](https://github.com/farming-labs/fsgate/pull/46)): decide who can reach the broker: an inherited connection and owner-only sockets for `fsgate-broker`, and a peer check and connection limit in `Broker::serve`. Acceptance: the RFC is accepted with its open questions answered.
 - [x] Implement RFC 0007 ([#47](https://github.com/farming-labs/fsgate/pull/47), [#48](https://github.com/farming-labs/fsgate/pull/48)). Acceptance: the RFC's tests pass on Linux and macOS, and the threat model's rows for other processes and for many connections cite them.
-- [ ] [RFC 0008](docs/rfcs/0008-confine-broker-worker.md): confine the worker `fsgate-broker` starts, so a compromised worker cannot skip the broker on Linux. Acceptance: the RFC is accepted with its decisions recorded.
-- [ ] Implement RFC 0008. Acceptance: the RFC's tests pass on Linux 6.6, Linux 7.3, and macOS, and the threat model's rows for a confined worker cite them.
+- [x] [RFC 0008](docs/rfcs/0008-confine-broker-worker.md) ([#51](https://github.com/farming-labs/fsgate/pull/51)): confine the worker `fsgate-broker` starts, so a compromised worker cannot skip the broker on Linux. Acceptance: the RFC is accepted with its decisions recorded.
+- [x] Implement RFC 0008 ([#51](https://github.com/farming-labs/fsgate/pull/51)). Acceptance: the RFC's tests pass on Linux 6.6, Linux 7.3, and macOS, and the threat model's rows for a confined worker cite them.
+
+  Evidence comes from [CI](https://github.com/farming-labs/fsgate/actions/runs/42697211561) on `6153b3c`. On Linux 6.6.162 and 7.3.3 (the `kernels` job, release build of the packaged crate) and the `ubuntu-26.04` runners' own kernel, the real `fsgate-broker` ran each scenario in `tests/broker_confined.rs`:
+  - A worker's direct read and create outside the grants fail with `EACCES`, and no file appears. A program it starts is confined too. The control run with `--unconfined` succeeds at both.
+  - A file the broker serves is refused when opened directly, so the grants did not become worker rules.
+  - A descriptor the parent left open is closed in the worker, and a variable is absent unless named with `--env`.
+  - Killing the broker kills the worker. The unconfined control keeps running.
+
+  In the boot with `lsm=capability`, on both kernels, the broker exits 1, names `--unconfined`, and the worker's marker is absent. macOS refuses the same way. Two tests are indirect: the session check stands in for `TIOCSTI`, and reading `/proc/<pid>/environ` stands in for `PTRACE_ATTACH`. The default paths have been measured only on Ubuntu 26.04. Not independently reviewed.
 - [ ] Independent security review of the handle layer, containment (including M8), broker, and audit sink. Acceptance: the reviewer, scope, reviewed commit, and findings are recorded; each finding is fixed or answered; and the README status says what was reviewed.
 - [ ] Release 0.2.0 through the trusted-publishing workflow, its first real run. Acceptance: the release job's verify step matches the uploaded, crates.io, and downloaded checksums and the `.cargo_vcs_info.json` commit. Before tagging, record two maintainer decisions here: whether 0.2.0 waits for M6 and the review, and whether it includes the `experimental-intercept` feature.
 
