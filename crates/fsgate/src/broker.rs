@@ -33,6 +33,14 @@ const MAX_FRAME_BYTES: usize = 1 << 20;
 /// reporting them, so nothing could ever close them.
 const MAX_FDS_PER_MESSAGE: usize = 254;
 
+/// Whether a frame may arrive with descriptors. Responses may; requests
+/// carry none (RFC 0003).
+#[derive(Clone, Copy, PartialEq)]
+enum Descriptors {
+    Accept,
+    Refuse,
+}
+
 /// Received descriptors must not survive `exec`, like every file std
 /// opens. Linux marks them close-on-exec atomically inside `recvmsg`;
 /// other platforms mark them right after it (see [`read_frame`]).
@@ -123,8 +131,8 @@ impl Broker {
     /// Serves one connection until the peer hangs up.
     pub fn serve_conn(&self, mut stream: UnixStream) -> io::Result<()> {
         loop {
-            let frame = match read_frame(&mut stream) {
-                Ok((frame, _fds)) => frame,
+            let frame = match read_frame(&mut stream, Descriptors::Refuse) {
+                Ok((frame, _)) => frame,
                 // Peer closed between requests: a normal end.
                 Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
                 Err(err) => return Err(err),
@@ -323,7 +331,8 @@ impl BrokerGate {
             message: format!("encoding the request failed: {err}"),
         })?;
         write_frame(&mut self.stream, &body, None).map_err(transport_lost)?;
-        let (frame, fds) = read_frame(&mut self.stream).map_err(transport_lost)?;
+        let (frame, fds) =
+            read_frame(&mut self.stream, Descriptors::Accept).map_err(transport_lost)?;
         let response: Response =
             serde_json::from_slice(&frame).map_err(|err| GateError::Broker {
                 message: format!("broker sent a malformed response: {err}"),
@@ -436,7 +445,10 @@ fn write_frame(stream: &mut UnixStream, body: &[u8], fd: Option<BorrowedFd>) -> 
 /// Without `MSG_CMSG_CLOEXEC` (macOS and other non-Linux systems), a
 /// thread that forks and execs between `recvmsg` and `fcntl` can still
 /// inherit a descriptor; nothing outside the kernel can close that window.
-fn read_frame(stream: &mut UnixStream) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
+fn read_frame(
+    stream: &mut UnixStream,
+    descriptors: Descriptors,
+) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
     let mut fds = Vec::new();
     let mut acc: Vec<u8> = Vec::new();
     let mut expected: Option<usize> = None;
@@ -500,6 +512,15 @@ fn read_frame(stream: &mut UnixStream) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "peer attached more descriptors than could be received",
+            ));
+        }
+        if descriptors == Descriptors::Refuse && !fds.is_empty() {
+            // Refused at the first one, before the rest of the frame, so a
+            // peer cannot pile them up by splitting a request across
+            // messages. Returning closes what was received.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "peer attached a file descriptor to a request; requests carry none",
             ));
         }
         if received.bytes == 0 {
