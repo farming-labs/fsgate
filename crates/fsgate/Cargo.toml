@@ -1,6 +1,6 @@
 [package]
 name = "fsgate"
-version = "0.1.1"
+version = "0.2.0"
 description = "Filesystem authority as directory handles granted up front, enforced by the kernel."
 readme = "README.md"
 edition.workspace = true
