@@ -13,6 +13,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
+use std::time::Duration;
 
 use fsgate::{Broker, BrokerGate, Gate, GateError, Rights};
 use tempfile::TempDir;
@@ -230,6 +231,42 @@ fn assert_closed_without_acting(result: std::io::Result<()>, response: &[u8], pl
         !planted.exists(),
         "the broker acted on a protocol violation"
     );
+}
+
+/// The protocol is lockstep, so a response is matched to a request only by
+/// its position. After one is lost, the next response to arrive belongs to
+/// the wrong request, and `open` would hand back the wrong file.
+#[test]
+fn a_lost_response_fails_every_later_request_closed() {
+    let (client, mut broker) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let mut gate = BrokerGate::from_stream(client);
+
+    // The broker has not answered yet, so the read times out.
+    let err = gate.metadata("/first").unwrap_err();
+    assert!(matches!(err, GateError::Broker { .. }), "got {err:?}");
+
+    // The answer to the first request arrives late.
+    let body = br#"{"result":"stat","stat":{"is_dir":false,"is_file":true,"len":111}}"#;
+    broker
+        .write_all(&frame(body.len() as u32, body))
+        .expect("answer the first request");
+
+    match gate.metadata("/second") {
+        Err(GateError::Broker { message }) => assert!(message.contains("earlier"), "{message}"),
+        Err(other) => panic!("expected a broker error, got {other:?}"),
+        Ok(stat) => panic!("the answer to /first was returned for /second: {stat:?}"),
+    }
+
+    // Refused without asking: only the first request ever reached the broker.
+    broker.set_nonblocking(true).unwrap();
+    let mut sent = Vec::new();
+    let _ = broker.read_to_end(&mut sent);
+    let first = String::from_utf8_lossy(&sent);
+    assert!(first.contains("/first"), "{first}");
+    assert!(!first.contains("/second"), "{first}");
 }
 
 /// A frame is exactly as long as its prefix says (RFC 0003). A request
