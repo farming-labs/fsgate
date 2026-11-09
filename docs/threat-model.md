@@ -97,6 +97,7 @@ A trusted broker holds the `Gate` and serves `BrokerGate` requests over a Unix s
 | A request for an ungranted path, or beyond a grant's rights | The typed `GateError` crosses the wire; no side effect | `broker.rs::denials_cross_the_wire_typed_and_leave_no_side_effect` |
 | A worker that tries to influence the decision | The request carries only an operation and a path; the broker's gate decides and audits | `audit.rs::broker_decisions_are_audited_server_side` |
 | A worker that outlives its broker | Every later operation fails with `GateError::Broker`, with no reconnect | `broker.rs::dead_broker_fails_every_operation_closed`, `broker.rs::broker_binary_serves_and_dies_closed` |
+| A response that is lost, as to a read timeout on the worker's stream | Every later request on that connection fails with `GateError::Broker`, because answers can no longer be matched to requests | `broker.rs::a_lost_response_fails_every_later_request_closed` |
 | A delivered file leaking into programs the worker runs | Received descriptors are close-on-exec | `broker.rs::delivered_descriptors_do_not_leak_into_spawned_programs` |
 | A frame over 1 MiB | The broker closes the connection before reading the body | `broker.rs::a_prefix_over_the_size_limit_fails_the_connection_closed` |
 | A length prefix shorter than the bytes that follow it | The broker closes the connection without acting | `broker.rs::bytes_beyond_the_declared_length_fail_the_connection_closed` |

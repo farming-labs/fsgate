@@ -38,7 +38,9 @@ can carry (253 on Linux, 254 on macOS), because macOS installs the ones
 that do not fit without reporting them, where nothing could close them.
 A message the kernel reports truncated anyway fails the connection
 closed.
-The client is strictly lockstep: one request, then its response.
+The client is strictly lockstep: one request, then its response. A client
+that loses a response can no longer match later ones to requests, so it
+fails every later request closed.
 
 ### Messages
 

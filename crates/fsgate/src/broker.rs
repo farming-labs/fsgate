@@ -261,6 +261,10 @@ fn error_response(err: GateError) -> Response {
 /// [`File`]s — the descriptor itself travels over the socket.
 pub struct BrokerGate {
     stream: UnixStream,
+    /// A request is outstanding whose response was not read whole. The
+    /// protocol is lockstep, so responses can no longer be matched to
+    /// requests on this connection.
+    out_of_step: bool,
 }
 
 impl BrokerGate {
@@ -286,12 +290,15 @@ impl BrokerGate {
                 ),
             }
         })?;
-        Ok(BrokerGate { stream })
+        Ok(BrokerGate::from_stream(stream))
     }
 
     /// Wraps an already-connected stream (e.g. an inherited socketpair).
     pub fn from_stream(stream: UnixStream) -> BrokerGate {
-        BrokerGate { stream }
+        BrokerGate {
+            stream,
+            out_of_step: false,
+        }
     }
 
     /// Opens an existing file for reading via the broker.
@@ -327,9 +334,18 @@ impl BrokerGate {
     }
 
     fn request(&mut self, request: &Request) -> Result<(Response, Vec<OwnedFd>), GateError> {
+        if self.out_of_step {
+            return Err(GateError::Broker {
+                message: "an earlier request lost its response, so this connection can no \
+                          longer match answers to requests; all filesystem operations fail \
+                          closed; open a new connection"
+                    .into(),
+            });
+        }
         let body = serde_json::to_vec(request).map_err(|err| GateError::Broker {
             message: format!("encoding the request failed: {err}"),
         })?;
+        self.out_of_step = true;
         write_frame(&mut self.stream, &body, None).map_err(transport_lost)?;
         let (frame, fds) =
             read_frame(&mut self.stream, Descriptors::Accept).map_err(transport_lost)?;
@@ -337,6 +353,7 @@ impl BrokerGate {
             serde_json::from_slice(&frame).map_err(|err| GateError::Broker {
                 message: format!("broker sent a malformed response: {err}"),
             })?;
+        self.out_of_step = false;
         if let Response::Error { error } = response {
             return Err(remote_error(error));
         }
@@ -428,12 +445,14 @@ fn write_frame(stream: &mut UnixStream, body: &[u8], fd: Option<BorrowedFd>) -> 
             vec![std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(1))];
         let mut ancillary = rustix::net::SendAncillaryBuffer::new(&mut space);
         ancillary.push(rustix::net::SendAncillaryMessage::ScmRights(&fds));
-        sent = rustix::net::sendmsg(
-            &*stream,
-            &[IoSlice::new(&frame)],
-            &mut ancillary,
-            rustix::net::SendFlags::empty(),
-        )?;
+        sent = rustix::io::retry_on_intr(|| {
+            rustix::net::sendmsg(
+                &*stream,
+                &[IoSlice::new(&frame)],
+                &mut ancillary,
+                rustix::net::SendFlags::empty(),
+            )
+        })?;
     }
     stream.write_all(&frame[sent..])
 }
@@ -487,12 +506,14 @@ fn read_frame(
             rustix::cmsg_space!(ScmRights(MAX_FDS_PER_MESSAGE))
         ];
         let mut ancillary = rustix::net::RecvAncillaryBuffer::new(&mut space);
-        let received = rustix::net::recvmsg(
-            &*stream,
-            &mut [IoSliceMut::new(&mut buf)],
-            &mut ancillary,
-            RECV_FLAGS,
-        )?;
+        let received = rustix::io::retry_on_intr(|| {
+            rustix::net::recvmsg(
+                &*stream,
+                &mut [IoSliceMut::new(&mut buf)],
+                &mut ancillary,
+                RECV_FLAGS,
+            )
+        })?;
         for message in ancillary.drain() {
             if let rustix::net::RecvAncillaryMessage::ScmRights(received_fds) = message {
                 for fd in received_fds {
