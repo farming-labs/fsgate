@@ -14,9 +14,9 @@ Not independently reviewed.
 - Where `fsgate-broker` cannot confine a worker, on macOS or on a kernel without Landlock ABI v3, the worker does not start. To keep the old behavior, pass `--unconfined`.
 - `fsgate-broker --socket` requires `--unconfined`, because a confined worker makes no new connections.
 
-## 0.2.0 (unreleased)
+## 0.2.0 (2026-11-09)
 
-Not independently reviewed. Everything behind the `experimental-intercept` feature is not part of this release: it builds only from the repository, and the published crate refuses the feature with a compile error. The experimental entries below describe the repository.
+[`fsgate` 0.2.0](https://crates.io/crates/fsgate/0.2.0), built from the signed tag [`v0.2.0`](https://github.com/farming-labs/fsgate/tree/v0.2.0) on `aee17a7`, and the first release published by the trusted-publishing workflow. Not independently reviewed. Everything behind the `experimental-intercept` feature is not part of this release: it builds only from the repository, and the published crate refuses the feature with a compile error. The experimental entries below describe the repository.
 
 ### Added
 
