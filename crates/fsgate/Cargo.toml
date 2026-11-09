@@ -15,7 +15,7 @@ workspace = true
 
 [dependencies]
 cap-std = "4.0.3"
-rustix = { version = "1.1.6", features = ["net"] }
+rustix = { version = "1.1.6", features = ["net", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
@@ -31,6 +31,10 @@ rustix = { version = "1.1.6", features = ["process", "termios"] }
 landlock = "0.4.7"
 libc = { version = "0.2.191", optional = true }
 rustix-linux-procfs = { version = "0.1.1", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# `getpeereid`, which `rustix` does not wrap (RFC 0007).
+libc = "0.2.191"
 
 [features]
 # Experimental and Linux only: the RFC 0004 interception profile, meaning

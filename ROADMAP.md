@@ -122,7 +122,7 @@ Started. No part of fsgate has had an independent security review. These are the
 - [x] Threat model: one document naming each boundary (the gate before `lock()`, the locked process, the broker and its worker, the experimental launcher), what each trusts, and what each does not stop. Acceptance: the README and RFC limit statements link to it, and every listed attack names the test that covers it or says that none does.
 
   Evidence: [docs/threat-model.md](docs/threat-model.md). The README and RFCs 0001 to 0004 and 0006 link to it. Every row names a test or says "none", and each named test exists at the commit the document describes. Writing it found gaps that no fsgate test covers:
-  - The broker does not authenticate who connects, and it accepts any number of connections.
+  - The broker does not authenticate who connects, and it accepts any number of connections. [RFC 0007](docs/rfcs/0007-broker-peers.md) addresses both.
   - Neither the 1 MiB frame limit nor a malformed request has a test. The fuzzing task below covers both.
   - Landlock cannot restrict `stat`, `chmod`, `utime`, or `setxattr`, so a locked process can read metadata anywhere and change the mode of files it owns outside the grants.
   - Hard links and mount points beneath a grant are reachable through both the gate and the kernel rules.
@@ -147,7 +147,7 @@ Started. No part of fsgate has had an independent security review. These are the
   - The build is `d9aca86`, which includes the broker's descriptor fix from [#40](https://github.com/farming-labs/fsgate/pull/40).
 
   [`fuzz.yml`](.github/workflows/fuzz.yml) repeats this run when `broker.rs` or the harness changes. The control run was on macOS only.
-- [ ] [RFC 0007](docs/rfcs/0007-broker-peers.md): decide who can reach the broker: an inherited connection and owner-only sockets for `fsgate-broker`, and a peer check and connection limit in `Broker::serve`. Acceptance: the RFC is accepted with its open questions answered.
+- [x] [RFC 0007](docs/rfcs/0007-broker-peers.md) ([#46](https://github.com/farming-labs/fsgate/pull/46)): decide who can reach the broker: an inherited connection and owner-only sockets for `fsgate-broker`, and a peer check and connection limit in `Broker::serve`. Acceptance: the RFC is accepted with its open questions answered.
 - [ ] Implement RFC 0007. Acceptance: the RFC's tests pass on Linux and macOS, and the threat model's rows for other processes and for many connections cite them.
 - [ ] Independent security review of the handle layer, containment (including M8), broker, and audit sink. Acceptance: the reviewer, scope, reviewed commit, and findings are recorded; each finding is fixed or answered; and the README status says what was reviewed.
 - [ ] Release 0.2.0 through the trusted-publishing workflow, its first real run. Acceptance: the release job's verify step matches the uploaded, crates.io, and downloaded checksums and the `.cargo_vcs_info.json` commit. Before tagging, record two maintainer decisions here: whether 0.2.0 waits for M6 and the review, and whether it includes the `experimental-intercept` feature.

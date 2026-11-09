@@ -1,6 +1,6 @@
 # RFC 0007: decide who can reach the broker
 
-- Status: proposed
+- Status: accepted ([#46](https://github.com/farming-labs/fsgate/pull/46))
 - Date: 2026-11-08
 - Roadmap: [M9](../../ROADMAP.md#m9--review-readiness-and-020)
 - Builds on: [RFC 0003](0003-broker-protocol.md) (broker protocol), the [threat model](../threat-model.md#3-the-broker-and-its-worker)
@@ -111,8 +111,8 @@ Linux uses `SO_PEERCRED`, which `rustix` provides. macOS uses
 `getpeereid`, which `rustix` does not, so it needs a direct `libc`
 dependency on macOS and the same isolated `unsafe` module. On any other
 platform `serve` fails with `ErrorKind::Unsupported` before accepting
-anything, unless the caller passes `ServeOptions::any_peer()`, so a
-missing check is never silent.
+anything, unless the caller sets `ServeOptions::any_peer`, so a missing
+check is never silent.
 
 ### A connection limit
 
@@ -176,10 +176,12 @@ is a property of the code, for review.
   takes stdin from every worker.
 - **Queueing past the limit.** See the connection limit.
 
-## Open questions
+## Decisions
 
-1. Is 64 the right default for `max_connections`?
-2. Should the README lead with the inherited form? This RFC recommends yes:
-   it is the safe default, the one to copy.
-3. Should a refused peer produce an audit event? RFC 0002 events describe
-   operations on paths, and a refused peer has none, so this RFC adds none.
+Accepted in [#46](https://github.com/farming-labs/fsgate/pull/46), with its
+open questions answered:
+
+1. `max_connections` defaults to 64.
+2. The README leads with the inherited form, the safe one to copy.
+3. A refused peer produces no audit event. RFC 0002 events describe
+   operations on paths, and a refused peer has none.
