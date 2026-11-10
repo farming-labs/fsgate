@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- An audit event for a request that no grant covers, and for a `grant` refused after `lock()`, records the normalized path, as [RFC 0002](docs/rfcs/0002-audit-events.md) specifies. It recorded the path as requested, so `/srv/data/../../etc/shadow` appeared to be a request inside `/srv/data`. The decision itself was always correct.
+
 ## 0.3.0 (2026-11-09)
 
 [`fsgate` 0.3.0](https://crates.io/crates/fsgate/0.3.0), built from the signed tag [`v0.3.0`](https://github.com/farming-labs/fsgate/tree/v0.3.0) on `78a33ae`. Not independently reviewed. Upgrade from 0.1.1 or 0.2.0: both have the `Gate::open` defect listed under Fixed. `fsgate-broker` now confines its worker by default, as listed under Changed, which is why this is a minor release. Everything behind the `experimental-intercept` feature is not part of this release: it builds only from the repository, and the published crate refuses the feature with a compile error.
