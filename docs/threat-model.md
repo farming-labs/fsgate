@@ -36,6 +36,8 @@ Test names are `file::test`. Files are in `crates/fsgate/tests/` unless they sta
 | Passing one gate's `Grant` to another gate | `UnknownGrant`, neither gate changes | `gate.rs::revoking_a_grant_from_another_gate_is_unknown_grant_and_changes_neither_gate`, `gate.rs::narrowing_a_grant_from_another_gate_is_unknown_grant_and_keeps_both_rights` |
 | A magic link such as `/proc/self/fd/N` beneath a grant | Refused by `RESOLVE_NO_MAGICLINKS` with `ELOOP` | `gate.rs::a_magic_link_beneath_a_grant_is_refused` (Linux only) |
 
+Beyond these chosen cases, `gate_model.rs::the_gate_matches_the_model_and_never_leaves_its_grants` runs generated trees and requests through the gate on Linux and macOS. It checks each answer and audit event against a reference model of the resolution above, that a success stays beneath its grant by inode, and that a failure changes nothing. It can show a defect, not prove there is none.
+
 **Does not stop:**
 
 | Gap | Why | Test |
