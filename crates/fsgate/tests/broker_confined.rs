@@ -529,6 +529,50 @@ mod kernel {
         assert!(reply.contains("alive"), "got {reply:?}");
     }
 
+    /// The gap: the death signal binds only a worker that keeps it. Any
+    /// process may clear its own, so a hostile worker outlives a killed
+    /// broker, still confined.
+    #[test]
+    fn a_confined_worker_that_clears_its_death_signal_outlives_its_broker() {
+        let fixture = fixture();
+        let mut broker = broker(
+            &fixture,
+            &confined(&[]),
+            "kernel::clears_death_signal_scenario",
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn fsgate-broker");
+        let mut stdin = broker.stdin.take().expect("piped stdin");
+        let mut stdout = BufReader::new(broker.stdout.take().expect("piped stdout"));
+        wait_until_ready(&mut stdout);
+
+        broker.kill().expect("kill the broker");
+        broker.wait().expect("reap the broker");
+
+        stdin.write_all(b"ping\n").expect("the worker is gone");
+        let mut reply = String::new();
+        stdout.read_line(&mut reply).expect("read the worker");
+        assert!(reply.contains("alive"), "got {reply:?}");
+    }
+
+    #[test]
+    fn clears_death_signal_scenario() {
+        if !in_child("kernel::clears_death_signal_scenario") {
+            return;
+        }
+        rustix::process::set_parent_process_death_signal(None).unwrap();
+        println!("worker ready");
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).unwrap();
+        // It outlived the broker and is still confined.
+        let secret = format!("{}/secret.txt", env::var("FSGATE_OUTSIDE").unwrap());
+        let err = fs::read(secret).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        println!("alive");
+    }
+
     #[test]
     fn waiting_scenario() {
         if !in_child("kernel::waiting_scenario") {

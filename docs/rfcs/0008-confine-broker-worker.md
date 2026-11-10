@@ -139,7 +139,9 @@ Each step closes a specific hole:
   bubblewrap, whose `--new-session` option is the same `setsid`. Landlock
   cannot help, because the terminal was opened before the sandbox.
 - **Step 2.** After `setsid`, Ctrl-C reaches only the broker. Without this
-  a killed broker would leave its worker running.
+  a killed broker would leave its worker running. It binds only a worker
+  that keeps it: any process can clear its own death signal, and a program
+  the worker starts never has one.
 - **Step 3.** Landlock says
   [files opened before the sandboxing are not subject to its restrictions](https://docs.kernel.org/userspace-api/landlock.html),
   so a leaked descriptor is a way out. `close_range` is not wrapped by
@@ -177,12 +179,19 @@ command line keeps working with one added flag. The library and
 ## What this does not stop
 
 - A compromised worker using its connection. The grants are the ceiling.
-- Reading anything beneath the runtime paths.
+- Reading anything beneath the runtime paths or a `--direct` path,
+  including a granted file beneath one of them.
 - File metadata anywhere. Landlock cannot restrict `stat`, `chmod`,
   `chown`, `utime`, or `setxattr`.
 - Network access.
 - Before Linux 6.12, signals to the broker and connects to abstract
-  sockets. Before Linux 7.1, connects to pathname sockets.
+  sockets. Before Linux 7.1, connects to pathname sockets, which include
+  services that act for their caller, such as systemd's user manager on
+  the session bus.
+- A worker outliving its broker after clearing its death signal, and
+  programs it starts, which never had one.
+- The worker's use of the terminal it inherited. It leads its own
+  session, so job control does not stop it.
 - Any containment on macOS.
 
 ## Testing
