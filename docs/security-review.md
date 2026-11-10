@@ -14,13 +14,13 @@ fsgate scopes a process's filesystem authority to directories granted up front. 
 
 ## Scope
 
-Review one named commit and record its full SHA. The latest release is `v0.2.0` on `aee17a7`. A later commit of `main` is fine if the report names it. Read the threat model from the commit under review.
+Review one named commit of `main` and record its full SHA. Use `6070452` or later, which has the final broker, including the worker confinement of [RFC 0008](rfcs/0008-confine-broker-worker.md). The latest release, `v0.2.0` on `aee17a7`, does not have that confinement. Read the threat model from the commit under review.
 
 | Area | Code in `crates/fsgate/src/` | Claims |
 |---|---|---|
 | Handle layer | `lib.rs` | [Threat model 1](threat-model.md#1-the-gate-before-lock), [RFC 0001](rfcs/0001-core-design.md) |
 | Containment, including the M8 restrictions | `containment.rs` | [Threat model 2](threat-model.md#2-the-locked-process-linux), [RFC 0006](rfcs/0006-lock-restrictions.md) |
-| Broker | `broker.rs`, `broker_sys.rs`, `bin/fsgate-broker.rs` | [Threat model 3](threat-model.md#3-the-broker-and-its-worker), [RFC 0003](rfcs/0003-broker-protocol.md), [RFC 0007](rfcs/0007-broker-peers.md) |
+| Broker, including its confined worker | `broker.rs`, `broker_sys.rs`, `bin/fsgate-broker.rs`, `bin/fsgate-broker/confine.rs` | [Threat model 3](threat-model.md#3-the-broker-and-its-worker), [RFC 0003](rfcs/0003-broker-protocol.md), [RFC 0007](rfcs/0007-broker-peers.md), [RFC 0008](rfcs/0008-confine-broker-worker.md) |
 | Audit sink | `audit.rs` | [Threat model, audit](threat-model.md#audit-is-observation-not-a-boundary), [RFC 0002](rfcs/0002-audit-events.md) |
 
 Out of scope:
@@ -36,7 +36,8 @@ The project's own tests and fuzzing cover the attacks the threat model lists. Th
 - **The gate and the kernel disagreeing.** `containment.rs` builds Landlock rules from the held descriptors. Landlock allows an access when any rule allows it, so the kernel does not enforce a nested grant's lesser rights. Look for other places the two differ.
 - **What `lock()` reports.** `Gate::restrictions`, `LockStatus`, and the `lock` audit event have to match what the kernel applied, including on kernels that lack a restriction.
 - **Descriptors crossing the broker.** `read_frame` handles `SCM_RIGHTS` from a hostile worker. macOS and Linux treat descriptors that do not fit differently, and macOS sets close-on-exec only after `recvmsg`.
-- **The `unsafe`.** `broker_sys.rs` is the only `unsafe` in a release build. Its module comment is the safety contract, and the descriptor number it adopts comes from `FSGATE_BROKER_FD`.
+- **The confined worker.** `confine.rs` takes authority away in a fresh process before `exec`, so the order of steps and the failure paths matter. No path should reach `exec` without the ruleset, and the grants should never become worker rules. Two of its tests are indirect, and its default paths have been measured only on Ubuntu 26.04; M9 records both.
+- **The `unsafe`.** A release build has it in two places: `broker_sys.rs` and the `sys` module of `confine.rs`. Each states its safety contract. The descriptor number `broker_sys.rs` adopts comes from `FSGATE_BROKER_FD`.
 - **Who reaches the broker.** The peer check and connection limit in `Broker::serve_with`, the order of steps in `bind_owner_only`, and `BrokerGate::from_inherited`.
 - **Audit completeness.** Every decision through a gate or a broker should emit exactly one event. Look for a path that emits none, or two.
 
@@ -47,13 +48,13 @@ Needs Rust 1.85 or later, and [cargo-deny](https://github.com/EmbarkStudios/carg
 ```sh
 git clone https://github.com/farming-labs/fsgate
 cd fsgate
-git switch --detach v0.2.0
+git switch --detach <commit>
 cargo test --locked
 cargo clippy --all-targets -- -D warnings
 cargo deny check
 ```
 
-Kernel enforcement needs Linux. On macOS these commands cover the handle layer and the broker, and a strict `lock()` fails closed.
+Kernel enforcement needs Linux. On macOS these commands cover the handle layer and the broker, and both a strict `lock()` and a confined worker fail closed.
 
 What the Linux tests exercise depends on the kernel running them. Strict `lock()` needs Linux 6.2 (Landlock ABI v3). Device ioctls need 6.10, abstract sockets and signals 6.12, all threads 7.0, and pathname sockets 7.1. On a kernel without one of these, the same test checks the refusal instead.
 
