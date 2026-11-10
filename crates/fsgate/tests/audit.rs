@@ -73,6 +73,42 @@ fn swallowed_denial_is_still_observed() {
     assert_eq!(last.grant, None);
 }
 
+/// RFC 0002 records the normalized path, so a `..` that climbs out of the
+/// grant cannot make a denial look like a request inside it.
+#[test]
+fn a_denial_with_no_grant_records_the_normalized_path() {
+    let (_root, granted, outside) = setup();
+    let all = Rights::READ | Rights::WRITE | Rights::CREATE | Rights::LIST;
+    let (gate, sink) = audited_gate(&granted, all);
+    let requested = granted.join("../outside/secret.txt");
+    let normalized = outside.join("secret.txt");
+
+    for op in [
+        AuditOp::Open,
+        AuditOp::Create,
+        AuditOp::Metadata,
+        AuditOp::ReadDir,
+    ] {
+        let err = match op {
+            AuditOp::Open => gate.open(&requested).err(),
+            AuditOp::Create => gate.create(&requested).err(),
+            AuditOp::Metadata => gate.metadata(&requested).err(),
+            _ => gate.read_dir(&requested).err(),
+        };
+        assert!(
+            matches!(&err, Some(GateError::NoGrant { path }) if path == &normalized),
+            "{op:?}: {err:?}"
+        );
+        let last = sink.events().pop().unwrap();
+        assert_eq!(last.op, op);
+        assert_eq!(last.decision, AuditDecision::Deny);
+        assert_eq!(last.reason, AuditReason::NoGrant);
+        assert_eq!(last.grant, None);
+        assert_eq!(last.path.as_deref(), Some(normalized.as_path()), "{op:?}");
+    }
+    assert!(!outside.join("secret.txt").exists());
+}
+
 #[test]
 fn rights_exceeded_names_the_matched_grant() {
     let (_root, granted, _) = setup();
@@ -211,7 +247,7 @@ fn lifecycle_events_cover_grant_revoke_and_lock() {
     let options = fsgate::LockOptions::new(fsgate::LockPolicy::BestEffort)
         .restrict(fsgate::Restrictions::all() - fsgate::Restrictions::ALL_THREADS);
     gate.lock_with(options).unwrap();
-    let _ = gate.grant(&granted, Rights::READ); // denied: locked
+    let _ = gate.grant(granted.join("sub/.."), Rights::READ); // denied: locked
     let _ = gate.lock(); // denied: already locked
 
     let events = sink.events();
@@ -229,6 +265,9 @@ fn lifecycle_events_cover_grant_revoke_and_lock() {
             (AuditOp::Lock, AuditDecision::Deny, AuditReason::Locked),
         ]
     );
+
+    // The refused grant records the normalized path (RFC 0002).
+    assert_eq!(events[3].path.as_deref(), Some(granted.as_path()));
 
     // The successful lock records the restrictions the gate reports; every
     // other event, the refused lock included, records none (RFC 0006).
