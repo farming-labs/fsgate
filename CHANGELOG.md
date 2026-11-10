@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `fsgate-broker` gives a usage error (exit 2) for an argument that is not valid UTF-8, naming the argument. It used to panic with exit 101.
+
 ## 0.3.0 (2026-11-09)
 
 [`fsgate` 0.3.0](https://crates.io/crates/fsgate/0.3.0), built from the signed tag [`v0.3.0`](https://github.com/farming-labs/fsgate/tree/v0.3.0) on `78a33ae`. Not independently reviewed. Upgrade from 0.1.1 or 0.2.0: both have the `Gate::open` defect listed under Fixed. `fsgate-broker` now confines its worker by default, as listed under Changed, which is why this is a minor release. Everything behind the `experimental-intercept` feature is not part of this release: it builds only from the repository, and the published crate refuses the feature with a compile error.
