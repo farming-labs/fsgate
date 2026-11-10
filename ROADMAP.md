@@ -160,6 +160,8 @@ Started. No part of fsgate has had an independent security review. These are the
 
   In the boot with `lsm=capability`, on both kernels, the broker exits 1, names `--unconfined`, and the worker's marker is absent. macOS refuses the same way. Two tests are indirect: the session check stands in for `TIOCSTI`, and reading `/proc/<pid>/environ` stands in for `PTRACE_ATTACH`. The default paths have been measured only on Ubuntu 26.04. Not independently reviewed.
 - [ ] Independent security review of the handle layer, containment (including M8), broker, and audit sink. Acceptance: the reviewer, scope, reviewed commit, and findings are recorded; each finding is fixed or answered; and the README status says what was reviewed.
+
+  Preparation: [docs/security-review.md](docs/security-review.md) gives a reviewer the scope, the commands, and what the review has to leave behind. [SECURITY.md](SECURITY.md) and GitHub's private vulnerability reporting give anyone a private way to report a bug. No reviewer has been chosen.
 - [x] Release 0.2.0 through the trusted-publishing workflow, its first real run (signed tag [`v0.2.0`](https://github.com/farming-labs/fsgate/tree/v0.2.0), [`fsgate` 0.2.0](https://crates.io/crates/fsgate/0.2.0); preparation in [PR #50](https://github.com/farming-labs/fsgate/pull/50)). Acceptance: the release job's verify step matches the uploaded, crates.io, and downloaded checksums and the `.cargo_vcs_info.json` commit. Before tagging, record two maintainer decisions here: whether 0.2.0 waits for M6 and the review, and whether it includes the `experimental-intercept` feature.
 
   Maintainer decisions:
