@@ -313,6 +313,61 @@ mod kernel {
         );
     }
 
+    /// A grant the confined worker could read without the broker is refused,
+    /// whichever of the two paths contains the other: those reads would not
+    /// be audited, and revoking the grant would not stop them. A grant that
+    /// gives no right the worker has there is fine.
+    #[test]
+    fn a_grant_the_worker_could_read_directly_is_refused() {
+        let fixture = fixture();
+        let sub = fixture.granted.join("sub");
+        fs::create_dir(&sub).unwrap();
+        let root = fixture.root.display().to_string();
+        let sub = sub.display().to_string();
+        let cases = [
+            (
+                ["--grant".to_string(), "/usr/bin:r".to_string()],
+                "`/usr`".to_string(),
+            ),
+            (
+                ["--direct".to_string(), format!("{root}:r")],
+                format!("`--direct {root}:r`"),
+            ),
+            (
+                ["--direct".to_string(), format!("{sub}:l")],
+                format!("`--direct {sub}:l`"),
+            ),
+        ];
+        for (extra, named) in cases {
+            let mut flags = confined(&[]);
+            flags.extend(extra);
+            let output = broker(&fixture, &flags, "kernel::nothing_scenario")
+                .output()
+                .expect("run fsgate-broker");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(1), "{named}: {stderr}");
+            assert!(stderr.contains(&named), "{named}: {stderr}");
+            assert!(output.stdout.is_empty(), "{named}: the worker ran");
+        }
+
+        let drop = fixture.outside.join("drop");
+        fs::create_dir(&drop).unwrap();
+        let mut flags = confined(&[]);
+        flags.extend([
+            "--grant".to_string(),
+            format!("{}:wc", drop.display()),
+            "--direct".to_string(),
+            format!("{}:r", fixture.outside.display()),
+        ]);
+        let output = broker(&fixture, &flags, "kernel::nothing_scenario")
+            .output()
+            .expect("run fsgate-broker");
+        assert_ran(&output);
+    }
+
+    #[test]
+    fn nothing_scenario() {}
+
     #[test]
     fn a_direct_path_can_be_read_and_nothing_beside_it() {
         let fixture = fixture();
