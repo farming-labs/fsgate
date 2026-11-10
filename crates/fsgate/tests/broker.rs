@@ -181,6 +181,23 @@ fn dead_broker_fails_every_operation_closed() {
     assert!(matches!(err, GateError::Broker { .. }), "got {err:?}");
 }
 
+/// The broker keeps no way to take a delivered file back, even by going away.
+#[test]
+fn a_delivered_file_stays_usable_after_its_broker_is_gone() {
+    let (_root, granted, _) = setup();
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::READ).unwrap();
+    let (mut client, server) = brokered(gate);
+    let mut file = client.open(granted.join("a.txt")).unwrap();
+
+    drop(client);
+    server.join().unwrap();
+
+    let mut content = String::new();
+    file.read_to_string(&mut content).unwrap();
+    assert_eq!(content, "inside");
+}
+
 /// Writes raw bytes to one broker connection as a worker would, closes the
 /// write side, and returns how the broker ended and everything it answered.
 fn serve_raw(gate: Gate, bytes: &[u8]) -> (std::io::Result<()>, Vec<u8>) {

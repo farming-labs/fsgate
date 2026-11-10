@@ -33,16 +33,16 @@ Test names are `file::test`. Files are in `crates/fsgate/tests/` unless they sta
 | Renaming the granted directory away and putting another in its place | The grant still reaches the directory it opened | `gate.rs::narrow_keeps_the_held_directory_instead_of_reopening_the_path` |
 | Using a grant after `revoke` or `narrow` | Denied | `gate.rs::revoked_grant_stops_covering_its_paths`, `gate.rs::narrow_drops_rights_and_denied_writes_leave_files_unchanged`, `gate.rs::narrow_cannot_widen_even_back_to_the_original_rights` |
 | Passing one gate's `Grant` to another gate | `UnknownGrant`, neither gate changes | `gate.rs::revoking_a_grant_from_another_gate_is_unknown_grant_and_changes_neither_gate`, `gate.rs::narrowing_a_grant_from_another_gate_is_unknown_grant_and_keeps_both_rights` |
-| A magic link such as `/proc/self/fd/N` beneath a grant | Refused by `RESOLVE_NO_MAGICLINKS` | none |
+| A magic link such as `/proc/self/fd/N` beneath a grant | Refused by `RESOLVE_NO_MAGICLINKS` with `ELOOP` | `gate.rs::a_magic_link_beneath_a_grant_is_refused` (Linux only) |
 
 **Does not stop:**
 
 | Gap | Why | Test |
 |---|---|---|
 | Code that uses `std::fs`, libc, or raw syscalls | Nothing is enforced until `lock()` | none; by design |
-| A hard link inside a grant to a file elsewhere | Resolution follows the directory tree, and a hard link is an ordinary entry in it. Landlock checks the same tree, so `lock()` does not stop it either. A locked process cannot create such a link itself, but one that exists, or that another process creates, is reachable. | none |
-| A file system mounted beneath a grant | cap-std does not pass `RESOLVE_NO_XDEV`, so resolution crosses mount points beneath a grant, including mounts made after `grant()` | none |
-| A symlink swapped in while a path resolves | Relies on `openat2` resolving in one call on Linux and on cap-std's component walk elsewhere | none; the symlink tests use static links |
+| A hard link inside a grant to a file elsewhere | Resolution follows the directory tree, and a hard link is an ordinary entry in it. Landlock checks the same tree, so `lock()` does not stop it either. A locked process cannot create such a link itself, but one that exists, or that another process creates, is reachable. | `gate.rs::a_hard_link_beneath_a_grant_reaches_the_file_elsewhere`, `lock.rs::kernel::a_locked_process_keeps_hard_links_but_cannot_make_them` |
+| A file system mounted beneath a grant | cap-std does not pass `RESOLVE_NO_XDEV`, so resolution crosses mount points beneath a grant, including mounts made after `grant()` | none; mounting needs privileges the tests do not have |
+| A symlink swapped in while a path resolves | Relies on `openat2` resolving in one call on Linux and on cap-std's component walk elsewhere. cap-std also falls back to the walk on Linux when `openat2` keeps failing with `EAGAIN`, which a rename anywhere on the host can cause. | `gate.rs::a_symlink_swapped_during_resolution_never_reaches_outside`, a stress test on Linux and macOS that could show an escape but cannot rule one out |
 
 ## 2. The locked process (Linux)
 
@@ -72,11 +72,11 @@ Test names are `file::test`. Files are in `crates/fsgate/tests/` unless they sta
 |---|---|---|
 | Pathname socket connects on kernels before 7.1, abstract socket connects and signals before 6.12, device ioctls before 6.10, or any of these with the member left out through `LockOptions::restrict` | The kernel cannot restrict them, or the caller dropped them | The control and `unsupported` modes of each test above show the action succeeding, with the member dropped and on kernels without it |
 | Threads that already exist at `lock()` on kernels before 7.0, or with `ALL_THREADS` left out | Landlock restricts only the calling thread there | `lock.rs::kernel::kernel_restricts_threads_that_predate_the_lock`, control mode: the earlier thread reads and writes outside the grants |
-| An unconfined process acting for the locked one | Over a connection made before the lock, through a pathname socket before Linux 7.1, or through an abstract socket or signal before 6.12, the locked process can ask another process to open files for it | none |
-| Descriptors opened before the lock, or received over `SCM_RIGHTS` | Landlock does not apply to an open descriptor; it keeps the access it was opened with | none |
-| `stat`, `access`, `chdir`, `flock`, `chmod`, `chown`, `setxattr`, `utime`, and `fcntl` on paths outside the grants | Landlock cannot restrict these call families ([kernel documentation](https://docs.kernel.org/userspace-api/landlock.html)). A locked process can learn whether any path exists and read its metadata, and can change the mode, times, or extended attributes of files it owns outside the grants. | none |
-| Narrowing or revoking after the lock | The installed ruleset never changes. Only operations through the gate see the change ([RFC 0005](rfcs/0005-grant-narrowing.md#kernel-enforcement)). | `lock.rs::kernel::kernel_enforces_rights_narrowed_before_the_lock` covers the gate side; none shows the raw access that remains |
-| A nested grant with fewer rights than its parent | Landlock allows an access when any rule allows it, so the kernel enforces the parent's rights beneath the nested grant | none |
+| An unconfined process acting for the locked one | Over a connection made before the lock, through a pathname socket before Linux 7.1, or through an abstract socket or signal before 6.12, the locked process can ask another process to open files for it | `lock.rs::kernel::a_descriptor_received_after_the_lock_keeps_its_access`, over a connection made before the lock; none for the other routes |
+| Descriptors opened before the lock, or received over `SCM_RIGHTS` | Landlock does not apply to an open descriptor; it keeps the access it was opened with | `lock.rs::kernel::a_descriptor_opened_before_the_lock_keeps_its_access`, `lock.rs::kernel::a_descriptor_received_after_the_lock_keeps_its_access` |
+| `stat`, `access`, `chdir`, `flock`, `chmod`, `chown`, `setxattr`, `utime`, and `fcntl` on paths outside the grants | Landlock cannot restrict these call families ([kernel documentation](https://docs.kernel.org/userspace-api/landlock.html)). A locked process can learn whether any path exists and read its metadata, and can change the mode, times, or extended attributes of files it owns outside the grants. | `lock.rs::kernel::metadata_and_modes_outside_the_grants_are_not_restricted`, for `stat` and `chmod`; the other families are from the kernel documentation |
+| Narrowing or revoking after the lock | The installed ruleset never changes. Only operations through the gate see the change ([RFC 0005](rfcs/0005-grant-narrowing.md#kernel-enforcement)). | `lock.rs::kernel::narrowing_or_revoking_after_the_lock_changes_only_the_gate` |
+| A nested grant with fewer rights than its parent | Landlock allows an access when any rule allows it, so the kernel enforces the parent's rights beneath the nested grant | `lock.rs::kernel::a_nested_grant_with_fewer_rights_binds_only_the_gate` |
 | `LockPolicy::BestEffort` on a kernel below ABI v3 | The caller asked for weaker rules; `LockStatus` reports `PartiallyEnforced` or `LibraryOnly` | `src/containment.rs::status_follows_the_filesystem_floor_alone` |
 | Network, memory, environment, and syscalls that are not file operations | Out of scope ([README](../README.md#what-fsgate-does-not-do)) | none |
 
@@ -121,19 +121,19 @@ A trusted broker holds the `Gate` and serves `BrokerGate` requests over a Unix s
 
 | Gap | Why | Test |
 |---|---|---|
-| Another process of an admitted user connecting to a socket path | It gets the grants: `Broker::serve` checks the peer's user, not its program, and `serve_conn` checks nothing because its caller chose the stream. An inherited connection does not have this gap. | none |
+| Another process of an admitted user connecting to a socket path | It gets the grants: `Broker::serve` checks the peer's user, not its program, and `serve_conn` checks nothing because its caller chose the stream. An inherited connection does not have this gap. | `broker_serve.rs::another_process_of_the_admitted_user_gets_the_grants` |
 | A peer in another user namespace whose uid does not map into the broker's | Linux reports an unmapped uid as the overflow uid ([`user_namespaces(7)`](https://man7.org/linux/man-pages/man7/user_namespaces.7.html)), 65534 by default, so a broker running as that uid would admit it | none; from the man page, not run |
-| Programs the command starts before adopting an inherited connection | They inherit it and get the grants. `from_inherited` marks it close-on-exec only when it runs. | none |
-| A process allowed to trace the worker or the broker | It can copy an inherited connection, as with `pidfd_getfd`, where the system's ptrace policy allows | none |
+| Programs the command starts before adopting an inherited connection | They inherit it and get the grants. `from_inherited` marks it close-on-exec only when it runs. | `broker_inherited.rs::a_program_started_before_adopting_inherits_the_connection` |
+| A process allowed to trace the worker or the broker | It can copy an inherited connection, as with `pidfd_getfd`, where the system's ptrace policy allows | none; it depends on the system's ptrace policy |
 | A full descriptor table when accepting | New connections wait in the listen backlog, with no error, until a descriptor frees. The broker keeps serving the connections it has. | `broker_serve.rs::a_full_descriptor_table_does_not_stop_the_broker` |
-| Idle connections up to the limit | An admitted peer can hold every slot. There is no idle timeout, because a worker may be idle between requests. | none |
-| A worker started with `--unconfined`, or served through the library and not isolated | It can open files directly. As the same user, it can also signal the broker, or trace it where the system's ptrace policy allows. | none; the operator's or embedder's job |
+| Idle connections up to the limit | An admitted peer can hold every slot. There is no idle timeout, because a worker may be idle between requests. | `broker_serve.rs::connections_past_the_limit_are_closed_until_one_ends`, where an idle connection holds the only slot |
+| A worker started with `--unconfined`, or served through the library and not isolated | It can open files directly. As the same user, it can also signal the broker, or trace it where the system's ptrace policy allows. | `broker_confined.rs::kernel::a_confined_worker_cannot_reach_files_on_its_own`, control run with `--unconfined`; the rest is the operator's or embedder's job |
 | A compromised confined worker using its own connection | It gets whatever the grants allow; the broker cannot tell it from a healthy worker | none; by design |
 | A confined worker reading its runtime paths | Anything beneath `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, and `--direct` paths is readable, and those opens are not audited | none; by design |
 | A confined worker, beyond files | It keeps the network and can read file metadata anywhere. Before Linux 6.12 it can signal the broker and connect to abstract sockets; before 7.1 it can connect to pathname sockets. | none; see [section 2](#2-the-locked-process-linux) |
-| Files already delivered | They stay usable; the broker keeps no way to take them back | none |
-| A fork and exec racing a receive on macOS | `FD_CLOEXEC` is set just after `recvmsg`, so a program started in that window inherits the descriptor ([RFC 0003](rfcs/0003-broker-protocol.md#framing)) | none |
-| Changing policy while serving | `Broker::new` takes the gate, so a serving broker cannot revoke or narrow | none |
+| Files already delivered | They stay usable; the broker keeps no way to take them back | `broker.rs::a_delivered_file_stays_usable_after_its_broker_is_gone` |
+| A fork and exec racing a receive on macOS | `FD_CLOEXEC` is set just after `recvmsg`, so a program started in that window inherits the descriptor ([RFC 0003](rfcs/0003-broker-protocol.md#framing)) | none; the window is too narrow to hit reliably |
+| Changing policy while serving | `Broker::new` takes the gate, so a serving broker cannot revoke or narrow | none; the compiler enforces it |
 
 ## 4. The experimental launcher (Linux x86_64)
 
