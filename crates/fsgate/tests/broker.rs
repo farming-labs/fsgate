@@ -125,6 +125,30 @@ fn denials_cross_the_wire_typed_and_leave_no_side_effect() {
     assert!(!target.exists());
 }
 
+/// RFC 0003 rejects sending directory descriptors: one would let the worker
+/// list the directory without `LIST` and open paths relative to it.
+#[test]
+fn a_directory_is_never_delivered() {
+    let (_root, granted, _) = setup();
+    fs::create_dir(granted.join("sub")).unwrap();
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::READ).unwrap();
+    let (mut client, _server) = brokered(gate);
+
+    let err = client.open(granted.join("sub")).unwrap_err();
+    let GateError::Io { source, .. } = &err else {
+        panic!("got {err:?}");
+    };
+    assert_eq!(
+        source.raw_os_error(),
+        Some(rustix::io::Errno::ISDIR.raw_os_error()),
+        "got {err:?}"
+    );
+
+    // A refusal is an answer, so the connection keeps working.
+    assert!(client.open(granted.join("a.txt")).is_ok());
+}
+
 #[test]
 fn metadata_and_read_dir_cross_the_wire() {
     let (_root, granted, _) = setup();
