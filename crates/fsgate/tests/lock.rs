@@ -853,4 +853,253 @@ mod kernel {
         assert!(!std::path::Path::new(&after).exists());
         assert!(gate.open(format!("{late}/a.txt")).is_ok());
     }
+
+    // The tests below show the gaps the threat model lists for a locked
+    // process. Each one proves the lock is on, then that the gap is there.
+
+    /// Runs one scenario in a locked child against `dirs()`.
+    fn run_locked(scenario: &str, granted: &std::path::Path, outside: &std::path::Path) {
+        run_child(
+            scenario,
+            "locked",
+            &[
+                ("FSGATE_GRANTED", granted.as_os_str()),
+                ("FSGATE_OUTSIDE", outside.as_os_str()),
+            ],
+        );
+    }
+
+    /// Strictly locks `gate`, and proves a raw read of the secret is refused.
+    /// Returns the granted directory and the secret's path.
+    fn lock_and_prove(gate: &mut Gate) -> (String, String) {
+        assert_eq!(gate.lock().expect("strict lock"), LockStatus::FullyEnforced);
+        let secret = format!("{}/secret.txt", std::env::var("FSGATE_OUTSIDE").unwrap());
+        let err = fs::read(&secret).expect_err("read outside the grants after the lock");
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        (std::env::var("FSGATE_GRANTED").unwrap(), secret)
+    }
+
+    /// A hard link is an ordinary entry in the directory tree, which is what
+    /// Landlock checks, so one made before the lock stays reachable. A locked
+    /// process cannot make a new one to a file outside its rules.
+    #[test]
+    fn a_locked_process_keeps_hard_links_but_cannot_make_them() {
+        let (_root, granted, outside) = dirs();
+        fs::hard_link(outside.join("secret.txt"), granted.join("before.txt")).unwrap();
+
+        run_locked("hard_link_child", &granted, &outside);
+
+        assert!(!granted.join("after.txt").exists(), "a link was made");
+    }
+
+    #[test]
+    fn hard_link_child() {
+        if child_mode("hard_link_child").is_none() {
+            return;
+        }
+        let mut gate = Gate::new();
+        gate.grant(
+            std::env::var("FSGATE_GRANTED").unwrap(),
+            Rights::READ | Rights::WRITE | Rights::CREATE,
+        )
+        .unwrap();
+        let (granted, secret) = lock_and_prove(&mut gate);
+
+        assert_eq!(
+            fs::read(format!("{granted}/before.txt")).unwrap(),
+            b"secret"
+        );
+
+        let err = fs::hard_link(&secret, format!("{granted}/after.txt")).unwrap_err();
+        let refused = [Errno::ACCESS, Errno::XDEV].map(Errno::raw_os_error);
+        assert!(
+            refused.contains(&err.raw_os_error().expect("an errno")),
+            "got {err:?}"
+        );
+    }
+
+    /// Landlock checks a path when it is opened, so a descriptor from before
+    /// the lock keeps the access it was opened with.
+    #[test]
+    fn a_descriptor_opened_before_the_lock_keeps_its_access() {
+        let (_root, granted, outside) = dirs();
+        run_locked("early_descriptor_child", &granted, &outside);
+    }
+
+    #[test]
+    fn early_descriptor_child() {
+        if child_mode("early_descriptor_child").is_none() {
+            return;
+        }
+        let secret = format!("{}/secret.txt", std::env::var("FSGATE_OUTSIDE").unwrap());
+        let mut held = fs::File::open(&secret).unwrap();
+
+        let mut gate = granted_gate();
+        lock_and_prove(&mut gate);
+
+        let mut content = String::new();
+        held.read_to_string(&mut content).unwrap();
+        assert_eq!(content, "secret");
+    }
+
+    /// A descriptor can also arrive after the lock, over `SCM_RIGHTS` from a
+    /// process the lock does not cover. Here that is an unconfined broker
+    /// the locked process connected to first.
+    #[test]
+    fn a_descriptor_received_after_the_lock_keeps_its_access() {
+        let (_root, granted, outside) = dirs();
+        let socket = granted.join("broker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut served = Gate::new();
+        served.grant(&outside, Rights::READ).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            Broker::new(served).serve_conn(stream)
+        });
+
+        run_child(
+            "received_descriptor_child",
+            "locked",
+            &[
+                ("FSGATE_GRANTED", granted.as_os_str()),
+                ("FSGATE_OUTSIDE", outside.as_os_str()),
+                ("FSGATE_SOCKET", socket.as_os_str()),
+            ],
+        );
+
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn received_descriptor_child() {
+        if child_mode("received_descriptor_child").is_none() {
+            return;
+        }
+        let socket = std::env::var("FSGATE_SOCKET").unwrap();
+        let mut client = BrokerGate::connect(&socket).expect("connect before the lock");
+
+        let mut gate = granted_gate();
+        let (_, secret) = lock_and_prove(&mut gate);
+
+        let mut content = String::new();
+        client
+            .open(&secret)
+            .expect("the broker grants this path")
+            .read_to_string(&mut content)
+            .unwrap();
+        assert_eq!(content, "secret");
+    }
+
+    /// Landlock has no rights for these call families.
+    #[test]
+    fn metadata_and_modes_outside_the_grants_are_not_restricted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_root, granted, outside) = dirs();
+        let secret = outside.join("secret.txt");
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).unwrap();
+
+        run_locked("metadata_child", &granted, &outside);
+
+        let mode = fs::metadata(&secret).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "the locked process changed no mode");
+    }
+
+    #[test]
+    fn metadata_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if child_mode("metadata_child").is_none() {
+            return;
+        }
+        let mut gate = granted_gate();
+        let (_, secret) = lock_and_prove(&mut gate);
+
+        assert_eq!(fs::metadata(&secret).unwrap().len(), b"secret".len() as u64);
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// Landlock allows an access when any rule allows it, so the parent's
+    /// rule also covers the nested directory. Only the gate honors the
+    /// nested grant's lesser rights.
+    #[test]
+    fn a_nested_grant_with_fewer_rights_binds_only_the_gate() {
+        let (_root, granted, outside) = dirs();
+        let nested = granted.join("nested");
+        fs::create_dir(&nested).unwrap();
+
+        run_locked("nested_grant_child", &granted, &outside);
+
+        assert!(!nested.join("through_gate.txt").exists());
+        assert!(nested.join("raw.txt").exists(), "the raw write was refused");
+    }
+
+    #[test]
+    fn nested_grant_child() {
+        if child_mode("nested_grant_child").is_none() {
+            return;
+        }
+        let parent = std::env::var("FSGATE_GRANTED").unwrap();
+        let nested = format!("{parent}/nested");
+        let mut gate = Gate::new();
+        gate.grant(&parent, Rights::READ | Rights::WRITE | Rights::CREATE)
+            .unwrap();
+        gate.grant(&nested, Rights::READ).unwrap();
+        lock_and_prove(&mut gate);
+
+        let err = gate
+            .create(format!("{nested}/through_gate.txt"))
+            .unwrap_err();
+        assert!(
+            matches!(err, GateError::RightsExceeded { .. }),
+            "got {err:?}"
+        );
+        fs::write(format!("{nested}/raw.txt"), b"x").unwrap();
+    }
+
+    /// The installed ruleset never changes, so only operations through the
+    /// gate see a later narrow or revoke.
+    #[test]
+    fn narrowing_or_revoking_after_the_lock_changes_only_the_gate() {
+        let (_root, granted, outside) = dirs();
+        fs::write(granted.join("a.txt"), b"inside").unwrap();
+
+        run_locked("late_change_child", &granted, &outside);
+
+        assert!(!granted.join("through_gate.txt").exists());
+        assert!(
+            granted.join("raw.txt").exists(),
+            "the raw write was refused"
+        );
+    }
+
+    #[test]
+    fn late_change_child() {
+        if child_mode("late_change_child").is_none() {
+            return;
+        }
+        let mut gate = Gate::new();
+        let grant = gate
+            .grant(
+                std::env::var("FSGATE_GRANTED").unwrap(),
+                Rights::READ | Rights::WRITE | Rights::CREATE,
+            )
+            .unwrap();
+        let (granted, _) = lock_and_prove(&mut gate);
+
+        gate.narrow(grant, Rights::READ).unwrap();
+        let err = gate
+            .create(format!("{granted}/through_gate.txt"))
+            .unwrap_err();
+        assert!(
+            matches!(err, GateError::RightsExceeded { .. }),
+            "got {err:?}"
+        );
+        fs::write(format!("{granted}/raw.txt"), b"x").unwrap();
+
+        gate.revoke(grant).unwrap();
+        let err = gate.open(format!("{granted}/a.txt")).unwrap_err();
+        assert!(matches!(err, GateError::NoGrant { .. }), "got {err:?}");
+        assert_eq!(fs::read(format!("{granted}/a.txt")).unwrap(), b"inside");
+    }
 }

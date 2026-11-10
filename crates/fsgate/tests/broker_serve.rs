@@ -160,6 +160,48 @@ fn connections_past_the_limit_are_closed_until_one_ends() {
     }
 }
 
+/// The peer check is by user, not by program, so another process of the
+/// broker's user that finds the socket gets the grants.
+#[test]
+fn another_process_of_the_admitted_user_gets_the_grants() {
+    let _serial = serial();
+    let (root, granted, _) = setup();
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::READ).unwrap();
+    let socket = root.path().join("broker.sock");
+    serving(gate, &socket, ServeOptions::default());
+
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "stranger_scenario", "--nocapture"])
+        .env("FSGATE_STRANGER_SOCKET", &socket)
+        .env("FSGATE_STRANGER_FILE", granted.join("a.txt"))
+        .output()
+        .expect("run another process");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn stranger_scenario() {
+    let Some(socket) = std::env::var_os("FSGATE_STRANGER_SOCKET") else {
+        return;
+    };
+    let file = std::env::var_os("FSGATE_STRANGER_FILE").unwrap();
+    let mut client = BrokerGate::connect(socket).unwrap();
+    let mut content = String::new();
+    client
+        .open(file)
+        .unwrap()
+        .read_to_string(&mut content)
+        .unwrap();
+    assert_eq!(content, "inside");
+}
+
 /// The real binary under a tight descriptor limit. `accept` fails while
 /// the table is full, and the broker must come back once a slot frees
 /// rather than stop accepting for good.

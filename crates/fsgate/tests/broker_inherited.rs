@@ -147,6 +147,41 @@ fn worker_scenario() {
     assert!(gate.metadata(format!("{granted}/a.txt")).unwrap().is_file);
 }
 
+/// `from_inherited` marks the connection close-on-exec only when it runs, so
+/// a program started before that gets the connection, and the grants.
+#[test]
+fn a_program_started_before_adopting_inherits_the_connection() {
+    run_under_broker("early_program_scenario");
+}
+
+#[test]
+fn early_program_scenario() {
+    if !in_child("early_program_scenario") {
+        return;
+    }
+    let output = Command::new(env::current_exe().unwrap())
+        .args(["--exact", "adopting_program_scenario", "--nocapture"])
+        .env("FSGATE_CHILD", "adopting_program_scenario")
+        .output()
+        .expect("start a program before adopting");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn adopting_program_scenario() {
+    if !in_child("adopting_program_scenario") {
+        return;
+    }
+    let mut gate = BrokerGate::from_inherited().expect("the connection was inherited");
+    let granted = env::var("FSGATE_GRANTED").unwrap();
+    assert!(gate.metadata(format!("{granted}/a.txt")).unwrap().is_file);
+}
+
 fn inheritable(fd: BorrowedFd<'_>) -> String {
     rustix::io::fcntl_setfd(fd, FdFlags::empty()).unwrap();
     fd.as_raw_fd().to_string()

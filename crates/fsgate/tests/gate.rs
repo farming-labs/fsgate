@@ -426,3 +426,153 @@ fn narrowing_a_grant_from_another_gate_is_unknown_grant_and_keeps_both_rights() 
     assert!(granted.join("a.txt").exists());
     assert!(other_dir.join("b.txt").exists());
 }
+
+/// `/proc/self/fd/N` names whatever the process has open, wherever it is.
+/// The ordinary open shows this one reaches the secret.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_magic_link_beneath_a_grant_is_refused() {
+    use std::os::fd::AsRawFd;
+
+    let (_root, _granted, outside) = setup();
+    let held = fs::File::open(outside.join("secret.txt")).unwrap();
+    let link = format!("/proc/self/fd/{}", held.as_raw_fd());
+    assert_eq!(fs::read_to_string(&link).unwrap(), "secret");
+
+    let mut gate = Gate::new();
+    gate.grant("/proc/self/fd", Rights::READ).unwrap();
+
+    let err = gate.open(&link).unwrap_err();
+    let GateError::Io { source, .. } = &err else {
+        panic!("got {err:?}");
+    };
+    assert_eq!(
+        source.raw_os_error(),
+        Some(rustix::io::Errno::LOOP.raw_os_error()),
+        "got {err:?}"
+    );
+}
+
+/// Resolution follows the directory tree, and a hard link is an ordinary
+/// entry in it, so the grant reaches the file. The threat model lists this
+/// as a gap.
+#[cfg(unix)]
+#[test]
+fn a_hard_link_beneath_a_grant_reaches_the_file_elsewhere() {
+    let (_root, granted, outside) = setup();
+    fs::hard_link(outside.join("secret.txt"), granted.join("link.txt")).unwrap();
+
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::READ).unwrap();
+
+    let file = gate.open(granted.join("link.txt")).unwrap();
+    assert_eq!(read_to_string(file), "secret");
+}
+
+/// Stops the swapping thread even when an assertion unwinds, because
+/// `thread::scope` would otherwise wait for it forever.
+#[cfg(unix)]
+struct StopOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+
+#[cfg(unix)]
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Opens `path` through the gate while another thread replaces `link`, by an
+/// atomic rename, with a symlink to `inside` and then to `outside`.
+///
+/// This can show an escape, not rule one out. Two things keep it honest:
+/// ordinary opens must see both the file inside and the secret, so the swap
+/// really happens and really reaches outside, and the gate must both serve
+/// and refuse, so it opened through both states.
+#[cfg(unix)]
+fn assert_swap_never_escapes(
+    gate: &Gate,
+    path: &std::path::Path,
+    link: &std::path::Path,
+    inside: &std::path::Path,
+    outside: &std::path::Path,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    const OPENS: usize = 20_000;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let stop = AtomicBool::new(false);
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let next = link.with_extension("next");
+            let mut targets = [inside, outside].into_iter().cycle();
+            while !stop.load(Ordering::Relaxed) {
+                std::os::unix::fs::symlink(targets.next().unwrap(), &next).unwrap();
+                fs::rename(&next, link).unwrap();
+            }
+        });
+        let _stop = StopOnDrop(&stop);
+
+        let (mut saw_inside, mut saw_secret) = (false, false);
+        while !(saw_inside && saw_secret) && Instant::now() < deadline {
+            match fs::read_to_string(path).as_deref() {
+                Ok("inside") => saw_inside = true,
+                Ok("secret") => saw_secret = true,
+                _ => {}
+            }
+        }
+        assert!(saw_inside && saw_secret, "the swap was never observed");
+
+        let (mut served, mut refused, mut opens) = (0_usize, 0_usize, 0_usize);
+        while (opens < OPENS || served == 0 || refused == 0) && Instant::now() < deadline {
+            opens += 1;
+            match gate.open(path) {
+                Ok(file) => {
+                    assert_eq!(read_to_string(file), "inside", "escaped on open {opens}");
+                    served += 1;
+                }
+                Err(GateError::Io { .. }) => refused += 1,
+                Err(other) => panic!("got {other:?}"),
+            }
+        }
+        assert!(
+            served > 0 && refused > 0,
+            "the gate saw only one state: {served} served, {refused} refused"
+        );
+    });
+}
+
+/// A symlink swapped in during resolution, as the last component and as a
+/// directory on the way, with an absolute and a relative target.
+#[cfg(unix)]
+#[test]
+fn a_symlink_swapped_during_resolution_never_reaches_outside() {
+    use std::path::Path;
+
+    let (_root, granted, outside) = setup();
+    fs::create_dir(granted.join("real")).unwrap();
+    fs::write(granted.join("real/secret.txt"), b"inside").unwrap();
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::READ).unwrap();
+
+    let directory = granted.join("directory");
+    std::os::unix::fs::symlink("real", &directory).unwrap();
+    assert_swap_never_escapes(
+        &gate,
+        &directory.join("secret.txt"),
+        &directory,
+        Path::new("real"),
+        &outside,
+    );
+
+    let last = granted.join("last");
+    std::os::unix::fs::symlink("real/secret.txt", &last).unwrap();
+    assert_swap_never_escapes(
+        &gate,
+        &last,
+        &last,
+        Path::new("real/secret.txt"),
+        Path::new("../outside/secret.txt"),
+    );
+}

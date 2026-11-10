@@ -32,7 +32,7 @@ Out of scope:
 
 The project's own tests and fuzzing cover the attacks the threat model lists. These are the places they say least about.
 
-- **Resolution races.** `Gate::resolve` picks a grant by path prefix, which is routing only. The security is in what happens beneath the held handle: `openat2` on Linux and cap-std's component walk elsewhere. The symlink tests use static links, so no test swaps one in during resolution. No test covers a magic link beneath a grant.
+- **Resolution races.** `Gate::resolve` picks a grant by path prefix, which is routing only. The security is in what happens beneath the held handle: `openat2` on Linux and cap-std's component walk elsewhere. On Linux, `openat2` that keeps failing with `EAGAIN` falls back to that walk too. One stress test swaps a symlink during resolution, and it could show an escape but cannot rule one out. It has found one defect so far, `Gate::open` returning a directory, fixed in [#55](https://github.com/farming-labs/fsgate/pull/55).
 - **The gate and the kernel disagreeing.** `containment.rs` builds Landlock rules from the held descriptors. Landlock allows an access when any rule allows it, so the kernel does not enforce a nested grant's lesser rights. Look for other places the two differ.
 - **What `lock()` reports.** `Gate::restrictions`, `LockStatus`, and the `lock` audit event have to match what the kernel applied, including on kernels that lack a restriction.
 - **Descriptors crossing the broker.** `read_frame` handles `SCM_RIGHTS` from a hostile worker. macOS and Linux treat descriptors that do not fit differently, and macOS sets close-on-exec only after `recvmsg`.
