@@ -31,6 +31,7 @@ Test names are `file::test`. Files are in `crates/fsgate/tests/` unless they sta
 | A relative path | `NotAbsolute` | `gate.rs::relative_paths_are_rejected` |
 | An operation the grant's rights do not allow | `RightsExceeded`, no file created | `gate.rs::read_only_grant_rejects_create_and_leaves_no_file`, `gate.rs::denied_create_leaves_no_file_behind`, `gate.rs::list_requires_the_list_right` |
 | Renaming the granted directory away and putting another in its place | The grant still reaches the directory it opened | `gate.rs::narrow_keeps_the_held_directory_instead_of_reopening_the_path` |
+| Opening a directory through `open` | `EISDIR`, checked on the opened descriptor, so listing still needs `LIST` | `gate.rs::open_refuses_a_directory` |
 | Using a grant after `revoke` or `narrow` | Denied | `gate.rs::revoked_grant_stops_covering_its_paths`, `gate.rs::narrow_drops_rights_and_denied_writes_leave_files_unchanged`, `gate.rs::narrow_cannot_widen_even_back_to_the_original_rights` |
 | Passing one gate's `Grant` to another gate | `UnknownGrant`, neither gate changes | `gate.rs::revoking_a_grant_from_another_gate_is_unknown_grant_and_changes_neither_gate`, `gate.rs::narrowing_a_grant_from_another_gate_is_unknown_grant_and_keeps_both_rights` |
 | A magic link such as `/proc/self/fd/N` beneath a grant | Refused by `RESOLVE_NO_MAGICLINKS` | none |
@@ -98,6 +99,7 @@ A trusted broker holds the `Gate` and serves `BrokerGate` requests over a Unix s
 | A worker that tries to influence the decision | The request carries only an operation and a path; the broker's gate decides and audits | `audit.rs::broker_decisions_are_audited_server_side` |
 | A worker that outlives its broker | Every later operation fails with `GateError::Broker`, with no reconnect | `broker.rs::dead_broker_fails_every_operation_closed`, `broker.rs::broker_binary_serves_and_dies_closed` |
 | A response that is lost, as to a read timeout on the worker's stream | Every later request on that connection fails with `GateError::Broker`, because answers can no longer be matched to requests | `broker.rs::a_lost_response_fails_every_later_request_closed` |
+| A worker asking for a directory's descriptor | `EISDIR` crosses the wire and nothing is delivered. A directory descriptor would move authority into the worker ([RFC 0003](rfcs/0003-broker-protocol.md#alternatives-considered)). | `broker.rs::a_directory_is_never_delivered` |
 | A delivered file leaking into programs the worker runs | Received descriptors are close-on-exec | `broker.rs::delivered_descriptors_do_not_leak_into_spawned_programs` |
 | A frame over 1 MiB | The broker closes the connection before reading the body | `broker.rs::a_prefix_over_the_size_limit_fails_the_connection_closed` |
 | A length prefix shorter than the bytes that follow it | The broker closes the connection without acting | `broker.rs::bytes_beyond_the_declared_length_fail_the_connection_closed` |
