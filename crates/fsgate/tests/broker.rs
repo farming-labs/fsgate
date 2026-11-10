@@ -20,6 +20,9 @@ use tempfile::TempDir;
 
 fn setup() -> (TempDir, PathBuf, PathBuf) {
     let root = tempfile::tempdir().expect("create temp root");
+    // `--socket` refuses a directory that others can write to, and under
+    // `umask 000` a new one is.
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let granted = root.path().join("granted");
     let outside = root.path().join("outside");
     fs::create_dir(&granted).unwrap();
