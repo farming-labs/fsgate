@@ -478,7 +478,7 @@ fn assert_swap_never_escapes(
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    const OPENS: usize = 20_000;
+    const OPENS: usize = usize::MAX;
     let deadline = Instant::now() + Duration::from_secs(60);
     let stop = AtomicBool::new(false);
 
