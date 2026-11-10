@@ -105,6 +105,12 @@ pub(crate) fn apply<'a>(
         if entry.rights.contains(Rights::CREATE) {
             access |= AccessFs::MakeReg;
         }
+        // A grant with no rights allows nothing, which is what having no rule
+        // means. Landlock rejects a rule with no access, so adding one would
+        // fail the whole lock.
+        if access.is_empty() {
+            continue;
+        }
         // The rule is bound to the held descriptor, not the path name.
         ruleset = ruleset
             .add_rule(PathBeneath::new(&entry.dir, access))
