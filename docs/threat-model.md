@@ -58,6 +58,7 @@ Test names are `file::test`. Files are in `crates/fsgate/tests/` unless they sta
 | A raw open outside the grants that bypasses the gate | `PermissionDenied` from the kernel | `lock.rs::kernel::kernel_blocks_filesystem_access_that_bypasses_the_gate` |
 | A raw write or create outside the grants, or beneath a read-only grant | Denied, and no file is left behind | `lock.rs::kernel::kernel_blocks_filesystem_access_that_bypasses_the_gate` |
 | A raw write beneath a grant narrowed before the lock | Denied, file unchanged | `lock.rs::kernel::kernel_enforces_rights_narrowed_before_the_lock` |
+| A raw read beneath a grant that holds no rights | Denied: the grant adds no rule, and the lock still succeeds | `lock.rs::kernel::a_grant_with_no_rights_locks_and_reaches_nothing` |
 | A new grant after the lock | `GateError::Locked` | `lock.rs::best_effort_lock_ends_the_granting_phase` |
 | An ioctl on a device beneath a grant without `WRITE` (Linux 6.10+) | `EACCES`; with `WRITE`, the device answers | `lock.rs::kernel::kernel_restricts_device_ioctls` |
 | A connect to an abstract Unix socket outside the sandbox (6.12+) | `EPERM`, and the listener accepts nothing | `lock.rs::kernel::kernel_scopes_abstract_unix_sockets` |
