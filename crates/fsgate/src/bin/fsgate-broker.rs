@@ -24,7 +24,8 @@
 //!
 //! `--unconfined` starts the child with this process's own environment and
 //! filesystem access. `--socket`, which needs it, creates an owner-only
-//! socket at that path and passes the path in `FSGATE_BROKER_SOCKET`.
+//! socket at that path and passes the path in `FSGATE_BROKER_SOCKET`. It
+//! refuses a path through a directory another user could change.
 //!
 //! Experimental interception mode (RFC 0004; built with the
 //! `experimental-intercept` feature, Linux x86_64 only, unsupported):
@@ -201,6 +202,60 @@ fn run_inherited(
     })
 }
 
+/// Refuses a socket path that another user could replace. Workers find the
+/// broker by this path, so whoever can rename an entry along it can put
+/// their own socket there. Every directory the path passes through, before
+/// and after resolving symlinks, must belong to this user or root, and
+/// must not be writable by others unless it is sticky, as `/tmp` is.
+fn check_socket_path(socket: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let refuse = |dir: &Path, why: &str| {
+        format!(
+            "`--socket {}`: `{}` {why}, so another user could replace the socket; \
+             use a directory that only you and root can change",
+            socket.display(),
+            dir.display()
+        )
+    };
+    let absolute = std::path::absolute(socket)
+        .map_err(|err| format!("`--socket {}`: {err}", socket.display()))?;
+    let parent = absolute
+        .parent()
+        .ok_or_else(|| format!("`--socket {}` names no file", socket.display()))?;
+    let me = rustix::process::geteuid().as_raw();
+    let mut checked = Vec::new();
+    for prefix in parent.ancestors() {
+        let resolved = fs::canonicalize(prefix).map_err(|err| {
+            format!(
+                "`--socket {}`: `{}`: {err}",
+                socket.display(),
+                prefix.display()
+            )
+        })?;
+        for dir in resolved.ancestors() {
+            if checked.iter().any(|seen: &PathBuf| seen == dir) {
+                continue;
+            }
+            let meta = fs::metadata(dir).map_err(|err| {
+                format!(
+                    "`--socket {}`: `{}`: {err}",
+                    socket.display(),
+                    dir.display()
+                )
+            })?;
+            if meta.uid() != me && meta.uid() != 0 {
+                return Err(refuse(dir, "belongs to another user"));
+            }
+            if meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0 {
+                return Err(refuse(dir, "is writable by other users and not sticky"));
+            }
+            checked.push(dir.to_path_buf());
+        }
+    }
+    Ok(())
+}
+
 /// Creates an owner-only socket at `path`. A connect before `listen` is
 /// refused, so setting the mode between `bind` and `listen` means the
 /// socket is never reachable while the umask's looser mode applies.
@@ -222,6 +277,7 @@ fn bind_owner_only(path: &Path) -> io::Result<UnixListener> {
 fn run(args: SocketArgs) -> Result<ExitCode, String> {
     let gate = gate_from(&args.grants)?;
 
+    check_socket_path(&args.socket)?;
     let listener = bind_owner_only(&args.socket).map_err(|err| {
         format!(
             "binding socket `{}` failed: {err}; remove a stale socket file first",

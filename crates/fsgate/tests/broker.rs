@@ -499,6 +499,69 @@ fn a_socket_is_owner_only_whatever_the_umask() {
     assert_eq!(mode, 0o600, "socket mode was {mode:o}");
 }
 
+/// Workers find the broker by its socket path, so a directory along it that
+/// another user can change would let them put their own socket there. The
+/// broker refuses such a path before it binds or starts its command. A
+/// sticky directory, as `/tmp` is, is fine.
+#[test]
+fn a_socket_path_others_could_replace_is_refused() {
+    let (root, granted, outside) = setup();
+    // The broker names the resolved directory, and macOS's temporary
+    // directory is a symlink.
+    let base = root.path().canonicalize().unwrap();
+    let marker = outside.join("ran");
+    let run = |socket: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_fsgate-broker"))
+            .arg("--unconfined")
+            .args(["--grant", &format!("{}:r", granted.display())])
+            .arg("--socket")
+            .arg(socket)
+            .arg("--")
+            .arg("touch")
+            .arg(&marker)
+            .output()
+            .expect("run fsgate-broker")
+    };
+    let dir = |path: PathBuf, mode: u32| {
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        path
+    };
+
+    let open = dir(base.join("open"), 0o777);
+    let group = dir(base.join("group"), 0o770);
+    let beneath = dir(open.join("mine"), 0o700);
+    for (socket, named) in [
+        (open.join("broker.sock"), &open),
+        (group.join("broker.sock"), &group),
+        (beneath.join("broker.sock"), &open),
+    ] {
+        let output = run(&socket);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{}: {stderr}",
+            socket.display()
+        );
+        assert!(
+            stderr.contains(&format!("`{}`", named.display())),
+            "{stderr}"
+        );
+        assert!(!socket.exists(), "the broker bound {}", socket.display());
+        assert!(!marker.exists(), "the broker started its command");
+    }
+
+    let sticky = dir(base.join("sticky"), 0o1777);
+    let output = run(&sticky.join("broker.sock"));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(marker.exists(), "the broker did not start its command");
+}
+
 fn broker_usage(args: &[&str]) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_fsgate-broker"))
         .args(args)
