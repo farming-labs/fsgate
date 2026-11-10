@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A request refused because a symlink leads out of its grant fails with `EXDEV` on every platform, as `openat2` reports it on Linux, and its audit event records that errno. Where cap-std's component walk refused it, which is always on macOS, the error had no errno, so the event recorded `allow` with `errno` null, the same as a success, and a broker's worker received no errno. The request was always refused.
+
 ## 0.3.0 (2026-11-09)
 
 [`fsgate` 0.3.0](https://crates.io/crates/fsgate/0.3.0), built from the signed tag [`v0.3.0`](https://github.com/farming-labs/fsgate/tree/v0.3.0) on `78a33ae`. Not independently reviewed. Upgrade from 0.1.1 or 0.2.0: both have the `Gate::open` defect listed under Fixed. `fsgate-broker` now confines its worker by default, as listed under Changed, which is why this is a minor release. Everything behind the `experimental-intercept` feature is not part of this release: it builds only from the repository, and the published crate refuses the feature with a compile error.

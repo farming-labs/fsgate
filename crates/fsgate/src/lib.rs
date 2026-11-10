@@ -943,6 +943,7 @@ impl Gate {
                 Ok(value)
             }
             Err(source) => {
+                let source = with_escape_errno(source);
                 self.emit(
                     origin,
                     Some(&full),
@@ -1092,6 +1093,23 @@ struct Notified {
 /// Normalizes an absolute path lexically: resolves `.` and `..` without
 /// touching the filesystem. Symlink behavior is deliberately not modeled
 /// here; the kernel's beneath-handle resolution is what prevents escapes.
+/// Gives cap-std's refusal of a path that leaves its grant the errno
+/// `openat2` returns for the same refusal, `EXDEV`.
+///
+/// cap-std's component walk, which runs on every platform but Linux and on
+/// Linux when `openat2` is unavailable or keeps failing, reports that refusal
+/// with no errno, the only error without one that the gated operations
+/// return. Without an errno,
+/// its audit event read as a success (RFC 0002 records one for every failure
+/// after an allow), and a broker's worker received no errno.
+fn with_escape_errno(err: io::Error) -> io::Error {
+    if err.raw_os_error().is_none() && err.kind() == io::ErrorKind::PermissionDenied {
+        rustix::io::Errno::XDEV.into()
+    } else {
+        err
+    }
+}
+
 fn normalize(path: &Path) -> Result<PathBuf, GateError> {
     if !path.is_absolute() {
         return Err(GateError::NotAbsolute {
