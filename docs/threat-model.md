@@ -36,6 +36,8 @@ Test names are `file::test`. Files are in `crates/fsgate/tests/` unless they sta
 | Passing one gate's `Grant` to another gate | `UnknownGrant`, neither gate changes | `gate.rs::revoking_a_grant_from_another_gate_is_unknown_grant_and_changes_neither_gate`, `gate.rs::narrowing_a_grant_from_another_gate_is_unknown_grant_and_keeps_both_rights` |
 | A magic link such as `/proc/self/fd/N` beneath a grant | Refused by `RESOLVE_NO_MAGICLINKS` with `ELOOP` | `gate.rs::a_magic_link_beneath_a_grant_is_refused` (Linux only) |
 
+Beyond these chosen cases, `gate_model.rs::the_gate_matches_the_model_and_never_leaves_its_grants` runs generated trees and requests through the gate on Linux and macOS. It checks each answer and audit event against a reference model of the resolution above, that a success stays beneath its grant by inode, and that a failure changes nothing. It can show a defect, not prove there is none.
+
 **Does not stop:**
 
 | Gap | Why | Test |
@@ -102,6 +104,7 @@ A trusted broker holds the `Gate` and serves `BrokerGate` requests over a Unix s
 | A worker asking for a directory's descriptor | `EISDIR` crosses the wire and nothing is delivered. A directory descriptor would move authority into the worker ([RFC 0003](rfcs/0003-broker-protocol.md#alternatives-considered)). | `broker.rs::a_directory_is_never_delivered` |
 | A delivered file leaking into programs the worker runs | Received descriptors are close-on-exec | `broker.rs::delivered_descriptors_do_not_leak_into_spawned_programs` |
 | A frame over 1 MiB | The broker closes the connection before reading the body | `broker.rs::a_prefix_over_the_size_limit_fails_the_connection_closed` |
+| A request or response that would not fit in 1 MiB, such as a listing of a very large directory | Only that request fails, with `GateError::Broker`, and the connection keeps serving | `broker.rs::a_response_over_the_size_limit_fails_only_its_request`, `broker.rs::a_request_over_the_size_limit_fails_only_itself` |
 | A length prefix shorter than the bytes that follow it | The broker closes the connection without acting | `broker.rs::bytes_beyond_the_declared_length_fail_the_connection_closed` |
 | A malformed request, an unknown or missing operation, or a request path that is not UTF-8 | The broker closes the connection without acting | `broker.rs::a_malformed_request_fails_the_connection_closed` |
 | A directory entry name that is not UTF-8 | Refused, never transcoded | `broker.rs::a_directory_entry_name_that_is_not_utf8_is_refused` (Linux only; APFS refuses such names) |
