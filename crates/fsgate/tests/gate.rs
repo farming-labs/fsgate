@@ -499,7 +499,7 @@ fn assert_swap_never_escapes(
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    const OPENS: usize = 20_000;
+    const OPENS: usize = usize::MAX;
     let deadline = Instant::now() + Duration::from_secs(60);
     let stop = AtomicBool::new(false);
 
@@ -525,6 +525,7 @@ fn assert_swap_never_escapes(
         assert!(saw_inside && saw_secret, "the swap was never observed");
 
         let (mut served, mut refused, mut opens) = (0_usize, 0_usize, 0_usize);
+        let mut directories = 0_usize;
         while (opens < OPENS || served == 0 || refused == 0) && Instant::now() < deadline {
             opens += 1;
             match gate.open(path) {
@@ -532,7 +533,12 @@ fn assert_swap_never_escapes(
                     assert_eq!(read_to_string(file), "inside", "escaped on open {opens}");
                     served += 1;
                 }
-                Err(GateError::Io { .. }) => refused += 1,
+                Err(GateError::Io { source, .. }) => {
+                    if source.raw_os_error() == Some(rustix::io::Errno::ISDIR.raw_os_error()) {
+                        directories += 1;
+                    }
+                    refused += 1;
+                }
                 Err(other) => panic!("got {other:?}"),
             }
         }
@@ -540,6 +546,14 @@ fn assert_swap_never_escapes(
             served > 0 && refused > 0,
             "the gate saw only one state: {served} served, {refused} refused"
         );
+        std::io::Write::write_all(
+            &mut std::io::stderr(),
+            format!(
+                "SWAP-STRESS {path:?}: opens={opens} served={served} refused={refused} directories={directories}\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
     });
 }
 
