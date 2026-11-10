@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- An audit event for a request that no grant covers, and for a `grant` refused after `lock()`, records the normalized path, as [RFC 0002](docs/rfcs/0002-audit-events.md) specifies. It recorded the path as requested, so `/srv/data/../../etc/shadow` appeared to be a request inside `/srv/data`. The decision itself was always correct.
 - `fsgate-broker` gives a usage error (exit 2) for an argument that is not valid UTF-8, naming the argument. It used to panic with exit 101.
 
 ## 0.3.0 (2026-11-09)
