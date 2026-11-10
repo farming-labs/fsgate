@@ -166,6 +166,22 @@ fn a_direct_path_cannot_be_written() {
     }
 }
 
+/// A relative `--direct` path would resolve against the broker's working
+/// directory, so `.:r` under a service started in `/` would open everything.
+/// `--grant` already refuses one.
+#[test]
+fn a_direct_path_must_be_absolute() {
+    for spec in [".:r", "usr:r", ":r"] {
+        let output = usage_error(&["--grant", "/tmp:r", "--direct", spec, "--", "true"]);
+        assert_eq!(output.status.code(), Some(2), "{spec}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("absolute"),
+            "{spec}: no remedy in: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn confinement_flags_need_a_confined_worker() {
     for flags in [
