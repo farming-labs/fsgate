@@ -529,16 +529,17 @@ mod kernel {
         assert!(reply.contains("alive"), "got {reply:?}");
     }
 
-    /// The gap: the death signal binds only a worker that keeps it. Any
-    /// process may clear its own, so a hostile worker outlives a killed
-    /// broker, still confined.
+    /// The gap: the death signal binds only the worker. A program it starts
+    /// never has one, so it outlives a killed broker, still confined. The
+    /// worker could also clear its own, but on its main thread, and libtest
+    /// runs each scenario on another.
     #[test]
-    fn a_confined_worker_that_clears_its_death_signal_outlives_its_broker() {
+    fn a_program_a_confined_worker_starts_outlives_its_broker() {
         let fixture = fixture();
         let mut broker = broker(
             &fixture,
             &confined(&[]),
-            "kernel::clears_death_signal_scenario",
+            "kernel::starts_a_program_scenario",
         )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -551,18 +552,31 @@ mod kernel {
         broker.kill().expect("kill the broker");
         broker.wait().expect("reap the broker");
 
-        stdin.write_all(b"ping\n").expect("the worker is gone");
+        stdin.write_all(b"ping\n").expect("the program is gone");
         let mut reply = String::new();
-        stdout.read_line(&mut reply).expect("read the worker");
+        stdout.read_line(&mut reply).expect("read the program");
         assert!(reply.contains("alive"), "got {reply:?}");
     }
 
     #[test]
-    fn clears_death_signal_scenario() {
-        if !in_child("kernel::clears_death_signal_scenario") {
+    fn starts_a_program_scenario() {
+        if !in_child("kernel::starts_a_program_scenario") {
             return;
         }
-        rustix::process::set_parent_process_death_signal(None).unwrap();
+        // The program shares this worker's standard streams, and the
+        // broker's death kills only this worker.
+        Command::new(env::current_exe().unwrap())
+            .args(["--exact", "kernel::outlives_scenario", "--nocapture"])
+            .env("FSGATE_CHILD", "kernel::outlives_scenario")
+            .status()
+            .unwrap();
+    }
+
+    #[test]
+    fn outlives_scenario() {
+        if !in_child("kernel::outlives_scenario") {
+            return;
+        }
         println!("worker ready");
         let mut line = String::new();
         std::io::stdin().read_line(&mut line).unwrap();

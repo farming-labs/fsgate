@@ -140,7 +140,7 @@ Each step closes a specific hole:
   cannot help, because the terminal was opened before the sandbox.
 - **Step 2.** After `setsid`, Ctrl-C reaches only the broker. Without this
   a killed broker would leave its worker running. It binds only a worker
-  that keeps it: any process can clear its own death signal, and a program
+  that keeps it: the worker can clear its own death signal, and a program
   the worker starts never has one.
 - **Step 3.** Landlock says
   [files opened before the sandboxing are not subject to its restrictions](https://docs.kernel.org/userspace-api/landlock.html),
