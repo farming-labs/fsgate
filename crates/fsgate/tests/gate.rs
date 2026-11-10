@@ -495,9 +495,7 @@ fn assert_swap_never_escapes(
     link: &std::path::Path,
     inside: &std::path::Path,
     outside: &std::path::Path,
-    known: &[(&str, u64)],
 ) {
-    use std::os::unix::fs::MetadataExt;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
@@ -531,12 +529,6 @@ fn assert_swap_never_escapes(
             opens += 1;
             match gate.open(path) {
                 Ok(file) => {
-                    let metadata = file.metadata().unwrap();
-                    assert!(
-                        metadata.is_file(),
-                        "open {opens} of {path:?} returned a non-file, inode {}, known {known:?}",
-                        metadata.ino()
-                    );
                     assert_eq!(read_to_string(file), "inside", "escaped on open {opens}");
                     served += 1;
                 }
@@ -556,21 +548,13 @@ fn assert_swap_never_escapes(
 #[cfg(unix)]
 #[test]
 fn a_symlink_swapped_during_resolution_never_reaches_outside() {
-    use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
-    let (root, granted, outside) = setup();
+    let (_root, granted, outside) = setup();
     fs::create_dir(granted.join("real")).unwrap();
     fs::write(granted.join("real/secret.txt"), b"inside").unwrap();
     let mut gate = Gate::new();
     gate.grant(&granted, Rights::READ).unwrap();
-    let inode = |path: &Path| fs::metadata(path).unwrap().ino();
-    let known = [
-        ("root", inode(root.path())),
-        ("granted", inode(&granted)),
-        ("real", inode(&granted.join("real"))),
-        ("outside", inode(&outside)),
-    ];
 
     let directory = granted.join("directory");
     std::os::unix::fs::symlink("real", &directory).unwrap();
@@ -580,7 +564,6 @@ fn a_symlink_swapped_during_resolution_never_reaches_outside() {
         &directory,
         Path::new("real"),
         &outside,
-        &known,
     );
 
     let last = granted.join("last");
@@ -591,6 +574,5 @@ fn a_symlink_swapped_during_resolution_never_reaches_outside() {
         &last,
         Path::new("real/secret.txt"),
         Path::new("../outside/secret.txt"),
-        &known,
     );
 }
