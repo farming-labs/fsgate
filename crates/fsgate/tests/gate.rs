@@ -180,7 +180,21 @@ fn symlink_to_an_outside_directory_cannot_escape() {
     let err = gate
         .open(granted.join("link").join("secret.txt"))
         .unwrap_err();
-    assert!(matches!(err, GateError::Io { .. }), "got {err:?}");
+    assert_is_escape(&err);
+}
+
+/// An escape is `EXDEV` on every platform: `openat2` returns it on Linux,
+/// and the gate gives cap-std's component walk the same errno.
+#[cfg(unix)]
+fn assert_is_escape(err: &GateError) {
+    let GateError::Io { source, .. } = err else {
+        panic!("got {err:?}");
+    };
+    assert_eq!(
+        source.raw_os_error(),
+        Some(rustix::io::Errno::XDEV.raw_os_error()),
+        "got {err:?}"
+    );
 }
 
 #[cfg(unix)]
@@ -193,7 +207,7 @@ fn absolute_symlink_target_cannot_escape() {
     gate.grant(&granted, Rights::READ).unwrap();
 
     let err = gate.open(granted.join("abs_link")).unwrap_err();
-    assert!(matches!(err, GateError::Io { .. }), "got {err:?}");
+    assert_is_escape(&err);
 }
 
 #[cfg(unix)]
