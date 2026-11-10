@@ -27,7 +27,7 @@ Test names are `file::test`. Files are in `crates/fsgate/tests/` unless they sta
 |---|---|---|
 | A path with no covering grant | `NoGrant` | `gate.rs::ungranted_path_is_no_grant` |
 | `..` that climbs out of a grant | `NoGrant`, nothing opened | `gate.rs::dotdot_cannot_reroute_to_an_ungranted_directory` |
-| A symlink inside a grant pointing outside it | Refused during resolution, by `openat2` on Linux | `gate.rs::symlink_to_an_outside_directory_cannot_escape`, `gate.rs::absolute_symlink_target_cannot_escape` |
+| A symlink inside a grant pointing outside it | Refused during resolution with `EXDEV`, by `openat2` on Linux and by cap-std's component walk elsewhere, and audited as `allow` with that errno | `gate.rs::symlink_to_an_outside_directory_cannot_escape`, `gate.rs::absolute_symlink_target_cannot_escape`, `audit.rs::an_escape_is_audited_with_its_errno` |
 | A relative path | `NotAbsolute` | `gate.rs::relative_paths_are_rejected` |
 | An operation the grant's rights do not allow | `RightsExceeded`, no file created | `gate.rs::read_only_grant_rejects_create_and_leaves_no_file`, `gate.rs::denied_create_leaves_no_file_behind`, `gate.rs::list_requires_the_list_right` |
 | Renaming the granted directory away and putting another in its place | The grant still reaches the directory it opened | `gate.rs::narrow_keeps_the_held_directory_instead_of_reopening_the_path` |
