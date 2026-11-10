@@ -402,11 +402,18 @@ fn parse_grant(spec: &str) -> Result<(PathBuf, Rights), String> {
 
 /// Splits a `--direct` spec into its path and its letters, which are `r`,
 /// `l`, and `x`. A write the worker makes directly is one the broker never
-/// sees, so there is no `w` or `c`.
+/// sees, so there is no `w` or `c`. The path must be absolute, as for
+/// `--grant`, because a relative one would depend on the broker's working
+/// directory.
 fn parse_direct(spec: &str) -> Result<(PathBuf, &str), String> {
     let (path, letters) = spec
         .rsplit_once(':')
         .ok_or_else(|| format!("`--direct {spec}` is not `<path>:<rights>`"))?;
+    if !Path::new(path).is_absolute() {
+        return Err(format!(
+            "`--direct {spec}` names a relative path; give an absolute one, as for `--grant`"
+        ));
+    }
     if letters.is_empty() {
         return Err(format!("`--direct {spec}` names no rights"));
     }
