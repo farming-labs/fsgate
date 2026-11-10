@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A broker request or response that would not fit in the protocol's 1 MiB frame fails only that request, with `GateError::Broker`, and the connection keeps serving. It used to end the connection for good: listing a directory whose names encode to more than 1 MiB, or a request for a path long enough that the error repeating it would not fit, closed the connection, and a worker on an inherited connection lost all filesystem access. A request too large to send no longer marks the connection out of step, since nothing was sent.
+
 ## 0.3.0 (2026-11-09)
 
 [`fsgate` 0.3.0](https://crates.io/crates/fsgate/0.3.0), built from the signed tag [`v0.3.0`](https://github.com/farming-labs/fsgate/tree/v0.3.0) on `78a33ae`. Not independently reviewed. Upgrade from 0.1.1 or 0.2.0: both have the `Gate::open` defect listed under Fixed. `fsgate-broker` now confines its worker by default, as listed under Changed, which is why this is a minor release. Everything behind the `experimental-intercept` feature is not part of this release: it builds only from the repository, and the published crate refuses the feature with a compile error.
