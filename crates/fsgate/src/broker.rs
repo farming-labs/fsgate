@@ -27,7 +27,8 @@ use serde::{Deserialize, Serialize};
 use crate::{Gate, GateError, Rights};
 
 /// Upper bound for one wire message; a frame claiming more is a protocol
-/// violation and fails the connection closed.
+/// violation and fails the connection closed. Neither side sends one: a
+/// request or response that would not fit fails only that request.
 const MAX_FRAME_BYTES: usize = 1 << 20;
 
 /// Room for as many descriptors as one message can carry: 253 on Linux
@@ -298,9 +299,14 @@ impl Broker {
                 // rather than guessing at intent.
                 Err(err) => return Err(io::Error::new(io::ErrorKind::InvalidData, err)),
             };
-            let (response, fd) = self.handle(request);
-            let body = serde_json::to_vec(&response)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+            let (response, mut fd) = self.handle(request);
+            let mut body = encode_response(&response)?;
+            // Only this request fails: the worker still gets one answer for
+            // it, so the connection stays in step.
+            if body.len() > MAX_FRAME_BYTES {
+                body = encode_response(&oversized_response())?;
+                fd = None;
+            }
             write_frame(&mut stream, &body, fd.as_ref().map(File::as_fd))?;
         }
     }
@@ -358,6 +364,22 @@ fn collect_entry_names(entries: crate::ReadDir) -> Result<Vec<String>, GateError
         }
     }
     Ok(names)
+}
+
+fn encode_response(response: &Response) -> io::Result<Vec<u8>> {
+    serde_json::to_vec(response).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+/// The answer to a request whose response would not fit in one frame, such
+/// as a listing of a very large directory, or an error that repeats a very
+/// long path.
+fn oversized_response() -> Response {
+    error_response(GateError::Broker {
+        message: "the response exceeds the broker protocol's 1 MiB frame limit, so the broker \
+                  answered with this error; a directory with this many entries cannot be \
+                  listed through the broker"
+            .into(),
+    })
 }
 
 fn error_response(err: GateError) -> Response {
@@ -540,6 +562,14 @@ impl BrokerGate {
         let body = serde_json::to_vec(request).map_err(|err| GateError::Broker {
             message: format!("encoding the request failed: {err}"),
         })?;
+        // Nothing has been sent, so the connection is still in step.
+        if body.len() > MAX_FRAME_BYTES {
+            return Err(GateError::Broker {
+                message: "the request exceeds the broker protocol's 1 MiB frame limit and was \
+                          not sent; use a shorter path"
+                    .into(),
+            });
+        }
         self.out_of_step = true;
         write_frame(&mut self.stream, &body, None).map_err(transport_lost)?;
         let (frame, fds) =
