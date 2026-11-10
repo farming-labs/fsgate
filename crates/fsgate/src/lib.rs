@@ -767,9 +767,19 @@ impl Gate {
     }
 
     /// Opens an existing file for reading. Needs [`Rights::READ`].
+    ///
+    /// A directory fails with `EISDIR`, because a descriptor for one could
+    /// list it without [`Rights::LIST`] and open paths relative to it. The
+    /// check is on the opened descriptor, so a path that changes during
+    /// resolution cannot get past it. Use [`read_dir`](Gate::read_dir) to
+    /// list a directory.
     pub fn open(&self, path: impl AsRef<Path>) -> Result<File, GateError> {
         self.gated(AuditOp::Open, path.as_ref(), Rights::READ, |entry, rel| {
-            entry.dir.open(rel).map(cap_std::fs::File::into_std)
+            let file = entry.dir.open(rel)?.into_std();
+            if file.metadata()?.is_dir() {
+                return Err(rustix::io::Errno::ISDIR.into());
+            }
+            Ok(file)
         })
     }
 

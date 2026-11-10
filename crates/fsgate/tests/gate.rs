@@ -99,6 +99,29 @@ fn read_only_grant_rejects_create_and_leaves_no_file() {
     assert!(!target.exists(), "denied create must not create the file");
 }
 
+/// A descriptor for a directory could list it, and `read_dir` is what needs
+/// `LIST`. Both the grant's root and a directory beneath it are refused.
+#[cfg(unix)]
+#[test]
+fn open_refuses_a_directory() {
+    let (_root, granted, _) = setup();
+    fs::create_dir(granted.join("sub")).unwrap();
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::READ).unwrap();
+
+    for path in [granted.join("sub"), granted.clone()] {
+        let err = gate.open(&path).unwrap_err();
+        let GateError::Io { source, .. } = &err else {
+            panic!("got {err:?}");
+        };
+        assert_eq!(
+            source.raw_os_error(),
+            Some(rustix::io::Errno::ISDIR.raw_os_error()),
+            "got {err:?}"
+        );
+    }
+}
+
 #[test]
 fn list_requires_the_list_right() {
     let (_root, granted, _) = setup();
