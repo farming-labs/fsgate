@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- An audit event for a request that no grant covers, and for a `grant` refused after `lock()`, records the normalized path, as [RFC 0002](docs/rfcs/0002-audit-events.md) specifies. It recorded the path as requested, so `/srv/data/../../etc/shadow` appeared to be a request inside `/srv/data`. The decision itself was always correct.
 - On Linux, `lock()` no longer fails when a grant holds no rights, whether it was granted that way or narrowed to nothing before the lock. Landlock rejects a rule with no access, so the lock used to fail with `GateError::LockFailed` (`AddRules(Fs(Compat(Access(Empty))))`), in strict and best-effort mode alike, while the same gate locked on macOS. Such a grant now adds no rule, so the kernel refuses everything beneath it, and the gate refuses it with `RightsExceeded`.
 
 ## 0.3.0 (2026-11-09)
