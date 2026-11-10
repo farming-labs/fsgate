@@ -23,6 +23,10 @@
 //! proptest shrinks a failing case and prints it, and
 //! `known_cases_match_the_model` keeps each one found so far. Set
 //! `PROPTEST_CASES` for a longer run.
+//!
+//! On Linux, the `kernel` module also replays each case as raw calls in a
+//! child locked with the case's grants, and checks where the kernel and the
+//! gate answer differently.
 #![cfg(unix)]
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -599,6 +603,7 @@ struct Coverage {
     revoked: usize,
 }
 
+#[derive(Clone)]
 struct ModelGrant {
     path: PathBuf,
     rights: Rights,
@@ -794,68 +799,11 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// The live grant RFC 0001 routes `full` to: the longest covering path,
-    /// and of equal ones, the later grant, as `Iterator::max_by_key` picks.
-    fn route(&self, full: &Path) -> Option<usize> {
-        let mut best: Option<(usize, usize)> = None;
-        for (index, grant) in self.grants.iter().enumerate() {
-            let Some(grant) = grant else { continue };
-            if !full.starts_with(&grant.path) {
-                continue;
-            }
-            let depth = grant.path.components().count();
-            if best.is_none_or(|(_, longest)| depth >= longest) {
-                best = Some((index, depth));
-            }
-        }
-        best.map(|(index, _)| index)
-    }
-
-    /// What the model predicts for a request, decided from the tree before
-    /// the gate runs, so that a create cannot change the prediction.
-    fn predict(&self, op: FsOp, requested: &Path) -> Predicted {
-        let Some(full) = normalize(requested) else {
-            return Predicted::NotAbsolute;
-        };
-        let Some(index) = self.route(&full) else {
-            return Predicted::NoGrant { full };
-        };
-        let grant = self.grants[index]
-            .as_ref()
-            .expect("route returns live grants");
-        let needed = op.needed();
-        if !grant.rights.contains(needed) {
-            return Predicted::RightsExceeded {
-                full,
-                index,
-                grant_path: grant.path.clone(),
-                missing: needed.missing_from(grant.rights),
-            };
-        }
-        let base = grant.path.clone();
-        let rel = full
-            .strip_prefix(&base)
-            .expect("routing checked the prefix");
-        let rel = if rel.as_os_str().is_empty() {
-            PathBuf::from(".")
-        } else {
-            rel.to_path_buf()
-        };
-        let expected = expect(op, &base, &rel);
-        Predicted::Allowed {
-            full,
-            index,
-            base,
-            rel,
-            expected,
-        }
-    }
-
     fn fs_op(&mut self, step: usize, op: FsOp, spec: &PathSpec) -> Result<(), String> {
         let requested = render(&self.tree, spec);
         let context = format!("step {step}: {op:?} `{}`", requested.display());
         let before = snapshot(&self.tree.root);
-        let predicted = self.predict(op, &requested);
+        let predicted = predict(&self.grants, op, &requested);
         let result = match op {
             FsOp::Open => self.gate.open(&requested).map(Reached::File),
             FsOp::Create => self.gate.create(&requested).map(Reached::Created),
@@ -1091,7 +1039,64 @@ impl Run<'_> {
     }
 }
 
+/// The live grant RFC 0001 routes `full` to: the longest covering path,
+/// and of equal ones, the later grant, as `Iterator::max_by_key` picks.
+fn route(grants: &[Option<ModelGrant>], full: &Path) -> Option<usize> {
+    let mut best: Option<(usize, usize)> = None;
+    for (index, grant) in grants.iter().enumerate() {
+        let Some(grant) = grant else { continue };
+        if !full.starts_with(&grant.path) {
+            continue;
+        }
+        let depth = grant.path.components().count();
+        if best.is_none_or(|(_, longest)| depth >= longest) {
+            best = Some((index, depth));
+        }
+    }
+    best.map(|(index, _)| index)
+}
+
+/// What the model predicts for a request under `grants`, decided from the
+/// tree before the gate runs, so that a create cannot change the
+/// prediction.
+fn predict(grants: &[Option<ModelGrant>], op: FsOp, requested: &Path) -> Predicted {
+    let Some(full) = normalize(requested) else {
+        return Predicted::NotAbsolute;
+    };
+    let Some(index) = route(grants, &full) else {
+        return Predicted::NoGrant { full };
+    };
+    let grant = grants[index].as_ref().expect("route returns live grants");
+    let needed = op.needed();
+    if !grant.rights.contains(needed) {
+        return Predicted::RightsExceeded {
+            full,
+            index,
+            grant_path: grant.path.clone(),
+            missing: needed.missing_from(grant.rights),
+        };
+    }
+    let base = grant.path.clone();
+    let rel = full
+        .strip_prefix(&base)
+        .expect("routing checked the prefix");
+    let rel = if rel.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        rel.to_path_buf()
+    };
+    let expected = expect(op, &base, &rel);
+    Predicted::Allowed {
+        full,
+        index,
+        base,
+        rel,
+        expected,
+    }
+}
+
 /// The model's answer for a request, from the tree before it ran.
+#[derive(Debug)]
 enum Predicted {
     NotAbsolute,
     NoGrant {
@@ -1130,7 +1135,8 @@ enum Reached {
     Dir(fsgate::ReadDir),
 }
 
-fn run(case: &Case, coverage: &Mutex<Coverage>) -> Result<(), String> {
+/// Builds a case's tree and makes its grants.
+fn start<'a>(case: &Case, coverage: &'a Mutex<Coverage>) -> Result<Run<'a>, String> {
     let tree = build(&case.tree);
     let events = Arc::new(Events::default());
     let mut gate = Gate::new();
@@ -1146,6 +1152,11 @@ fn run(case: &Case, coverage: &Mutex<Coverage>) -> Result<(), String> {
     for (step, (dir, bits)) in case.grants.iter().enumerate() {
         run.grant(step, *dir, *bits)?;
     }
+    Ok(run)
+}
+
+fn run(case: &Case, coverage: &Mutex<Coverage>) -> Result<(), String> {
+    let mut run = start(case, coverage)?;
     let offset = case.grants.len();
     for (step, op) in case.ops.iter().enumerate() {
         let step = offset + step;
@@ -1281,4 +1292,724 @@ fn known_cases_match_the_model() {
         "{coverage:?}"
     );
     assert_eq!(coverage.create_escape_refused, 2, "{coverage:?}");
+}
+
+/// The gate against the kernel (ROADMAP M10). Each generated case is also
+/// replayed in a child process locked with the case's grants, as the raw
+/// `std::fs` calls the gate's operations would make without the gate. Every
+/// raw success must reach an object the installed rules give the right it
+/// needs, and every raw failure must leave the tree unchanged. Wherever the
+/// kernel and the gate answer differently, the difference must be one of the
+/// [`Gap`]s, each a row in section 2 of `docs/threat-model.md`.
+///
+/// The gate's answer is the model's, which the tests above check against the
+/// gate. The parent also runs each request through an unlocked gate after the
+/// raw call, so the model and the gate agree on the trees raw calls leave.
+#[cfg(target_os = "linux")]
+mod kernel {
+    use std::fmt::Display;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::ffi::OsStrExt;
+    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
+    use fsgate::LockStatus;
+    use rustix::io::Errno;
+
+    use super::*;
+
+    /// The child half's test name, which the parent runs with `--exact`.
+    const CHILD: &str = "locked_child";
+    /// Marks the child's replies among the test harness's own output.
+    const REPLY: &str = "FSGATE_REPLY ";
+
+    fn nothing() -> Rights {
+        Rights::from_bits_truncate(0)
+    }
+
+    /// A documented place where the kernel and the gate answer differently.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    enum Gap {
+        /// Landlock does not restrict `stat`.
+        Metadata,
+        /// The installed rules never change, so a narrow or revoke after the
+        /// lock binds only the gate.
+        ChangedAfterLock,
+        /// Landlock allows an access when any rule allows it, so an enclosing
+        /// grant's rights apply beneath a nested grant with fewer.
+        NestedGrant,
+        /// Landlock checks the object a path resolves to, so it allows a path
+        /// through a symlink or `..` to an object a rule covers. The gate
+        /// removes `.` and `..` lexically, as RFC 0001 specifies, and refuses
+        /// a symlink out of the grant the path names.
+        Route,
+        /// Beneath rules that give `CREATE` but not `WRITE`, the kernel makes
+        /// the file, then refuses to open it for writing, and the empty file
+        /// stays.
+        CreateWithoutWrite,
+    }
+
+    /// How often each answer came up across a run.
+    #[derive(Debug, Default)]
+    struct KernelCoverage {
+        /// Raw calls that answered as the gate does, by operation and outcome.
+        agreed: BTreeMap<String, usize>,
+        /// Raw calls the kernel refused with `EACCES`, by operation.
+        denied: BTreeMap<&'static str, usize>,
+        gaps: BTreeMap<Gap, usize>,
+        /// Relative paths, which a raw call resolves from the child's working
+        /// directory, so they are not compared.
+        relative: usize,
+    }
+
+    /// What a raw call in the locked child did.
+    #[derive(Debug)]
+    enum Raw {
+        Reached {
+            id: Id,
+            dir: bool,
+            /// A listing's names, sorted.
+            names: Vec<String>,
+        },
+        Failed(i32),
+    }
+
+    fn parse(reply: &str) -> Option<Raw> {
+        let mut words = reply.split(' ');
+        match words.next()? {
+            "ok" => {
+                let dev = words.next()?.parse().ok()?;
+                let ino = words.next()?.parse().ok()?;
+                let dir = words.next()? == "dir";
+                Some(Raw::Reached {
+                    id: (dev, ino),
+                    dir,
+                    names: words.map(str::to_string).collect(),
+                })
+            }
+            "err" => Some(Raw::Failed(words.next()?.parse().ok()?)),
+            _ => None,
+        }
+    }
+
+    /// A child process locked with a case's grants, answering one request
+    /// at a time.
+    struct Locked {
+        child: Child,
+        stdin: Option<ChildStdin>,
+        stdout: BufReader<ChildStdout>,
+    }
+
+    impl Locked {
+        fn spawn(grants: &[Option<ModelGrant>]) -> Result<Locked, String> {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &format!("kernel::{CHILD}"), "--nocapture"])
+                .env("FSGATE_CHILD", CHILD)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .map_err(|err| format!("spawn the locked child: {err}"))?;
+            let stdin = child.stdin.take();
+            let stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
+            let mut locked = Locked {
+                child,
+                stdin,
+                stdout,
+            };
+            for grant in grants.iter().flatten() {
+                let request = format!("grant {} {}", grant.rights.bits(), grant.path.display());
+                let reply = locked.ask(&request)?;
+                ensure(reply == "granted", || format!("`{request}`: {reply}"))?;
+            }
+            let reply = locked.ask("lock")?;
+            ensure(reply == "locked", || {
+                format!("the child did not lock: {reply}")
+            })?;
+            Ok(locked)
+        }
+
+        fn ask(&mut self, request: &str) -> Result<String, String> {
+            let stdin = self.stdin.as_mut().expect("open until finish");
+            writeln!(stdin, "{request}")
+                .and_then(|()| stdin.flush())
+                .map_err(|err| format!("`{request}`: the locked child is gone: {err}"))?;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let read = self
+                    .stdout
+                    .read_line(&mut line)
+                    .map_err(|err| format!("`{request}`: {err}"))?;
+                if read == 0 {
+                    return Err(format!(
+                        "`{request}`: the locked child exited: {:?}",
+                        self.child.wait()
+                    ));
+                }
+                // The harness may print a test's name without a newline, so
+                // the marker can start mid-line.
+                if let Some(at) = line.find(REPLY) {
+                    return Ok(line[at + REPLY.len()..].trim_end().to_string());
+                }
+            }
+        }
+
+        fn finish(mut self) -> Result<(), String> {
+            drop(self.stdin.take());
+            let status = self.child.wait().map_err(|err| err.to_string())?;
+            ensure(status.success(), || {
+                format!("the locked child failed: {status}")
+            })
+        }
+    }
+
+    impl Drop for Locked {
+        fn drop(&mut self) {
+            // A failed check returns early. Do not leave the child running.
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// The child half: a no-op outside the child. It grants and locks as
+    /// told, then makes raw calls until its input ends.
+    #[test]
+    fn locked_child() {
+        if std::env::var_os("FSGATE_CHILD").is_none_or(|name| name.to_str() != Some(CHILD)) {
+            return;
+        }
+        let mut gate = Gate::new();
+        let mut out = std::io::stdout().lock();
+        for line in std::io::stdin().lock().lines() {
+            let line = line.unwrap();
+            let (word, rest) = line.split_once(' ').unwrap_or((&line, ""));
+            let reply = match word {
+                "grant" => {
+                    let (bits, path) = rest.split_once(' ').expect("grant <bits> <path>");
+                    let rights = Rights::from_bits_truncate(bits.parse().unwrap());
+                    gate.grant(path, rights).unwrap();
+                    "granted".to_string()
+                }
+                "lock" => match gate.lock() {
+                    Ok(LockStatus::FullyEnforced) => "locked".to_string(),
+                    other => format!("{other:?}"),
+                },
+                op => {
+                    let (step, path) = rest.split_once(' ').expect("<op> <step> <path>");
+                    raw(op, step, Path::new(path))
+                }
+            };
+            writeln!(out, "{REPLY}{reply}").unwrap();
+            out.flush().unwrap();
+        }
+    }
+
+    /// The marker a raw create writes, so the parent can find the file.
+    fn marker(step: impl Display) -> String {
+        format!("raw create at step {step}")
+    }
+
+    /// The call the gate's operation makes once it has resolved the path,
+    /// made on the path itself.
+    fn raw(op: &str, step: &str, path: &Path) -> String {
+        let reached = match op {
+            "open" => fs::File::open(path)
+                .and_then(|file| file.metadata())
+                .map(|meta| (meta, Vec::new())),
+            "create" => fs::File::create(path)
+                .and_then(|mut file| {
+                    file.write_all(marker(step).as_bytes())?;
+                    file.metadata()
+                })
+                .map(|meta| (meta, Vec::new())),
+            "metadata" => fs::metadata(path).map(|meta| (meta, Vec::new())),
+            "read_dir" => fs::read_dir(path).and_then(|entries| {
+                let mut names = entries
+                    .map(|entry| {
+                        entry.map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                names.sort();
+                Ok((fs::metadata(path)?, names))
+            }),
+            other => panic!("unknown request `{other}`"),
+        };
+        match reached {
+            Ok((meta, names)) => {
+                let kind = if meta.is_dir() { "dir" } else { "file" };
+                let mut reply = format!("ok {} {} {kind}", meta.dev(), meta.ino());
+                for name in names {
+                    reply.push(' ');
+                    reply.push_str(&name);
+                }
+                reply
+            }
+            Err(err) => format!("err {}", err.raw_os_error().unwrap_or(-1)),
+        }
+    }
+
+    /// The rights the installed rules give an object: those of every grant
+    /// at lock time it is physically beneath.
+    fn held(locked: &[Option<ModelGrant>], id: Id) -> Rights {
+        locked
+            .iter()
+            .flatten()
+            .filter(|grant| ids_beneath(&grant.path).contains(&id))
+            .fold(nothing(), |held, grant| held | grant.rights)
+    }
+
+    /// The entry beneath `root` with this device and inode, without
+    /// following symlinks.
+    fn find(root: &Path, id: Id) -> Option<PathBuf> {
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(path) = pending.pop() {
+            if id_of(&path) == id {
+                return Some(path);
+            }
+            if is_dir(&path) {
+                for entry in fs::read_dir(&path).unwrap() {
+                    pending.push(entry.unwrap().path());
+                }
+            }
+        }
+        None
+    }
+
+    fn id_if_present(path: &Path) -> Option<Id> {
+        fs::symlink_metadata(path)
+            .ok()
+            .map(|meta| (meta.dev(), meta.ino()))
+    }
+
+    /// Whether `path` holds a `.` or `..`, which the gate removes before it
+    /// resolves anything. `Path::components` drops a `.` that is not first,
+    /// so this reads the path as written.
+    fn lexical(path: &Path) -> bool {
+        path.as_os_str()
+            .as_bytes()
+            .split(|byte| *byte == b'/')
+            .any(|part| part == b"." || part == b"..")
+    }
+
+    /// Whether the kernel meets a `.`, a `..`, or a symlink in the tree
+    /// resolving `path`.
+    fn indirect(root: &Path, path: &Path) -> bool {
+        let mut prefix = root.to_path_buf();
+        let rest = path.strip_prefix(root).expect("requests are in the tree");
+        lexical(path)
+            || rest.components().any(|component| {
+                prefix.push(component);
+                is_symlink(&prefix)
+            })
+    }
+
+    /// Where the gate's answer reaches, if it can succeed.
+    fn target(predicted: &Predicted) -> Option<&Path> {
+        match predicted {
+            Predicted::Allowed {
+                expected: Expect::Reach(target) | Expect::Either(target),
+                ..
+            } => Some(target),
+            _ => None,
+        }
+    }
+
+    /// Why the kernel and the gate answered differently, `None` when they
+    /// did not, or an error when the difference is not a [`Gap`].
+    fn classify(
+        op: FsOp,
+        root: &Path,
+        requested: &Path,
+        gate: &Predicted,
+        at_lock: &Predicted,
+        locked: &[Option<ModelGrant>],
+        kernel: Option<Id>,
+    ) -> Result<Option<Gap>, &'static str> {
+        let reaches =
+            |predicted: &Predicted, id: Id| target(predicted).and_then(id_if_present) == Some(id);
+        let either = matches!(
+            gate,
+            Predicted::Allowed {
+                expected: Expect::Either(_),
+                ..
+            }
+        );
+        match (kernel, target(gate)) {
+            (None, None) => Ok(None),
+            // The gate may refuse a create through a dangling symlink.
+            (None, Some(_)) if either => Ok(None),
+            (Some(id), Some(_)) if reaches(gate, id) => Ok(None),
+            // Where both resolve the path, only a `.` or `..` makes them
+            // reach different objects, because the gate removes them
+            // lexically.
+            (_, Some(_)) if lexical(requested) => Ok(Some(Gap::Route)),
+            (Some(_), Some(_)) => Err("the kernel reached another object than the gate"),
+            (None, Some(_)) => Err("the kernel refused what the gate allows"),
+            (Some(id), None) => {
+                if op == FsOp::Metadata {
+                    return Ok(Some(Gap::Metadata));
+                }
+                if reaches(at_lock, id) {
+                    return Ok(Some(Gap::ChangedAfterLock));
+                }
+                if let Predicted::RightsExceeded { full, index, .. } = at_lock {
+                    let base = &locked[*index]
+                        .as_ref()
+                        .expect("route returns live grants")
+                        .path;
+                    let rel = relative(full.strip_prefix(base).expect("routed").components());
+                    let would = match expect(op, base, &rel) {
+                        Expect::Reach(target) | Expect::Either(target) => id_if_present(&target),
+                        Expect::Fail(_) => None,
+                    };
+                    if would == Some(id) {
+                        return Ok(Some(Gap::NestedGrant));
+                    }
+                }
+                if indirect(root, requested) {
+                    Ok(Some(Gap::Route))
+                } else {
+                    Err("the kernel allowed what the gate refuses")
+                }
+            }
+        }
+    }
+
+    /// Checks that a refused raw call changed the tree only as
+    /// [`Gap::CreateWithoutWrite`] allows: one new, empty file, beneath
+    /// rules that give `CREATE` but not `WRITE`.
+    fn left_behind(
+        context: &str,
+        op: FsOp,
+        errno: i32,
+        root: &Path,
+        before: &BTreeMap<PathBuf, Entry>,
+        after: &BTreeMap<PathBuf, Entry>,
+        locked: &[Option<ModelGrant>],
+    ) -> Result<(), String> {
+        let changed = || {
+            format!(
+                "{context}: the kernel refused it, but the tree changed\nbefore: {before:?}\n\
+                 after:  {after:?}"
+            )
+        };
+        let mut added = after.iter().filter(|(key, _)| !before.contains_key(*key));
+        let (Some((key, Entry::File(contents))), None) = (added.next(), added.next()) else {
+            return Err(changed());
+        };
+        ensure(
+            op == FsOp::Create
+                && errno == Errno::ACCESS.raw_os_error()
+                && contents.is_empty()
+                && before
+                    .iter()
+                    .all(|(key, entry)| after.get(key) == Some(entry)),
+            changed,
+        )?;
+        let held = held(locked, id_of(&root.join(key)));
+        ensure(
+            held.contains(Rights::CREATE) && !held.contains(Rights::WRITE),
+            || {
+                format!(
+                    "{context}: the kernel left `{}` beneath rules that give {held:?}",
+                    key.display()
+                )
+            },
+        )
+    }
+
+    /// Makes one raw call in the locked child and checks it against the
+    /// gate's answer, which the model predicts from the tree before the call.
+    fn compare(
+        run: &Run,
+        locked: &[Option<ModelGrant>],
+        child: &mut Locked,
+        step: usize,
+        op: FsOp,
+        spec: &PathSpec,
+        coverage: &Mutex<KernelCoverage>,
+    ) -> Result<(), String> {
+        let root = &run.tree.root;
+        let requested = render(&run.tree, spec);
+        let name = op.audit().as_str();
+        let before = snapshot(root);
+        let gate = predict(&run.grants, op, &requested);
+        let at_lock = predict(locked, op, &requested);
+        let reply = child.ask(&format!("{name} {step} {}", requested.display()))?;
+        let context = format!(
+            "step {step}: raw {name} `{}` answered `{reply}`",
+            requested.display()
+        );
+        let raw = parse(&reply).ok_or_else(|| format!("{context}: malformed reply"))?;
+        let after = snapshot(root);
+        let mut gaps = Vec::new();
+
+        let kernel = match raw {
+            Raw::Failed(errno) => {
+                ensure(errno > 0, || format!("{context}: no errno"))?;
+                if errno == Errno::ACCESS.raw_os_error() {
+                    *coverage.lock().unwrap().denied.entry(name).or_default() += 1;
+                }
+                if after != before {
+                    left_behind(&context, op, errno, root, &before, &after, locked)?;
+                    gaps.push(Gap::CreateWithoutWrite);
+                }
+                None
+            }
+            Raw::Reached { id, dir, names } => {
+                let needed = if op == FsOp::Create {
+                    let marker = Entry::File(marker(step).into_bytes());
+                    let key = after
+                        .iter()
+                        .find(|(_, entry)| **entry == marker)
+                        .map(|(key, _)| key.clone())
+                        .ok_or_else(|| {
+                            format!("{context}: the kernel wrote a file outside the tree")
+                        })?;
+                    let mut expected = before.clone();
+                    expected.insert(key.clone(), marker);
+                    ensure(after == expected, || {
+                        format!(
+                            "{context}: the create should change only `{}`\nexpected: \
+                             {expected:?}\nafter:    {after:?}",
+                            key.display()
+                        )
+                    })?;
+                    ensure(id_of(&root.join(&key)) == id, || {
+                        format!("{context}: the marker is not in the file it reached")
+                    })?;
+                    if before.contains_key(&key) {
+                        Rights::WRITE
+                    } else {
+                        Rights::CREATE | Rights::WRITE
+                    }
+                } else {
+                    unchanged(&context, &before, root)?;
+                    match op {
+                        FsOp::Open if dir => Rights::LIST,
+                        FsOp::Open => Rights::READ,
+                        FsOp::ReadDir => Rights::LIST,
+                        _ => nothing(),
+                    }
+                };
+                let held = held(locked, id);
+                ensure(held.contains(needed), || {
+                    format!(
+                        "{context}: the kernel allowed it, but the rules give that object \
+                         {held:?}, not {needed:?}"
+                    )
+                })?;
+                if op == FsOp::ReadDir {
+                    let path = find(root, id)
+                        .ok_or_else(|| format!("{context}: the listing is not in the tree"))?;
+                    let mut expected: Vec<String> = fs::read_dir(&path)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                        .collect();
+                    expected.sort();
+                    ensure(names == expected, || {
+                        format!("{context}: listed {names:?}, expected {expected:?}")
+                    })?;
+                }
+                // The gate's open fails with EISDIR on a directory once it
+                // has opened it, so a raw open of one counts as a failure.
+                (!(op == FsOp::Open && dir)).then_some(id)
+            }
+        };
+
+        let gap = classify(op, root, &requested, &gate, &at_lock, locked, kernel)
+            .map_err(|why| format!("{context}: {why}\ngate:    {gate:?}\nat lock: {at_lock:?}"))?;
+        let mut coverage = coverage.lock().unwrap();
+        match gap {
+            None => {
+                let outcome = if kernel.is_some() {
+                    "reached"
+                } else {
+                    "refused"
+                };
+                *coverage
+                    .agreed
+                    .entry(format!("{name} {outcome}"))
+                    .or_default() += 1;
+            }
+            Some(gap) => gaps.push(gap),
+        }
+        for gap in gaps {
+            *coverage.gaps.entry(gap).or_default() += 1;
+        }
+        Ok(())
+    }
+
+    /// Replays one case: the raw calls in a child locked with the case's
+    /// grants, and the same requests through the gate in this process.
+    fn replay(case: &Case, coverage: &Mutex<KernelCoverage>) -> Result<(), String> {
+        let model = Mutex::new(Coverage::default());
+        let mut run = start(case, &model)?;
+        let locked = run.grants.clone();
+        let mut child = Locked::spawn(&locked)?;
+        let offset = case.grants.len();
+        for (step, op) in case.ops.iter().enumerate() {
+            let step = offset + step;
+            match op {
+                Op::Fs(op, spec) => {
+                    if spec.relative {
+                        coverage.lock().unwrap().relative += 1;
+                    } else {
+                        compare(&run, &locked, &mut child, step, *op, spec, coverage)?;
+                    }
+                    run.fs_op(step, *op, spec)?;
+                }
+                // A locked gate refuses new grants, which lock.rs checks.
+                Op::Grant(..) => {}
+                Op::Narrow(grant, bits) => run.narrow(step, *grant, *bits)?,
+                Op::Revoke(grant) => run.revoke(step, *grant)?,
+            }
+        }
+        child.finish()
+    }
+
+    /// The kernel test. Like the model test, it requires that the run met
+    /// every gap and both answers of each operation.
+    #[test]
+    fn raw_calls_differ_from_the_gate_only_where_documented() {
+        let coverage = Mutex::new(KernelCoverage::default());
+        let mut runner = TestRunner::new(config());
+        if let Err(err) = runner.run(&case(), |case| {
+            replay(&case, &coverage).map_err(TestCaseError::fail)
+        }) {
+            panic!("{err}");
+        }
+        let coverage = coverage.into_inner().unwrap();
+        let mut missing = Vec::new();
+        for gap in [
+            Gap::Metadata,
+            Gap::ChangedAfterLock,
+            Gap::NestedGrant,
+            Gap::Route,
+            Gap::CreateWithoutWrite,
+        ] {
+            if !coverage.gaps.contains_key(&gap) {
+                missing.push(format!("{gap:?}"));
+            }
+        }
+        for op in ["open", "create", "metadata", "read_dir"] {
+            for outcome in ["reached", "refused"] {
+                let key = format!("{op} {outcome}");
+                if !coverage.agreed.contains_key(&key) {
+                    missing.push(format!("agreement on {key}"));
+                }
+            }
+        }
+        for op in ["open", "create", "read_dir"] {
+            if !coverage.denied.contains_key(op) {
+                missing.push(format!("EACCES on a raw {op}"));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "the run never reached: {missing:?}\n{coverage:?}"
+        );
+        eprintln!("{coverage:?}");
+    }
+
+    /// One fixed case for each gap, and a grant with no rights, so that each
+    /// is classified the same way on every run.
+    #[test]
+    fn known_gaps_are_classified() {
+        let all = 0b1111;
+        let cases = [
+            // `stat` of the secret, which no grant covers.
+            (
+                Some(Gap::Metadata),
+                Case {
+                    tree: vec![],
+                    grants: vec![(0, all)],
+                    ops: vec![Op::Fs(
+                        FsOp::Metadata,
+                        path(None, vec![Comp::DotDot, Comp::SecretDir, Comp::SecretFile]),
+                    )],
+                },
+            ),
+            // An open after the only grant was revoked.
+            (
+                Some(Gap::ChangedAfterLock),
+                Case {
+                    tree: vec![(0, 0, NodeSpec::File)],
+                    grants: vec![(0, all)],
+                    ops: vec![Op::Revoke(0), Op::Fs(FsOp::Open, path(Some(1), vec![]))],
+                },
+            ),
+            // An open beneath a nested grant that holds only LIST.
+            (
+                Some(Gap::NestedGrant),
+                Case {
+                    tree: vec![(0, 0, NodeSpec::Dir), (1, 1, NodeSpec::File)],
+                    grants: vec![(0, all), (1, 0b1000)],
+                    ops: vec![Op::Fs(FsOp::Open, path(Some(2), vec![]))],
+                },
+            ),
+            // An absolute symlink in one grant to a file in another.
+            (
+                Some(Gap::Route),
+                Case {
+                    tree: vec![
+                        (0, 0, NodeSpec::Dir),
+                        (0, 1, NodeSpec::Dir),
+                        (2, 2, NodeSpec::File),
+                        (1, 3, NodeSpec::Link(LinkSpec::Absolute(3))),
+                    ],
+                    grants: vec![(1, all), (2, all)],
+                    ops: vec![Op::Fs(FsOp::Open, path(Some(4), vec![]))],
+                },
+            ),
+            // A `..` after a symlink, which the kernel takes from the link's
+            // target and the gate removes lexically.
+            (
+                Some(Gap::Route),
+                Case {
+                    tree: vec![
+                        (0, 0, NodeSpec::Dir),
+                        (1, 1, NodeSpec::Dir),
+                        (1, 2, NodeSpec::File),
+                        (0, 3, NodeSpec::Link(LinkSpec::To(2))),
+                    ],
+                    grants: vec![(0, all)],
+                    ops: vec![Op::Fs(
+                        FsOp::Open,
+                        path(Some(4), vec![Comp::DotDot, Comp::Name(2)]),
+                    )],
+                },
+            ),
+            // A create beneath a grant that holds only CREATE.
+            (
+                Some(Gap::CreateWithoutWrite),
+                Case {
+                    tree: vec![],
+                    grants: vec![(0, 0b0100)],
+                    ops: vec![Op::Fs(FsOp::Create, path(None, vec![Comp::Name(0)]))],
+                },
+            ),
+            // A grant with no rights still locks, and the kernel refuses an
+            // open beneath it, as the gate does.
+            (
+                None,
+                Case {
+                    tree: vec![(0, 0, NodeSpec::File)],
+                    grants: vec![(0, 0)],
+                    ops: vec![Op::Fs(FsOp::Open, path(Some(1), vec![]))],
+                },
+            ),
+        ];
+        for (number, (gap, case)) in cases.iter().enumerate() {
+            let coverage = Mutex::new(KernelCoverage::default());
+            if let Err(err) = replay(case, &coverage) {
+                panic!("case {number}: {err}\n{case:?}");
+            }
+            let coverage = coverage.into_inner().unwrap();
+            let expected: BTreeMap<Gap, usize> = gap.iter().map(|gap| (*gap, 1)).collect();
+            assert_eq!(
+                coverage.gaps, expected,
+                "case {number}: {case:?}\n{coverage:?}"
+            );
+        }
+    }
 }
