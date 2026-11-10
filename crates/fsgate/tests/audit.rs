@@ -192,6 +192,47 @@ fn kernel_refusal_is_allow_with_errno() {
     assert!(last.errno.is_some(), "expected an errno, got {last:?}");
 }
 
+/// A symlink out of the grant is refused while the path resolves, after
+/// policy allowed the request, so the event is `allow` with an errno. Without
+/// one it reads as a success. cap-std's component walk, which macOS always
+/// uses, reported this refusal with no errno.
+#[cfg(unix)]
+#[test]
+fn an_escape_is_audited_with_its_errno() {
+    let (_root, granted, outside) = setup();
+    fs::write(outside.join("secret.txt"), b"secret").unwrap();
+    std::os::unix::fs::symlink("../outside", granted.join("link")).unwrap();
+    let all = Rights::READ | Rights::WRITE | Rights::CREATE | Rights::LIST;
+    let (gate, sink) = audited_gate(&granted, all);
+    let exdev = rustix::io::Errno::XDEV.raw_os_error();
+
+    for op in [
+        AuditOp::Open,
+        AuditOp::Create,
+        AuditOp::Metadata,
+        AuditOp::ReadDir,
+    ] {
+        let err = match op {
+            AuditOp::Open => gate.open(granted.join("link/secret.txt")).err(),
+            AuditOp::Create => gate.create(granted.join("link/new.txt")).err(),
+            AuditOp::Metadata => gate.metadata(granted.join("link/secret.txt")).err(),
+            _ => gate.read_dir(granted.join("link")).err(),
+        };
+        assert!(
+            matches!(&err, Some(GateError::Io { source, .. }) if source.raw_os_error() == Some(exdev)),
+            "{op:?}: {err:?}"
+        );
+        let last = sink.events().pop().unwrap();
+        assert_eq!(last.op, op);
+        assert_eq!(last.decision, AuditDecision::Allow);
+        assert_eq!(last.reason, AuditReason::Ok);
+        assert_eq!(last.grant, Some(0));
+        assert_eq!(last.errno, Some(exdev), "{op:?}: {last:?}");
+    }
+    assert!(!outside.join("new.txt").exists());
+    assert_eq!(fs::read(outside.join("secret.txt")).unwrap(), b"secret");
+}
+
 #[test]
 fn lifecycle_events_cover_grant_revoke_and_lock() {
     let (_root, granted, _) = setup();
