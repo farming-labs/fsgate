@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+Not independently reviewed.
+
+### Added
+
+- `fsgate-broker --direct <path>:<rights>` adds a path a confined worker may open itself, with the letters `r`, `l`, and `x`. Those opens are not audited, so it is for runtime files, not data. `--env <name>` passes one variable to a confined worker.
+
+### Changed
+
+- `fsgate-broker` confines its worker by default ([RFC 0008](docs/rfcs/0008-confine-broker-worker.md)). On Linux the worker can open the files a program needs to start and its `--direct` paths, and reaches everything else through the broker. It has no controlling terminal, is killed if the broker dies, and inherits no descriptors beyond its connection and standard streams and no environment beyond its `--env` names. A worker that opens data directly must use `BrokerGate` or `--direct`.
+- Where `fsgate-broker` cannot confine a worker, on macOS or on a kernel without Landlock ABI v3, the worker does not start. To keep the old behavior, pass `--unconfined`.
+- `fsgate-broker --socket` requires `--unconfined`, because a confined worker makes no new connections.
+
 ## 0.2.0 (2026-11-09)
 
 [`fsgate` 0.2.0](https://crates.io/crates/fsgate/0.2.0), built from the signed tag [`v0.2.0`](https://github.com/farming-labs/fsgate/tree/v0.2.0) on `aee17a7`, and the first release published by the trusted-publishing workflow. Not independently reviewed. Everything behind the `experimental-intercept` feature is not part of this release: it builds only from the repository, and the published crate refuses the feature with a compile error. The experimental entries below describe the repository.

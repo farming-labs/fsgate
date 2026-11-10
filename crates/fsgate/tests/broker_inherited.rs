@@ -48,8 +48,14 @@ fn run_under_broker(scenario: &str) -> tempfile::TempDir {
     fs::write(granted.join("a.txt"), b"inside").unwrap();
     fs::write(outside.join("secret.txt"), b"secret").unwrap();
 
+    // These cases are about the connection. Confinement has its own file.
     let mut command = Command::new(env!("CARGO_BIN_EXE_fsgate-broker"));
-    command.args(["--grant", &format!("{}:r", granted.display()), "--"]);
+    command.args([
+        "--unconfined",
+        "--grant",
+        &format!("{}:r", granted.display()),
+        "--",
+    ]);
     child_args(&mut command, scenario);
     let output = command
         .env("FSGATE_GRANTED", &granted)

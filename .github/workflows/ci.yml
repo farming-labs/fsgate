@@ -197,15 +197,16 @@ jobs:
           jq --raw-output 'select(.reason == "compiler-artifact" and .profile.test)
             | .executable' "$RUNNER_TEMP/build.json" >"$results/tests"
           jq --raw-output 'select(.reason == "compiler-artifact" and .profile.test
-            and (.target.name == "launch" or .target.name == "lock"))
+            and (.target.name == "launch" or .target.name == "lock"
+              or .target.name == "broker_confined"))
             | .executable' "$RUNNER_TEMP/build.json" >"$results/no-landlock-tests"
           cat "$results/tests"
           # The library's unit tests, the broker's, and one per tests/*.rs.
           integration=("$(dirname "$manifest")"/tests/*.rs)
           expected=$((2 + ${#integration[@]}))
           found=$(wc -l <"$results/tests")
-          if [ "$found" -ne "$expected" ] || [ "$(wc -l <"$results/no-landlock-tests")" -ne 2 ]; then
-            echo "::error::expected $expected test executables, two of them launch and lock; found $found"
+          if [ "$found" -ne "$expected" ] || [ "$(wc -l <"$results/no-landlock-tests")" -ne 3 ]; then
+            echo "::error::expected $expected test executables, three of them launch, lock, and broker_confined; found $found"
             exit 1
           fi
       - name: Run the tests on Linux ${{ matrix.kernel }}

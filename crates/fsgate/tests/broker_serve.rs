@@ -171,6 +171,7 @@ fn a_full_descriptor_table_does_not_stop_the_broker() {
     let mut broker = Command::new("sh")
         .args(["-c", "ulimit -n 16; exec \"$@\"", "sh"])
         .arg(env!("CARGO_BIN_EXE_fsgate-broker"))
+        .arg("--unconfined")
         .args(["--grant", &format!("{}:r", granted.display())])
         .args(["--socket", &socket.display().to_string()])
         .args(["--", "sh", "-c", "echo ready; read line; exit 0"])

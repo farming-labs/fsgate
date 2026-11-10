@@ -328,6 +328,7 @@ fn broker_binary_serves_and_dies_closed() {
 
     let mut broker = std::process::Command::new(env!("CARGO_BIN_EXE_fsgate-broker"))
         .args([
+            "--unconfined",
             "--grant",
             &format!("{}:rl", granted.display()),
             "--socket",
@@ -381,6 +382,7 @@ fn a_socket_is_owner_only_whatever_the_umask() {
     let mut broker = Command::new("sh")
         .args(["-c", "umask 000; exec \"$@\"", "sh"])
         .arg(env!("CARGO_BIN_EXE_fsgate-broker"))
+        .arg("--unconfined")
         .args(["--grant", &format!("{}:r", granted.display())])
         .args(["--socket", &socket.display().to_string()])
         .args(["--", "sh", "-c", "echo ready; read line; exit 0"])
