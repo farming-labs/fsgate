@@ -544,6 +544,64 @@ mod kernel {
         assert!(reply.contains("alive"), "got {reply:?}");
     }
 
+    /// The gap: the death signal binds only the worker. A program it starts
+    /// never has one, so it outlives a killed broker, still confined. The
+    /// worker could also clear its own, but on its main thread, and libtest
+    /// runs each scenario on another.
+    #[test]
+    fn a_program_a_confined_worker_starts_outlives_its_broker() {
+        let fixture = fixture();
+        let mut broker = broker(
+            &fixture,
+            &confined(&[]),
+            "kernel::starts_a_program_scenario",
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn fsgate-broker");
+        let mut stdin = broker.stdin.take().expect("piped stdin");
+        let mut stdout = BufReader::new(broker.stdout.take().expect("piped stdout"));
+        wait_until_ready(&mut stdout);
+
+        broker.kill().expect("kill the broker");
+        broker.wait().expect("reap the broker");
+
+        stdin.write_all(b"ping\n").expect("the program is gone");
+        let mut reply = String::new();
+        stdout.read_line(&mut reply).expect("read the program");
+        assert!(reply.contains("alive"), "got {reply:?}");
+    }
+
+    #[test]
+    fn starts_a_program_scenario() {
+        if !in_child("kernel::starts_a_program_scenario") {
+            return;
+        }
+        // The program shares this worker's standard streams, and the
+        // broker's death kills only this worker.
+        Command::new(env::current_exe().unwrap())
+            .args(["--exact", "kernel::outlives_scenario", "--nocapture"])
+            .env("FSGATE_CHILD", "kernel::outlives_scenario")
+            .status()
+            .unwrap();
+    }
+
+    #[test]
+    fn outlives_scenario() {
+        if !in_child("kernel::outlives_scenario") {
+            return;
+        }
+        println!("worker ready");
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).unwrap();
+        // It outlived the broker and is still confined.
+        let secret = format!("{}/secret.txt", env::var("FSGATE_OUTSIDE").unwrap());
+        let err = fs::read(secret).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        println!("alive");
+    }
+
     #[test]
     fn waiting_scenario() {
         if !in_child("kernel::waiting_scenario") {

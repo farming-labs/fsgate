@@ -879,6 +879,41 @@ mod kernel {
         (std::env::var("FSGATE_GRANTED").unwrap(), secret)
     }
 
+    /// A grant with no rights, made that way or narrowed to nothing before
+    /// the lock, must not stop the lock, and must reach nothing after it.
+    #[test]
+    fn a_grant_with_no_rights_locks_and_reaches_nothing() {
+        let (_root, granted, outside) = dirs();
+        fs::write(granted.join("a.txt"), b"inside").unwrap();
+
+        run_locked("no_rights_child", &granted, &outside);
+    }
+
+    #[test]
+    fn no_rights_child() {
+        if child_mode("no_rights_child").is_none() {
+            return;
+        }
+        let outside = std::env::var("FSGATE_OUTSIDE").unwrap();
+        let none = Rights::READ.missing_from(Rights::READ);
+        let mut gate = Gate::new();
+        gate.grant(std::env::var("FSGATE_GRANTED").unwrap(), Rights::READ)
+            .unwrap();
+        gate.grant(&outside, Rights::from_bits_truncate(0)).unwrap();
+        let narrowed = gate.grant(&outside, Rights::READ).unwrap();
+        gate.narrow(narrowed, none).unwrap();
+
+        // The raw read of the secret beneath the empty grants is refused.
+        let (granted, secret) = lock_and_prove(&mut gate);
+
+        let err = gate.open(&secret).unwrap_err();
+        assert!(
+            matches!(err, GateError::RightsExceeded { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(fs::read(format!("{granted}/a.txt")).unwrap(), b"inside");
+    }
+
     /// A hard link is an ordinary entry in the directory tree, which is what
     /// Landlock checks, so one made before the lock stays reachable. A locked
     /// process cannot make a new one to a file outside its rules.
