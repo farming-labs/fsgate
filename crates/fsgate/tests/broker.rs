@@ -336,6 +336,55 @@ fn a_prefix_over_the_size_limit_fails_the_connection_closed() {
     assert_closed_without_acting(result, &response, &planted);
 }
 
+/// A listing too large for one frame fails that request. The broker answers
+/// it with an error that fits, so the connection keeps serving.
+#[test]
+fn a_response_over_the_size_limit_fails_only_its_request() {
+    let (_root, granted, _) = setup();
+    let crowded = granted.join("crowded");
+    fs::create_dir(&crowded).unwrap();
+    // JSON writes U+0001 as six bytes, so 800 of these 255-byte names
+    // encode to more than 1 MiB.
+    let stem = "\u{1}".repeat(250);
+    for index in 0..800 {
+        fs::write(crowded.join(format!("{stem}{index:05}")), b"").unwrap();
+    }
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::READ | Rights::LIST).unwrap();
+    let (mut client, _server) = brokered(gate);
+
+    let err = client.read_dir(&crowded).unwrap_err();
+    let GateError::Broker { message } = &err else {
+        panic!("got {err:?}");
+    };
+    assert!(message.contains("1 MiB"), "{message}");
+    assert!(client.open(granted.join("a.txt")).is_ok());
+}
+
+/// A request too large for one frame is never sent. A request that fits but
+/// whose error would not, because the error repeats the path, gets an error
+/// that fits. Either way only that request fails.
+#[test]
+fn a_request_over_the_size_limit_fails_only_itself() {
+    let (_root, granted, _) = setup();
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::READ).unwrap();
+    let (mut client, _server) = brokered(gate);
+
+    for len in [600_000, 2 << 20] {
+        let long = granted.join("x".repeat(len));
+        let err = client.metadata(&long).unwrap_err();
+        assert!(
+            matches!(err, GateError::Broker { .. }),
+            "{len}: got {err:?}"
+        );
+        assert!(
+            client.open(granted.join("a.txt")).is_ok(),
+            "{len}: the connection stopped serving"
+        );
+    }
+}
+
 /// A body that is not exactly one known request fails the connection
 /// instead of being guessed at, including a path that is not UTF-8.
 #[test]
