@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- An audit event for a request that no grant covers, and for a `grant` refused after `lock()`, records the normalized path, as [RFC 0002](docs/rfcs/0002-audit-events.md) specifies. It recorded the path as requested, so `/srv/data/../../etc/shadow` appeared to be a request inside `/srv/data`. The decision itself was always correct.
 - `fsgate-broker --direct` refuses a relative path, as `--grant` does, with a usage error that asks for an absolute one. It used to resolve one against the broker's working directory, so `--direct .:r` under a service started in `/` let the confined worker read the whole filesystem.
 
 ## 0.3.0 (2026-11-09)

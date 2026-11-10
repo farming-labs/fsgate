@@ -536,9 +536,10 @@ impl Gate {
     pub fn grant(&mut self, path: impl AsRef<Path>, rights: Rights) -> Result<Grant, GateError> {
         let requested = path.as_ref();
         if self.locked {
+            let normalized = normalize(requested).ok();
             self.emit(
                 AuditOp::Grant,
-                Some(requested),
+                Some(normalized.as_deref().unwrap_or(requested)),
                 None,
                 AuditDecision::Deny,
                 AuditReason::Locked,
@@ -904,13 +905,22 @@ impl Gate {
         let (index, entry, rel, full) = match self.resolve(path) {
             Ok(resolved) => resolved,
             Err(err) => {
-                let reason = match &err {
-                    GateError::NotAbsolute { .. } => AuditReason::NotAbsolute,
-                    GateError::NoGrant { .. } => AuditReason::NoGrant,
+                // RFC 0002 records the normalized path. A relative path has
+                // none, so it records the path as requested.
+                let (reason, recorded) = match &err {
+                    GateError::NotAbsolute { .. } => (AuditReason::NotAbsolute, path),
+                    GateError::NoGrant { path: full } => (AuditReason::NoGrant, full.as_path()),
                     // resolve() returns no other variants.
-                    _ => AuditReason::Ok,
+                    _ => (AuditReason::Ok, path),
                 };
-                self.emit(origin, Some(path), None, AuditDecision::Deny, reason, None);
+                self.emit(
+                    origin,
+                    Some(recorded),
+                    None,
+                    AuditDecision::Deny,
+                    reason,
+                    None,
+                );
                 return Err(err);
             }
         };
