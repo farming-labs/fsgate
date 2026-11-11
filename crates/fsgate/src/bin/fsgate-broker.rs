@@ -107,7 +107,14 @@ enum Start {
 }
 
 fn main() -> ExitCode {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let argv = match utf8_args(std::env::args_os().skip(1)) {
+        Ok(argv) => argv,
+        Err(message) => {
+            eprintln!("fsgate-broker: {message}");
+            eprintln!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
     #[cfg(target_os = "linux")]
     if argv.first().is_some_and(|first| first == confine::ENTRY) {
         return confine::main(argv.into_iter().skip(1));
@@ -183,18 +190,20 @@ fn run_inherited(
             worker
         }
     };
-    let mut child = worker
-        .spawn()
-        .map_err(|err| format!("spawning `{}` failed: {err}", command[0]))?;
-    // Held open here, the broker would never see the worker hang up.
-    drop(worker_end);
-
     std::thread::scope(|scope| {
-        scope.spawn(|| {
-            // A failed connection fails the worker closed; it does not end
-            // the broker, which waits for the worker's exit code.
-            let _ = broker.serve_conn(broker_end);
-        });
+        // Started before the worker, so no worker runs without one.
+        std::thread::Builder::new()
+            .spawn_scoped(scope, || {
+                // A failed connection fails the worker closed; it does not
+                // end the broker, which waits for the worker's exit code.
+                let _ = broker.serve_conn(broker_end);
+            })
+            .map_err(|err| format!("starting the thread that serves the worker failed: {err}"))?;
+        let mut child = worker
+            .spawn()
+            .map_err(|err| format!("spawning `{}` failed: {err}", command[0]))?;
+        // Held open here, the broker would never see the worker hang up.
+        drop(worker_end);
         let status = child
             .wait()
             .map_err(|err| format!("waiting for `{}` failed: {err}", command[0]))?;
@@ -287,18 +296,26 @@ fn run(args: SocketArgs) -> Result<ExitCode, String> {
 
     let broker = Broker::new(gate);
     std::thread::scope(|scope| {
-        scope.spawn(|| {
-            // A broker that stopped accepting would leave workers hanging.
-            // Exiting fails them closed instead.
-            if let Err(err) = broker.serve(&listener) {
-                eprintln!(
-                    "fsgate-broker: serving `{}` failed: {err}; workers now fail closed",
-                    args.socket.display()
-                );
+        std::thread::Builder::new()
+            .spawn_scoped(scope, || {
+                // A broker that stopped accepting would leave workers
+                // hanging. Exiting fails them closed instead.
+                if let Err(err) = broker.serve(&listener) {
+                    eprintln!(
+                        "fsgate-broker: serving `{}` failed: {err}; workers now fail closed",
+                        args.socket.display()
+                    );
+                    let _ = fs::remove_file(&args.socket);
+                    std::process::exit(1);
+                }
+            })
+            .map_err(|err| {
                 let _ = fs::remove_file(&args.socket);
-                std::process::exit(1);
-            }
-        });
+                format!(
+                    "starting the thread that serves `{}` failed: {err}",
+                    args.socket.display()
+                )
+            })?;
 
         let status = Command::new(&args.command[0])
             .args(&args.command[1..])
@@ -333,6 +350,23 @@ const USAGE: &str = "usage: fsgate-broker --grant <path>:<rights> [--grant ...] 
                      [--audit] [--apply] -- <static-binary> [args...]\n\
                      rights letters: r read, w write, c create, l list; \
                      for --direct: r read, l list, x execute";
+
+/// The arguments as strings. `std::env::args` would panic on one that is not
+/// UTF-8, and the broker protocol carries paths as UTF-8 anyway.
+fn utf8_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Vec<String>, String> {
+    args.enumerate()
+        .map(|(index, arg)| {
+            arg.into_string().map_err(|arg| {
+                format!(
+                    "argument {} (`{}`) is not valid UTF-8; fsgate-broker accepts only UTF-8 \
+                     arguments, so pass this value to the worker another way",
+                    index + 1,
+                    arg.to_string_lossy()
+                )
+            })
+        })
+        .collect()
+}
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut grants = Vec::new();

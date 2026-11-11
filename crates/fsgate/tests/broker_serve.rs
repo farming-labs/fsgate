@@ -272,3 +272,115 @@ fn a_full_descriptor_table_does_not_stop_the_broker() {
     drop(broker.stdin.take());
     assert_eq!(broker.wait().expect("reap broker").code(), Some(0));
 }
+
+/// The real binary when it cannot start a thread for a connection. That
+/// connection is closed, and the broker keeps accepting. The limit is
+/// lowered on the running broker, so only threads it starts afterwards
+/// fail.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_connection_without_a_thread_is_closed_and_serving_continues() {
+    use rustix::process::{Pid, Resource, Rlimit, getrlimit, prlimit};
+
+    let _serial = serial();
+    let (root, granted, _) = setup();
+    let socket = root.path().join("broker.sock");
+    let mut broker = Command::new(env!("CARGO_BIN_EXE_fsgate-broker"))
+        .arg("--unconfined")
+        .args(["--grant", &format!("{}:r", granted.display())])
+        .args(["--socket", &socket.display().to_string()])
+        .args(["--", "sh", "-c", "echo ready; read line; exit 0"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn fsgate-broker");
+    let mut ready = String::new();
+    BufReader::new(broker.stdout.take().expect("piped stdout"))
+        .read_line(&mut ready)
+        .expect("read the broker command's output");
+    assert_eq!(
+        ready, "ready\n",
+        "broker exited before starting its command"
+    );
+
+    let pid = Pid::from_child(&broker);
+    let own = getrlimit(Resource::Nproc);
+    // This user already runs more than one task, so the broker can start
+    // no new one.
+    let none_left = Rlimit {
+        current: Some(1),
+        maximum: own.maximum,
+    };
+    prlimit(Some(pid), Resource::Nproc, none_left).unwrap();
+
+    let file = granted.join("a.txt");
+    let client = || {
+        let stream = UnixStream::connect(&socket).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        BrokerGate::from_stream(stream)
+    };
+    assert!(
+        client().metadata(&file).is_err(),
+        "the broker started a thread past its limit, so this test proved nothing"
+    );
+
+    prlimit(Some(pid), Resource::Nproc, own).unwrap();
+    let stat = client()
+        .metadata(&file)
+        .expect("the broker stopped serving");
+    assert!(stat.is_file);
+
+    drop(broker.stdin.take());
+    assert_eq!(broker.wait().expect("reap broker").code(), Some(0));
+}
+
+/// The real binary when it cannot start the thread that serves its socket:
+/// an error and exit 1, with the socket removed.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_broker_that_cannot_start_its_serve_thread_exits_with_an_error() {
+    let _serial = serial();
+    let (root, granted, _) = setup();
+    let socket = root.path().join("broker.sock");
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "no_threads_scenario", "--nocapture"])
+        .env("FSGATE_NO_THREADS_SOCKET", &socket)
+        .env("FSGATE_NO_THREADS_GRANTED", &granted)
+        .output()
+        .expect("run the scenario");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("thread"), "{stderr}");
+    assert!(!socket.exists(), "the broker left its socket behind");
+}
+
+/// Starts the broker with no tasks left for this user. `exec` replaces
+/// this process without starting one.
+#[cfg(target_os = "linux")]
+#[test]
+fn no_threads_scenario() {
+    use std::os::unix::process::CommandExt;
+
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
+    let Some(socket) = std::env::var_os("FSGATE_NO_THREADS_SOCKET") else {
+        return;
+    };
+    let granted = std::env::var("FSGATE_NO_THREADS_GRANTED").unwrap();
+    let own = getrlimit(Resource::Nproc);
+    let none_left = Rlimit {
+        current: Some(1),
+        maximum: own.maximum,
+    };
+    setrlimit(Resource::Nproc, none_left).unwrap();
+    let err = Command::new(env!("CARGO_BIN_EXE_fsgate-broker"))
+        .arg("--unconfined")
+        .args(["--grant", &format!("{granted}:r")])
+        .arg("--socket")
+        .arg(socket)
+        .args(["--", "true"])
+        .exec();
+    panic!("exec failed: {err}");
+}
