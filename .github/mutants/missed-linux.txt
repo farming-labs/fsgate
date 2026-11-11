@@ -14,6 +14,11 @@ crates/fsgate/src/broker.rs: replace peer_uid -> io::Result<u32> with Ok(1)
 crates/fsgate/src/containment.rs: replace apply -> Result<Applied, GateError> with Ok(Default::default())
 crates/fsgate/src/containment.rs: replace == with != in apply
 
+# The filter's `install` for architectures that have no filter, which x86_64
+# does not build. It shares its name with the x86_64 one, which the tests
+# catch.
+crates/fsgate/src/bin/fsgate-broker/confine.rs: replace unix_socket_filter::install -> Result<(), String> with Ok(())
+
 # The Linux `apply` checks that a strict lock ended fully enforced. The
 # mutant checks a best-effort one instead, which differs only on a kernel
 # below Landlock ABI v3. `best_effort_lock_reports_library_only` catches it
@@ -34,6 +39,27 @@ crates/fsgate/src/containment.rs: replace | with ^ in apply
 crates/fsgate/src/bin/fsgate-broker/confine.rs: replace | with ^ in restrict
 crates/fsgate/src/bin/fsgate-broker/confine.rs: replace | with ^ in restrict
 crates/fsgate/src/bin/fsgate-broker/confine.rs: replace | with ^ in restrict
+
+# So are the supervisor's wait options and the parts of each instruction and
+# answer in the Unix socket filter, so `^` builds the same value as `|`.
+# The four without a function are in the filter's `PROGRAM`. `BPF_LD` and
+# `BPF_W` are both 0, so `&` between them in `load` gives 0 too.
+crates/fsgate/src/bin/fsgate-broker/confine.rs: replace | with ^ in Running::finish
+crates/fsgate/src/bin/fsgate-broker/confine.rs: replace | with ^
+crates/fsgate/src/bin/fsgate-broker/confine.rs: replace | with ^
+crates/fsgate/src/bin/fsgate-broker/confine.rs: replace | with ^
+crates/fsgate/src/bin/fsgate-broker/confine.rs: replace | with ^
+crates/fsgate/src/bin/fsgate-broker/confine.rs: replace | with ^ in unix_socket_filter::native::load
+crates/fsgate/src/bin/fsgate-broker/confine.rs: replace | with & in unix_socket_filter::native::load
+crates/fsgate/src/bin/fsgate-broker/confine.rs: replace | with ^ in unix_socket_filter::native::answer
+crates/fsgate/src/bin/fsgate-broker/confine.rs: replace | with ^ in unix_socket_filter::native::jump
+crates/fsgate/src/bin/fsgate-broker/confine.rs: replace | with ^ in unix_socket_filter::native::jump
+
+# Below Linux 7.1, as on the runner, the answer is false anyway. From 7.1
+# the mutant installs the filter where Landlock already refuses the same
+# connects, which `below_linux_7_1_a_confined_worker_cannot_create_a_unix_socket`
+# catches in the kernels job's 7.3 boot.
+crates/fsgate/src/bin/fsgate-broker/confine.rs: replace refuses_unix_connects -> bool with false
 
 # The connection is never descriptor 3. std reopens a closed standard stream
 # at startup, the broker opens at least one grant before the connection's

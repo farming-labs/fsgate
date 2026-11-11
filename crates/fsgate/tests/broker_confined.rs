@@ -226,7 +226,7 @@ mod kernel {
     use std::env;
     use std::fs::{self, File};
     use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
-    use std::os::fd::{AsFd, AsRawFd};
+    use std::os::fd::AsRawFd;
     use std::os::linux::net::SocketAddrExt;
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::net::{SocketAddr, UnixDatagram, UnixListener, UnixStream};
@@ -442,25 +442,44 @@ mod kernel {
 
     /// A descriptor the broker's parent left open would outlive the sandbox,
     /// because Landlock does not restrict what was opened before it applied.
+    /// The worker closes two, one on each side of its connection's number:
+    /// 3, which `sh` opens before it becomes the broker, and one numbered 900
+    /// or more. A stray at whatever number the test process had free could
+    /// land on either side, and then only that side was checked.
     #[test]
     fn a_descriptor_the_parent_left_open_is_closed_in_the_worker() {
         let fixture = fixture();
-        let stray = File::open(fixture.outside.join("secret.txt")).unwrap();
-        rustix::io::fcntl_setfd(stray.as_fd(), FdFlags::empty()).unwrap();
-        let number = stray.as_raw_fd().to_string();
+        let secret = fixture.outside.join("secret.txt");
+        let stray = File::open(&secret).unwrap();
+        let high = rustix::io::fcntl_dupfd_cloexec(&stray, 900).unwrap();
+        rustix::io::fcntl_setfd(&high, FdFlags::empty()).unwrap();
+        let numbers = format!("3,{}", high.as_raw_fd());
         let inode = stray.metadata().unwrap().ino().to_string();
 
-        let extra = ["FSGATE_EXPECT", "FSGATE_STRAY", "FSGATE_STRAY_INODE"];
+        let extra = ["FSGATE_EXPECT", "FSGATE_STRAYS", "FSGATE_STRAY_INODE"];
         for (flags, expect) in [(confined(&extra), "denied"), (unconfined(), "allowed")] {
-            let output = broker(&fixture, &flags, "kernel::stray_scenario")
+            let command = broker(&fixture, &flags, "kernel::stray_scenario");
+            let mut through_sh = Command::new("sh");
+            through_sh
+                .args(["-c", "exec 3<\"$0\" && exec \"$@\""])
+                .arg(&secret)
+                .arg(command.get_program())
+                .args(command.get_args())
                 .env("FSGATE_EXPECT", expect)
-                .env("FSGATE_STRAY", &number)
-                .env("FSGATE_STRAY_INODE", &inode)
-                .output()
-                .expect("run fsgate-broker");
+                .env("FSGATE_STRAYS", &numbers)
+                .env("FSGATE_STRAY_INODE", &inode);
+            for (key, value) in command.get_envs() {
+                if let Some(value) = value {
+                    through_sh.env(key, value);
+                }
+            }
+            if let Some(dir) = command.get_current_dir() {
+                through_sh.current_dir(dir);
+            }
+            let output = through_sh.output().expect("run fsgate-broker through sh");
             assert_ran(&output);
         }
-        drop(stray);
+        drop(high);
     }
 
     #[test]
@@ -468,13 +487,14 @@ mod kernel {
         if !in_child("kernel::stray_scenario") {
             return;
         }
-        let number = env::var("FSGATE_STRAY").unwrap();
         let inode: u64 = env::var("FSGATE_STRAY_INODE").unwrap().parse().unwrap();
-        // `stat` works under Landlock. The inode tells this descriptor from
-        // something else that took its number.
-        let open =
-            fs::metadata(format!("/proc/self/fd/{number}")).is_ok_and(|meta| meta.ino() == inode);
-        assert_eq!(open, !expect_denied());
+        for number in env::var("FSGATE_STRAYS").unwrap().split(',') {
+            // `stat` works under Landlock. The inode tells this descriptor
+            // from something else that took its number.
+            let open = fs::metadata(format!("/proc/self/fd/{number}"))
+                .is_ok_and(|meta| meta.ino() == inode);
+            assert_eq!(open, !expect_denied(), "descriptor {number}");
+        }
     }
 
     #[test]

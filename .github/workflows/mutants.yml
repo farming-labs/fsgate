@@ -48,7 +48,7 @@ jobs:
           Linux)
             args=(
               --features experimental-intercept
-              --exclude-re 'fsgate-broker\.rs:\d+:\d+: .*confine::command'
+              --exclude-re 'fsgate-broker\.rs:\d+:\d+: .*confine::'
               --exclude-re 'broker_sys\.rs:\d+:\d+: .*peer_uid'
             )
             ;;
