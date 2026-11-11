@@ -59,9 +59,11 @@ fn serving(gate: Gate, path: &Path, options: ServeOptions) {
     thread::spawn(move || Broker::new(gate).serve_with(&listener, options));
 }
 
-/// Sends `bytes` on a new connection and returns everything the broker
-/// answers. The broker may hang up first, which each platform reports
-/// differently on the write and the read.
+/// Sends `bytes` on a new connection, hangs up its own side, and returns
+/// everything the broker answers. A broker that serves the request then
+/// sees the hang-up and closes, so a wrong answer fails the test instead of
+/// leaving it waiting. The broker may hang up first, which each platform
+/// reports differently on the write, the shutdown, and the read.
 fn raw_answer(socket: &Path, bytes: &[u8]) -> Vec<u8> {
     let hung_up = |err: &std::io::Error| {
         matches!(
@@ -74,6 +76,11 @@ fn raw_answer(socket: &Path, bytes: &[u8]) -> Vec<u8> {
         Ok(()) => {}
         Err(err) if hung_up(&err) => {}
         Err(err) => panic!("writing failed: {err}"),
+    }
+    match stream.shutdown(std::net::Shutdown::Write) {
+        Ok(()) => {}
+        Err(err) if hung_up(&err) => {}
+        Err(err) => panic!("shutdown failed: {err}"),
     }
     let mut answer = Vec::new();
     match stream.read_to_end(&mut answer) {
@@ -161,6 +168,62 @@ fn connections_past_the_limit_are_closed_until_one_ends() {
             Err(GateError::Broker { .. }) if Instant::now() < deadline => thread::yield_now(),
             Err(err) => panic!("the slot was never freed: {err:?}"),
         }
+    }
+}
+
+/// Each option keeps the ones set before it: a limit set first still holds
+/// after the peers are chosen.
+#[test]
+fn choosing_peers_keeps_the_connection_limit() {
+    let _serial = serial();
+    for options in [
+        ServeOptions::default()
+            .max_connections(NonZeroUsize::MIN)
+            .any_peer(),
+        ServeOptions::default()
+            .max_connections(NonZeroUsize::MIN)
+            .allow_peer_uids([own_uid()]),
+    ] {
+        let (root, granted, _) = setup();
+        let mut gate = Gate::new();
+        gate.grant(&granted, Rights::READ).unwrap();
+        let socket = root.path().join("broker.sock");
+        serving(gate, &socket, options.clone());
+        let file = granted.join("a.txt");
+
+        let mut first = BrokerGate::connect(&socket).unwrap();
+        assert!(first.metadata(&file).unwrap().is_file);
+        let body = serde_json::json!({ "op": "metadata", "path": file }).to_string();
+        let answer = raw_answer(&socket, &frame(body.len() as u32, body.as_bytes()));
+        assert!(answer.is_empty(), "past the limit under {options:?}");
+    }
+}
+
+/// `serve` returns when its listener fails, rather than retrying. A
+/// non-blocking listener with nothing waiting fails with `EAGAIN`, which
+/// is not a shortage that can pass.
+#[test]
+fn serve_returns_when_its_listener_fails() {
+    let _serial = serial();
+    let (root, granted, _) = setup();
+    let socket = root.path().join("broker.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::READ).unwrap();
+
+    let (done, result) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let broker = Broker::new(gate);
+        let _ = done.send(broker.serve(&listener));
+        let _ = done.send(broker.serve_with(&listener, ServeOptions::default()));
+    });
+    for _ in 0..2 {
+        let served = result
+            .recv_timeout(Duration::from_secs(5))
+            .expect("serve kept accepting after its listener failed");
+        let err = served.expect_err("serve returned without an error");
+        assert_eq!(err.kind(), ErrorKind::WouldBlock, "{err}");
     }
 }
 

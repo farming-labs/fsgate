@@ -188,13 +188,18 @@ fn inheritable(fd: BorrowedFd<'_>) -> String {
 }
 
 fn assert_refused(value: Option<&str>, stays_open: bool, stdin: Stdio) {
+    assert_refused_with(value, stays_open, stdin, Stdio::piped());
+}
+
+fn assert_refused_with(value: Option<&str>, stays_open: bool, stdin: Stdio, stderr: Stdio) {
     let mut command = Command::new(env::current_exe().unwrap());
     command
         .args(["--exact", "refusal_scenario", "--nocapture"])
         .env("FSGATE_CHILD", "refusal_scenario")
         .env("FSGATE_STAYS_OPEN", if stays_open { "1" } else { "" })
         .env_remove("FSGATE_BROKER_FD")
-        .stdin(stdin);
+        .stdin(stdin)
+        .stderr(stderr);
     if let Some(value) = value {
         command.env("FSGATE_BROKER_FD", value);
     }
@@ -216,6 +221,14 @@ fn from_inherited_refuses_anything_but_an_inherited_connection() {
     // A real Unix stream socket, so only its number can be why it is refused.
     let (stdin, _peer) = UnixStream::pair().unwrap();
     assert_refused(Some("0"), true, Stdio::from(OwnedFd::from(stdin)));
+    // The highest standard stream, the last number refused for that alone.
+    let (stderr, _peer) = UnixStream::pair().unwrap();
+    assert_refused_with(
+        Some("2"),
+        true,
+        Stdio::null(),
+        Stdio::from(OwnedFd::from(stderr)),
+    );
 
     let file = File::open(env::current_exe().unwrap()).unwrap();
     assert_refused(Some(&inheritable(file.as_fd())), true, Stdio::null());

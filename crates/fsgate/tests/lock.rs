@@ -52,6 +52,32 @@ fn best_effort_lock_ends_the_granting_phase() {
     assert!(matches!(err, GateError::Locked), "got {err:?}");
 }
 
+/// `restrict` and `require` take sets built with these operators, and a
+/// set prints as its members.
+#[test]
+fn restrictions_combine_and_print_as_a_set() {
+    let signal = Restrictions::SIGNAL;
+    let devices_and_signal = Restrictions::IOCTL_DEV | signal;
+    assert_eq!(devices_and_signal | signal, devices_and_signal);
+    assert_eq!(
+        Restrictions::all() - signal,
+        Restrictions::IOCTL_DEV
+            | Restrictions::ABSTRACT_UNIX_SOCKET
+            | Restrictions::ALL_THREADS
+            | Restrictions::RESOLVE_UNIX
+    );
+    assert_eq!(signal - Restrictions::all(), Restrictions::empty());
+    assert_eq!(devices_and_signal & signal, signal);
+
+    assert!(Restrictions::empty().is_empty());
+    assert!(!signal.is_empty());
+    assert!(devices_and_signal.contains(signal));
+    assert!(!signal.contains(devices_and_signal));
+
+    assert_eq!(format!("{devices_and_signal:?}"), "IOCTL_DEV | SIGNAL");
+    assert_eq!(format!("{:?}", Restrictions::empty()), "(none)");
+}
+
 /// A required restriction binds even under `BestEffort`, and a lock that
 /// cannot meet it changes nothing (RFC 0006).
 #[cfg(not(target_os = "linux"))]

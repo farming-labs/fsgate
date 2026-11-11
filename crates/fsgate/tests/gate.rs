@@ -250,6 +250,32 @@ fn assert_is_escape(err: &GateError) {
     );
 }
 
+/// Only an escape becomes `EXDEV`. A file the process may not read beneath
+/// the grant keeps `EACCES`, so its audit event and a broker's worker see
+/// a permission problem, not an escape.
+#[cfg(unix)]
+#[test]
+fn a_permission_denied_open_keeps_its_errno() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_root, granted, _) = setup();
+    let locked = granted.join("locked.txt");
+    fs::write(&locked, b"locked").unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::READ).unwrap();
+
+    let err = gate.open(&locked).unwrap_err();
+    let GateError::Io { source, .. } = &err else {
+        panic!("got {err:?}");
+    };
+    assert_eq!(
+        source.raw_os_error(),
+        Some(rustix::io::Errno::ACCESS.raw_os_error()),
+        "got {err:?}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn absolute_symlink_target_cannot_escape() {
@@ -642,4 +668,20 @@ fn a_symlink_swapped_during_resolution_never_reaches_outside() {
         Path::new("real/secret.txt"),
         Path::new("../outside/secret.txt"),
     );
+}
+
+/// A union of rights holds each right once, and the error messages name
+/// rights through `Debug`.
+#[test]
+fn rights_combine_and_print_as_a_set() {
+    let read_list = Rights::READ | Rights::LIST;
+    assert_eq!(read_list | Rights::READ, read_list);
+    assert_eq!(Rights::WRITE | Rights::WRITE, Rights::WRITE);
+
+    assert_eq!(format!("{read_list:?}"), "READ | LIST");
+    assert_eq!(
+        format!("{:?}", Rights::from_bits_truncate(0b1111)),
+        "READ | WRITE | CREATE | LIST"
+    );
+    assert_eq!(format!("{:?}", Rights::from_bits_truncate(0)), "(none)");
 }

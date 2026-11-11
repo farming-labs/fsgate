@@ -1,0 +1,5 @@
+# Mutants the tests miss on Linux, each with the reason it cannot change
+# behavior there. The `mutants` workflow fails when the mutants it misses
+# differ from this list. A line is a mutant as `cargo mutants --list` names
+# it, without its line and column, so a name that occurs twice in a file is
+# listed once for each miss.
