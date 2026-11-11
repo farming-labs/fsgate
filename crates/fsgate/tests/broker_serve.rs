@@ -9,6 +9,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::num::NonZeroUsize;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -28,6 +29,9 @@ fn serial() -> MutexGuard<'static, ()> {
 
 fn setup() -> (TempDir, PathBuf, PathBuf) {
     let root = tempfile::tempdir().expect("create temp root");
+    // `--socket` refuses a directory that others can write to, and under
+    // `umask 000` a new one is.
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let granted = root.path().join("granted");
     let outside = root.path().join("outside");
     fs::create_dir(&granted).unwrap();
