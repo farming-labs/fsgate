@@ -200,9 +200,9 @@ Started. Today each attack in the threat model has a test written for it, and on
   Evidence: [CI](https://github.com/farming-labs/fsgate/actions/runs/42907442197) on `0f2e46a` passed both tests in `gate_model.rs` on the `ubuntu-26.04` runner's kernel, where the gate resolves with `openat2`, in all three runs of the `check` job (the checkout, `experimental-intercept`, and the packaged crate), on Rust 1.85 in the `msrv` job, and on macOS, where it uses cap-std's component walk. Each default run is 512 cases. On macOS, two runs of 20,000 cases also passed. The test found two defects in how refusals are recorded, fixed in [#58](https://github.com/farming-labs/fsgate/pull/58) and [#59](https://github.com/farming-labs/fsgate/pull/59); the decisions themselves were correct. The two controls fail within a second. The generator makes no hard links, mounts, or concurrent renames, and the model follows RFC 0001, so it cannot find a flaw in the RFC's own rules.
 - [ ] Gate and kernel agree. On Linux, replay the generated cases as raw opens in a locked child. Acceptance: every place the kernel and the gate answer differently is one the threat model documents, such as a nested grant's lesser right, or it is fixed.
 - [ ] Mutation testing of the security core (`lib.rs`, `containment.rs`, `broker.rs`, `broker_sys.rs`, and `fsgate-broker` with `confine.rs`) with `cargo-mutants`, on Linux and macOS. Acceptance: the caught and missed counts are recorded, and each missed mutant in an authorization, resolution, or confinement path gets a test that catches it or a written reason it cannot change behavior.
-- [ ] More fuzzing: targets for the `--grant` and `--direct` parsers and for path resolution beneath a fixed tree, where nothing outside the tree may be reached. Run every target on a weekly schedule as well as when the code changes. Acceptance: each target has seeds and a recorded run with its duration, and every crash becomes a regression test.
+- [x] More fuzzing: targets for the `--grant` and `--direct` parsers and for path resolution beneath a fixed tree, where nothing outside the tree may be reached. Run every target on a weekly schedule as well as when the code changes. Acceptance: each target has seeds and a recorded run with its duration, and every crash becomes a regression test.
 
-  Started. Two targets join `broker_requests` in [`fuzz/`](fuzz/README.md), each with seeds and a dictionary:
+  Evidence ([#81](https://github.com/farming-labs/fsgate/pull/81)): two targets join `broker_requests` in [`fuzz/`](fuzz/README.md), each with seeds and a dictionary.
   - `gate_paths` runs `open`, `create`, `metadata`, and `read_dir` on arbitrary paths through one gate. Its three nested grants cover a fixed tree whose symlinks stay inside, climb out, are absolute, dangle, or loop. It fails if a success reaches an object outside the grant the path routes to, checked by device and inode. It also fails if a refusal is not the one the routing calls for, or if anything changes but the file a `create` returned.
   - `broker_args` compares `fsgate-broker`'s parser with a restatement of its rules, for each `--grant` and `--direct` spec and for the mode the options select. The parser moved unchanged into [`fsgate-broker/args.rs`](crates/fsgate/src/bin/fsgate-broker/args.rs) so the target can include it.
   - [`fuzz.yml`](.github/workflows/fuzz.yml) runs every target on Linux, and `gate_paths` on macOS too. Each runs for 15 minutes when the crate or a harness changes, and for an hour every Monday.
@@ -219,14 +219,18 @@ Started. Today each attack in the threat model has a test written for it, and on
 
   At first the last control was not found in five minutes, twice: once with a dictionary of the option names and once with each name ending in a NUL. One input byte now stands for an option, so changing it swaps one option for another.
 
-  Recorded runs on macOS, with no crash, hang, or check failure:
+  Recorded runs, none with a crash, hang, or check failure. The first two ran locally; the rest are the [`fuzz` jobs](https://github.com/farming-labs/fsgate/actions/runs/43089069857) on `144078d`, with the same seeds and flags.
 
-  | Target | Seconds | Inputs | Per second | Corpus | Coverage counters |
-  |---|---|---|---|---|---|
-  | `gate_paths` | 901 | 371,858 | 412 | 9 seeds to 564 inputs (82 KiB) | 1,037 to 1,095 |
-  | `broker_args` | 901 | 5,846,233 | 6,488 | 19 seeds to 733 inputs (167 KiB) | 442 to 614 |
+  | Target | Where | Seconds | Inputs | Per second | Corpus | Coverage counters | libFuzzer seed |
+  |---|---|---|---|---|---|---|---|
+  | `gate_paths` | macOS 26.2, Apple M1 | 901 | 371,858 | 412 | 9 seeds to 564 inputs (82 KiB) | 1,037 to 1,095 | 4200607416 |
+  | `broker_args` | macOS 26.2, Apple M1 | 901 | 5,846,233 | 6,488 | 19 seeds to 733 inputs (167 KiB) | 442 to 614 | 4200606091 |
+  | `gate_paths` | Linux 7.0.0-1019-azure x86_64 | 901 | 411,576 | 456 | 9 seeds to 405 inputs (63 KiB) | 840 to 873 | 859958495 |
+  | `broker_args` | Linux 7.0.0-1019-azure x86_64 | 901 | 3,155,653 | 3,502 | 19 seeds to 759 inputs (211 KiB) | 444 to 622 | 2992076140 |
+  | `broker_requests` | Linux 7.0.0-1019-azure x86_64 | 901 | 26,466,766 | 29,374 | 14 seeds to 1,376 inputs (74 KiB) | 1,013 to 2,111 | 2081091315 |
+  | `gate_paths` | macOS runner, Darwin 25.6.0 arm64 | 901 | 385,580 | 427 | 9 seeds to 566 inputs (82 KiB) | 1,037 to 1,098 | 1508359095 |
 
-  Toolchain: rustc 1.102.0-nightly (`f5cedb83a` 2026-11-07), cargo-fuzz 0.13.2, libfuzzer-sys 0.4.13, with AddressSanitizer, on macOS 26.2 (Apple M1). libFuzzer seeds 4200607416 and 4200606091. Neither run found a crash, so there is no crash regression test.
+  Toolchain everywhere: rustc 1.102.0-nightly (`f5cedb83a` 2026-11-07), cargo-fuzz 0.13.2, libfuzzer-sys 0.4.13, with AddressSanitizer. No run found a crash, so there is no crash regression test. `gate_paths` resolves with `openat2` on Linux and with cap-std's component walk on macOS, so the two platforms cover different code. The weekly run starts once this workflow is on `main`.
 
   The tree has no hard links or mounts, and no rename happens while a path resolves; the threat model lists those gaps. The parser's restatement follows the same rules, so it cannot find a flaw in the rules themselves. The corpus is not kept between CI runs, so each run starts from the seeds.
 - [ ] More kernels and an architecture. Add Linux 6.1 (Landlock ABI v2, below fsgate's floor, where a strict `lock()` and a confined worker must fail closed) and 6.12 (the first kernel with signal and abstract socket scopes) to the `kernels` job, and run `check` on an arm64 runner too. Acceptance: the threat model's row for Landlock ABI below v3 names a test.
