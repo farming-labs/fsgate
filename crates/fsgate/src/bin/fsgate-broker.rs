@@ -24,7 +24,8 @@
 //!
 //! `--unconfined` starts the child with this process's own environment and
 //! filesystem access. `--socket`, which needs it, creates an owner-only
-//! socket at that path and passes the path in `FSGATE_BROKER_SOCKET`.
+//! socket at that path and passes the path in `FSGATE_BROKER_SOCKET`. It
+//! refuses a path through a directory another user could change.
 //!
 //! Experimental interception mode (RFC 0004; built with the
 //! `experimental-intercept` feature, Linux x86_64 only, unsupported):
@@ -62,10 +63,14 @@ mod confine;
 #[cfg(not(target_os = "linux"))]
 mod confine {
     use std::os::fd::RawFd;
+    use std::path::PathBuf;
     use std::process::Command;
+
+    use fsgate::Rights;
 
     pub(super) fn command(
         _: RawFd,
+        _: &[(PathBuf, Rights)],
         _: &[String],
         _: &[String],
         _: &[String],
@@ -106,7 +111,14 @@ enum Start {
 }
 
 fn main() -> ExitCode {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let argv = match utf8_args(std::env::args_os().skip(1)) {
+        Ok(argv) => argv,
+        Err(message) => {
+            eprintln!("fsgate-broker: {message}");
+            eprintln!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
     #[cfg(target_os = "linux")]
     if argv.first().is_some_and(|first| first == confine::ENTRY) {
         return confine::main(argv.into_iter().skip(1));
@@ -172,7 +184,7 @@ fn run_inherited(
 
     let mut worker = match start {
         Start::Confined { direct, env } => {
-            confine::command(worker_end.as_raw_fd(), &direct, &env, command)?
+            confine::command(worker_end.as_raw_fd(), grants, &direct, &env, command)?
         }
         Start::Unconfined => {
             let mut worker = Command::new(&command[0]);
@@ -182,23 +194,79 @@ fn run_inherited(
             worker
         }
     };
-    let mut child = worker
-        .spawn()
-        .map_err(|err| format!("spawning `{}` failed: {err}", command[0]))?;
-    // Held open here, the broker would never see the worker hang up.
-    drop(worker_end);
-
     std::thread::scope(|scope| {
-        scope.spawn(|| {
-            // A failed connection fails the worker closed; it does not end
-            // the broker, which waits for the worker's exit code.
-            let _ = broker.serve_conn(broker_end);
-        });
+        // Started before the worker, so no worker runs without one.
+        std::thread::Builder::new()
+            .spawn_scoped(scope, || {
+                // A failed connection fails the worker closed; it does not
+                // end the broker, which waits for the worker's exit code.
+                let _ = broker.serve_conn(broker_end);
+            })
+            .map_err(|err| format!("starting the thread that serves the worker failed: {err}"))?;
+        let mut child = worker
+            .spawn()
+            .map_err(|err| format!("spawning `{}` failed: {err}", command[0]))?;
+        // Held open here, the broker would never see the worker hang up.
+        drop(worker_end);
         let status = child
             .wait()
             .map_err(|err| format!("waiting for `{}` failed: {err}", command[0]))?;
         std::process::exit(status.code().unwrap_or(1))
     })
+}
+
+/// Refuses a socket path that another user could replace. Workers find the
+/// broker by this path, so whoever can rename an entry along it can put
+/// their own socket there. Every directory the path passes through, before
+/// and after resolving symlinks, must belong to this user or root, and
+/// must not be writable by others unless it is sticky, as `/tmp` is.
+fn check_socket_path(socket: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let refuse = |dir: &Path, why: &str| {
+        format!(
+            "`--socket {}`: `{}` {why}, so another user could replace the socket; \
+             use a directory that only you and root can change",
+            socket.display(),
+            dir.display()
+        )
+    };
+    let absolute = std::path::absolute(socket)
+        .map_err(|err| format!("`--socket {}`: {err}", socket.display()))?;
+    let parent = absolute
+        .parent()
+        .ok_or_else(|| format!("`--socket {}` names no file", socket.display()))?;
+    let me = rustix::process::geteuid().as_raw();
+    let mut checked = Vec::new();
+    for prefix in parent.ancestors() {
+        let resolved = fs::canonicalize(prefix).map_err(|err| {
+            format!(
+                "`--socket {}`: `{}`: {err}",
+                socket.display(),
+                prefix.display()
+            )
+        })?;
+        for dir in resolved.ancestors() {
+            if checked.iter().any(|seen: &PathBuf| seen == dir) {
+                continue;
+            }
+            let meta = fs::metadata(dir).map_err(|err| {
+                format!(
+                    "`--socket {}`: `{}`: {err}",
+                    socket.display(),
+                    dir.display()
+                )
+            })?;
+            if meta.uid() != me && meta.uid() != 0 {
+                return Err(refuse(dir, "belongs to another user"));
+            }
+            if meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0 {
+                return Err(refuse(dir, "is writable by other users and not sticky"));
+            }
+            checked.push(dir.to_path_buf());
+        }
+    }
+    Ok(())
 }
 
 /// Creates an owner-only socket at `path`. A connect before `listen` is
@@ -222,6 +290,7 @@ fn bind_owner_only(path: &Path) -> io::Result<UnixListener> {
 fn run(args: SocketArgs) -> Result<ExitCode, String> {
     let gate = gate_from(&args.grants)?;
 
+    check_socket_path(&args.socket)?;
     let listener = bind_owner_only(&args.socket).map_err(|err| {
         format!(
             "binding socket `{}` failed: {err}; remove a stale socket file first",
@@ -231,18 +300,26 @@ fn run(args: SocketArgs) -> Result<ExitCode, String> {
 
     let broker = Broker::new(gate);
     std::thread::scope(|scope| {
-        scope.spawn(|| {
-            // A broker that stopped accepting would leave workers hanging.
-            // Exiting fails them closed instead.
-            if let Err(err) = broker.serve(&listener) {
-                eprintln!(
-                    "fsgate-broker: serving `{}` failed: {err}; workers now fail closed",
-                    args.socket.display()
-                );
+        std::thread::Builder::new()
+            .spawn_scoped(scope, || {
+                // A broker that stopped accepting would leave workers
+                // hanging. Exiting fails them closed instead.
+                if let Err(err) = broker.serve(&listener) {
+                    eprintln!(
+                        "fsgate-broker: serving `{}` failed: {err}; workers now fail closed",
+                        args.socket.display()
+                    );
+                    let _ = fs::remove_file(&args.socket);
+                    std::process::exit(1);
+                }
+            })
+            .map_err(|err| {
                 let _ = fs::remove_file(&args.socket);
-                std::process::exit(1);
-            }
-        });
+                format!(
+                    "starting the thread that serves `{}` failed: {err}",
+                    args.socket.display()
+                )
+            })?;
 
         let status = Command::new(&args.command[0])
             .args(&args.command[1..])
@@ -277,6 +354,23 @@ const USAGE: &str = "usage: fsgate-broker --grant <path>:<rights> [--grant ...] 
                      [--audit] [--apply] -- <static-binary> [args...]\n\
                      rights letters: r read, w write, c create, l list; \
                      for --direct: r read, l list, x execute";
+
+/// The arguments as strings. `std::env::args` would panic on one that is not
+/// UTF-8, and the broker protocol carries paths as UTF-8 anyway.
+fn utf8_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Vec<String>, String> {
+    args.enumerate()
+        .map(|(index, arg)| {
+            arg.into_string().map_err(|arg| {
+                format!(
+                    "argument {} (`{}`) is not valid UTF-8; fsgate-broker accepts only UTF-8 \
+                     arguments, so pass this value to the worker another way",
+                    index + 1,
+                    arg.to_string_lossy()
+                )
+            })
+        })
+        .collect()
+}
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut grants = Vec::new();

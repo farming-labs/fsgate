@@ -19,6 +19,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+use fsgate::Rights;
 use landlock::{
     ABI, Access, AccessFs, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd, PathFdError,
     Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus, Scope,
@@ -39,10 +40,12 @@ const RUNTIME_DIRS: [&str; 5] = ["/usr", "/lib", "/lib64", "/bin", "/sbin"];
 /// started. `direct` and `env` were validated when the broker parsed them.
 pub(super) fn command(
     connection: RawFd,
+    grants: &[(PathBuf, Rights)],
     direct: &[String],
     env: &[String],
     worker: &[String],
 ) -> Result<Command, String> {
+    check_overlap(grants, direct)?;
     let mut command = Command::new("/proc/self/exe");
     command
         .arg0("fsgate-broker")
@@ -57,6 +60,44 @@ pub(super) fn command(
     }
     command.arg("--").args(worker);
     Ok(command)
+}
+
+/// Refuses a grant the worker could read without the broker: one that
+/// overlaps a runtime directory or a `--direct` path, in either direction,
+/// and gives a right the worker has there. Those reads would not be
+/// audited, and revoking the grant would not stop them. Paths are compared
+/// after resolving symlinks, as the rules see them. The image and the
+/// single files in [`restrict`] hold no data, so they are left out.
+fn check_overlap(grants: &[(PathBuf, Rights)], direct: &[String]) -> Result<(), String> {
+    let mut readable = Vec::new();
+    for dir in RUNTIME_DIRS {
+        if let Ok(path) = fs::canonicalize(dir) {
+            readable.push((format!("the runtime directory `{dir}`"), path, "rl"));
+        }
+    }
+    for spec in direct {
+        let (path, letters) = super::parse_direct(spec)?;
+        let path = fs::canonicalize(&path).map_err(|err| format!("`--direct {spec}`: {err}"))?;
+        readable.push((format!("`--direct {spec}`"), path, letters));
+    }
+    for (grant, rights) in grants {
+        let resolved = fs::canonicalize(grant)
+            .map_err(|err| format!("granting `{}` failed: {err}", grant.display()))?;
+        for (what, path, letters) in &readable {
+            let bypassed = (rights.contains(Rights::READ) && letters.contains('r'))
+                || (rights.contains(Rights::LIST) && letters.contains('l'));
+            if bypassed && (resolved.starts_with(path) || path.starts_with(&resolved)) {
+                return Err(format!(
+                    "`--grant {}` overlaps {what}, which a confined worker reads without \
+                     the broker, so those reads would not be audited and revoking the \
+                     grant would not stop them; grant a directory that neither contains \
+                     nor sits beneath it",
+                    grant.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 struct Request {
