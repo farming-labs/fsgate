@@ -1,6 +1,6 @@
 # RFC 0010: end a confined worker's programs with it
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-10
 - Roadmap: [M9](../../ROADMAP.md#m9--review-readiness-and-020)
 - Builds on: [RFC 0008](0008-confine-broker-worker.md) (the confined worker), the [threat model](../threat-model.md#3-the-broker-and-its-worker)
@@ -163,3 +163,12 @@ assert the kill and the absence of the side effect:
 2. When stopped by a signal, should the broker die by that signal, as
    proposed, or exit 128 plus its number? Dying by it is what a shell
    expects from Ctrl-C.
+
+## Decisions
+
+Accepted in [#72](https://github.com/farming-labs/fsgate/pull/72), with its
+open questions answered:
+
+1. The broker waits for signals with `sigwait` in the `sys` module of
+   `confine.rs`, and adds no dependency.
+2. A broker stopped by a signal dies by that signal.
