@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- A `Broker` audits what it refuses before its gate sees a request ([RFC 0011](docs/rfcs/0011-audit-broker-refusals.md)), through the sink already installed on the gate. Each connection `serve_with` accepts is one `connect` event: `allow`, or `deny` with `peer_refused`, `connection_limit`, or `no_thread`. A request that breaks the protocol is one `request` event, with `frame_too_large`, `malformed_frame`, or `malformed_request`. Events gain a `peer_uid` key, the peer's uid on those events and `null` on every other. `AuditOp`, `AuditReason`, and `AuditEvent` gain the matching variants and field, which their `#[non_exhaustive]` allows in a minor release. A refused peer used to leave no event, as RFC 0007 had decided.
+
 ### Fixed
 
 - An audit event for a request that no grant covers, and for a `grant` refused after `lock()`, records the normalized path, as [RFC 0002](docs/rfcs/0002-audit-events.md) specifies. It recorded the path as requested, so `/srv/data/../../etc/shadow` appeared to be a request inside `/srv/data`. The decision itself was always correct.

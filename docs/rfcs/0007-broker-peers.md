@@ -186,4 +186,7 @@ open questions answered:
 1. `max_connections` defaults to 64.
 2. The README leads with the inherited form, the safe one to copy.
 3. A refused peer produces no audit event. RFC 0002 events describe
-   operations on paths, and a refused peer has none.
+   operations on paths, and a refused peer has none. Superseded by
+   [RFC 0011](0011-audit-broker-refusals.md): a refused peer, a
+   connection past the limit, and a request that breaks the protocol are
+   each one event.

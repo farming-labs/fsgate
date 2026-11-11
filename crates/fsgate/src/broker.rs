@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Gate, GateError, Rights};
+use crate::{AuditDecision, AuditOp, AuditReason, Gate, GateError, Rights};
 
 /// Upper bound for one wire message; a frame claiming more is a protocol
 /// violation and fails the connection closed. Neither side sends one: a
@@ -192,13 +192,41 @@ fn peer_uid(_stream: &UnixStream) -> io::Result<u32> {
     Err(io::ErrorKind::Unsupported.into())
 }
 
-/// Whether to serve this connection. A peer whose identity cannot be read
-/// is refused.
-fn is_admitted(stream: &UnixStream, allowed: Option<&[u32]>) -> bool {
+/// Whether to serve a peer with this uid. A peer whose identity cannot be
+/// read is refused.
+fn is_admitted(uid: Option<u32>, allowed: Option<&[u32]>) -> bool {
     match allowed {
         None => true,
-        Some(allowed) => peer_uid(stream).is_ok_and(|uid| allowed.contains(&uid)),
+        Some(allowed) => uid.is_some_and(|uid| allowed.contains(&uid)),
     }
+}
+
+/// A frame that breaks RFC 0003's framing, carried inside the
+/// [`io::Error`] that [`read_frame`] returns, so the broker can audit it
+/// with its reason. Its message is the error's message.
+#[derive(Debug)]
+struct FramingError {
+    reason: AuditReason,
+    message: &'static str,
+}
+
+impl std::fmt::Display for FramingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message)
+    }
+}
+
+impl std::error::Error for FramingError {}
+
+fn framing_error(reason: AuditReason, message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, FramingError { reason, message })
+}
+
+/// The audit reason for a frame that broke the protocol, or `None` for any
+/// other failure, such as the connection itself failing.
+fn framing_reason(err: &io::Error) -> Option<AuditReason> {
+    let framing = err.get_ref()?.downcast_ref::<FramingError>()?;
+    Some(framing.reason)
 }
 
 /// How long `serve` waits before retrying after running out of a resource.
@@ -250,6 +278,11 @@ impl Broker {
     /// backlog. Returns only when the listener fails, or at once with
     /// [`io::ErrorKind::Unsupported`] if `options` needs a peer's identity
     /// and this platform cannot provide it.
+    ///
+    /// Each accepted connection is one [`AuditOp::Connect`] event on the
+    /// gate's sink: `allow`, on the connection's thread before its first
+    /// request, or `deny` with the reason it was closed. Each carries the
+    /// peer's uid when it can be read.
     pub fn serve_with(&self, listener: &UnixListener, options: ServeOptions) -> io::Result<()> {
         let allowed = options.allowed_uids()?;
         let active = AtomicUsize::new(0);
@@ -267,11 +300,18 @@ impl Broker {
                     }
                     Err(err) => return Err(err),
                 };
+                let uid = peer_uid(&stream).ok();
+                let refuse = |reason| {
+                    self.gate
+                        .emit_broker(AuditOp::Connect, AuditDecision::Deny, reason, uid);
+                };
                 // Checked first, so a refused peer cannot use up the limit.
-                if !is_admitted(&stream, allowed.as_deref()) {
+                if !is_admitted(uid, allowed.as_deref()) {
+                    refuse(AuditReason::PeerRefused);
                     continue;
                 }
                 if active.load(Ordering::Acquire) >= options.max_connections.get() {
+                    refuse(AuditReason::ConnectionLimit);
                     continue;
                 }
                 // Only this thread adds, so the count cannot pass the limit.
@@ -280,29 +320,61 @@ impl Broker {
                 // If no thread can start, the closure is dropped with the
                 // stream and the slot: the peer sees its connection close,
                 // and the next connection may get a thread.
-                let _ = std::thread::Builder::new().spawn_scoped(scope, move || {
+                let spawned = std::thread::Builder::new().spawn_scoped(scope, move || {
                     let _slot = slot;
+                    // Emitted here, so it comes before any event for this
+                    // connection's requests.
+                    self.gate.emit_broker(
+                        AuditOp::Connect,
+                        AuditDecision::Allow,
+                        AuditReason::Ok,
+                        uid,
+                    );
                     // A failed connection only ends that connection.
-                    let _ = self.serve_conn(stream);
+                    let _ = self.serve_peer(stream, uid);
                 });
+                if spawned.is_err() {
+                    refuse(AuditReason::NoThread);
+                }
             }
         })
     }
 
     /// Serves one connection until the peer hangs up.
-    pub fn serve_conn(&self, mut stream: UnixStream) -> io::Result<()> {
+    ///
+    /// A request that breaks the protocol ends the connection, and is one
+    /// [`AuditOp::Request`] event on the gate's sink, with no peer uid.
+    pub fn serve_conn(&self, stream: UnixStream) -> io::Result<()> {
+        self.serve_peer(stream, None)
+    }
+
+    /// [`serve_conn`](Broker::serve_conn), recording `uid` on the events
+    /// for requests that break the protocol.
+    fn serve_peer(&self, mut stream: UnixStream, uid: Option<u32>) -> io::Result<()> {
+        let refuse = |reason| {
+            self.gate
+                .emit_broker(AuditOp::Request, AuditDecision::Deny, reason, uid);
+        };
         loop {
             let frame = match read_frame(&mut stream, Descriptors::Refuse) {
                 Ok((frame, _)) => frame,
                 // Peer closed between requests: a normal end.
                 Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-                Err(err) => return Err(err),
+                Err(err) => {
+                    if let Some(reason) = framing_reason(&err) {
+                        refuse(reason);
+                    }
+                    return Err(err);
+                }
             };
             let request: Request = match serde_json::from_slice(&frame) {
                 Ok(request) => request,
                 // A malformed request fails the whole connection closed
                 // rather than guessing at intent.
-                Err(err) => return Err(io::Error::new(io::ErrorKind::InvalidData, err)),
+                Err(err) => {
+                    refuse(AuditReason::MalformedRequest);
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, err));
+                }
             };
             let (response, mut fd) = self.handle(request);
             let mut body = encode_response(&response)?;
@@ -717,8 +789,8 @@ fn read_frame(
                 // A lockstep peer sends nothing past a frame before its
                 // response. Extra bytes mean the prefix understates the body
                 // or the peer pipelined; acting on either would guess.
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
+                return Err(framing_error(
+                    AuditReason::MalformedFrame,
                     "peer sent bytes beyond the declared frame length",
                 ));
             }
@@ -730,8 +802,8 @@ fn read_frame(
         } else if acc.len() >= 4 {
             let len = u32::from_le_bytes([acc[0], acc[1], acc[2], acc[3]]) as usize;
             if len > MAX_FRAME_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
+                return Err(framing_error(
+                    AuditReason::FrameTooLarge,
                     "frame exceeds the protocol size limit",
                 ));
             }
@@ -769,8 +841,8 @@ fn read_frame(
             // message carry, so this is another platform or a full
             // descriptor table. Descriptors that did not fit may be open
             // here unreported; only the reported ones can be closed.
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            return Err(framing_error(
+                AuditReason::MalformedFrame,
                 "peer attached more descriptors than could be received",
             ));
         }
@@ -778,8 +850,8 @@ fn read_frame(
             // Refused at the first one, before the rest of the frame, so a
             // peer cannot pile them up by splitting a request across
             // messages. Returning closes what was received.
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            return Err(framing_error(
+                AuditReason::MalformedFrame,
                 "peer attached a file descriptor to a request; requests carry none",
             ));
         }
