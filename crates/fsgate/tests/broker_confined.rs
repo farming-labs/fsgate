@@ -166,6 +166,22 @@ fn a_direct_path_cannot_be_written() {
     }
 }
 
+/// A relative `--direct` path would resolve against the broker's working
+/// directory, so `.:r` under a service started in `/` would open everything.
+/// `--grant` already refuses one.
+#[test]
+fn a_direct_path_must_be_absolute() {
+    for spec in [".:r", "usr:r", ":r"] {
+        let output = usage_error(&["--grant", "/tmp:r", "--direct", spec, "--", "true"]);
+        assert_eq!(output.status.code(), Some(2), "{spec}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("absolute"),
+            "{spec}: no remedy in: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn confinement_flags_need_a_confined_worker() {
     for flags in [
@@ -188,6 +204,21 @@ fn an_environment_name_is_only_a_name() {
         let output = usage_error(&["--grant", "/tmp:r", "--env", name, "--", "true"]);
         assert_eq!(output.status.code(), Some(2), "{name:?}: {output:?}");
     }
+}
+
+/// An argument that is not UTF-8 is a usage error, not a panic.
+#[test]
+fn an_argument_that_is_not_utf8_is_a_usage_error() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fsgate-broker"))
+        .args(["--grant", "/tmp:r", "--unconfined", "--", "true"])
+        .arg(std::ffi::OsStr::from_bytes(b"\xff"))
+        .output()
+        .expect("run fsgate-broker");
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("UTF-8"), "no reason in: {stderr}");
 }
 
 #[cfg(target_os = "linux")]
@@ -296,6 +327,81 @@ mod kernel {
             ErrorKind::PermissionDenied
         );
     }
+
+    /// A grant the confined worker could read without the broker is refused,
+    /// whichever of the two paths contains the other: those reads would not
+    /// be audited, and revoking the grant would not stop them. A grant that
+    /// gives no right the worker has there is fine.
+    #[test]
+    fn a_grant_the_worker_could_read_directly_is_refused() {
+        let fixture = fixture();
+        let sub = fixture.granted.join("sub");
+        fs::create_dir(&sub).unwrap();
+        let listed = fixture.outside.join("listed");
+        fs::create_dir_all(listed.join("sub")).unwrap();
+        let root = fixture.root.display().to_string();
+        let sub = sub.display().to_string();
+        let listed = listed.display().to_string();
+        let flag = |name: &str, value: String| [name.to_string(), value];
+        let cases = [
+            (
+                vec![flag("--grant", "/usr/bin:r".into())],
+                "`/usr`".to_string(),
+            ),
+            (
+                vec![flag("--direct", format!("{root}:r"))],
+                format!("`--direct {root}:r`"),
+            ),
+            (
+                vec![flag("--direct", format!("{sub}:r"))],
+                format!("`--direct {sub}:r`"),
+            ),
+            (
+                vec![
+                    flag("--grant", format!("{listed}:l")),
+                    flag("--direct", format!("{listed}/sub:l")),
+                ],
+                format!("`--direct {listed}/sub:l`"),
+            ),
+        ];
+        for (extra, named) in cases {
+            let extra = extra.concat();
+            let mut flags = confined(&[]);
+            flags.extend(extra);
+            let output = broker(&fixture, &flags, "kernel::nothing_scenario")
+                .output()
+                .expect("run fsgate-broker");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(1), "{named}: {stderr}");
+            assert!(stderr.contains(&named), "{named}: {stderr}");
+            assert!(output.stdout.is_empty(), "{named}: the worker ran");
+        }
+
+        // Neither grant gives a right the worker has at the `--direct` path:
+        // a write-only grant beneath a readable one, and a listable path
+        // beneath a grant that can only read.
+        let drop = fixture.outside.join("drop");
+        fs::create_dir(&drop).unwrap();
+        let controls = [
+            [
+                flag("--grant", format!("{}:wc", drop.display())),
+                flag("--direct", format!("{}:r", fixture.outside.display())),
+            ]
+            .concat(),
+            flag("--direct", format!("{sub}:l")).to_vec(),
+        ];
+        for extra in controls {
+            let mut flags = confined(&[]);
+            flags.extend(extra);
+            let output = broker(&fixture, &flags, "kernel::nothing_scenario")
+                .output()
+                .expect("run fsgate-broker");
+            assert_ran(&output);
+        }
+    }
+
+    #[test]
+    fn nothing_scenario() {}
 
     #[test]
     fn a_direct_path_can_be_read_and_nothing_beside_it() {
@@ -527,6 +633,64 @@ mod kernel {
         let mut reply = String::new();
         stdout.read_line(&mut reply).expect("read the worker");
         assert!(reply.contains("alive"), "got {reply:?}");
+    }
+
+    /// The gap: the death signal binds only the worker. A program it starts
+    /// never has one, so it outlives a killed broker, still confined. The
+    /// worker could also clear its own, but on its main thread, and libtest
+    /// runs each scenario on another.
+    #[test]
+    fn a_program_a_confined_worker_starts_outlives_its_broker() {
+        let fixture = fixture();
+        let mut broker = broker(
+            &fixture,
+            &confined(&[]),
+            "kernel::starts_a_program_scenario",
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn fsgate-broker");
+        let mut stdin = broker.stdin.take().expect("piped stdin");
+        let mut stdout = BufReader::new(broker.stdout.take().expect("piped stdout"));
+        wait_until_ready(&mut stdout);
+
+        broker.kill().expect("kill the broker");
+        broker.wait().expect("reap the broker");
+
+        stdin.write_all(b"ping\n").expect("the program is gone");
+        let mut reply = String::new();
+        stdout.read_line(&mut reply).expect("read the program");
+        assert!(reply.contains("alive"), "got {reply:?}");
+    }
+
+    #[test]
+    fn starts_a_program_scenario() {
+        if !in_child("kernel::starts_a_program_scenario") {
+            return;
+        }
+        // The program shares this worker's standard streams, and the
+        // broker's death kills only this worker.
+        Command::new(env::current_exe().unwrap())
+            .args(["--exact", "kernel::outlives_scenario", "--nocapture"])
+            .env("FSGATE_CHILD", "kernel::outlives_scenario")
+            .status()
+            .unwrap();
+    }
+
+    #[test]
+    fn outlives_scenario() {
+        if !in_child("kernel::outlives_scenario") {
+            return;
+        }
+        println!("worker ready");
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).unwrap();
+        // It outlived the broker and is still confined.
+        let secret = format!("{}/secret.txt", env::var("FSGATE_OUTSIDE").unwrap());
+        let err = fs::read(secret).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        println!("alive");
     }
 
     #[test]
