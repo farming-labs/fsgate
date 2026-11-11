@@ -9,6 +9,7 @@ edition = "2024"
 cargo-fuzz = true
 
 [dependencies]
+cap-std = "4.0.3"
 fsgate = { path = "../crates/fsgate" }
 libfuzzer-sys = "0.4.13"
 rustix = { version = "1.1.6", features = ["net", "process"] }
@@ -16,6 +17,20 @@ rustix = { version = "1.1.6", features = ["net", "process"] }
 [[bin]]
 name = "broker_requests"
 path = "fuzz_targets/broker_requests.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "broker_args"
+path = "fuzz_targets/broker_args.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gate_paths"
+path = "fuzz_targets/gate_paths.rs"
 test = false
 doc = false
 bench = false
