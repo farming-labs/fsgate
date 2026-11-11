@@ -1,6 +1,6 @@
 # RFC 0011: audit what the broker refuses before the gate
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-10
 - Roadmap: [M9](../../ROADMAP.md#m9--review-readiness-and-020)
 - Builds on: [RFC 0002](0002-audit-events.md) (audit events), [RFC 0003](0003-broker-protocol.md) (the broker protocol), [RFC 0007](0007-broker-peers.md) (peer checks and the connection limit)
@@ -165,3 +165,14 @@ and assert the event and the refusal:
 3. Should events for `open` and the rest carry the peer's uid too? That
    needs the gate to know which connection a request came from. It could
    follow as its own RFC.
+
+## Decisions
+
+Accepted in [#73](https://github.com/farming-labs/fsgate/pull/73), with its
+open questions answered:
+
+1. An admitted connection produces an `allow` event.
+2. The broker does not limit the rate of events. The sink owns
+   backpressure, as RFC 0002 says.
+3. The peer's uid on `open` and the other operations is left to a later
+   RFC.
