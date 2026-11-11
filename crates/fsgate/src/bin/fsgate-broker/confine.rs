@@ -166,12 +166,14 @@ fn run(request: Request) -> Result<Infallible, String> {
         return Err("the broker exited before its worker started".into());
     }
 
-    // Landlock does not restrict descriptors opened before it applies.
-    close_others_at_exec(request.connection)
-        .map_err(|err| format!("closing inherited descriptors failed: {err}"))?;
-
     let image = resolve(&request.worker[0])?;
     restrict(&image, &request.direct)?;
+
+    // Landlock does not restrict descriptors opened before it applies. This
+    // comes after `restrict` so that on a kernel too old for both, the error
+    // is the one that names `--unconfined`.
+    close_others_at_exec(request.connection)
+        .map_err(|err| format!("closing inherited descriptors failed: {err}"))?;
 
     let mut worker = Command::new(&image);
     worker.arg0(&request.worker[0]).args(&request.worker[1..]);

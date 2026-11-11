@@ -127,12 +127,12 @@ That fresh, single-threaded process, in order:
 
 1. Calls `setsid`, so the worker has no controlling terminal.
 2. Asks for `SIGKILL` when the broker dies (`PR_SET_PDEATHSIG`).
-3. Closes every descriptor except standard input, output, and error and
-   the broker connection.
-4. Resolves the command on `PATH`, opens each allowed path, and builds the
+3. Resolves the command on `PATH`, opens each allowed path, and builds the
    ruleset with the `landlock` crate.
-5. Restricts itself, which also sets `no_new_privs`, so a set-ID program
+4. Restricts itself, which also sets `no_new_privs`, so a set-ID program
    cannot gain privileges.
+5. Closes every descriptor except standard input, output, and error and
+   the broker connection, when the command starts.
 6. Clears the environment, keeping `FSGATE_BROKER_FD` and any name given
    with `--env NAME`, and calls `exec` on the command.
 
@@ -150,12 +150,14 @@ Each step closes a specific hole:
   a killed broker would leave its worker running. It binds only a worker
   that keeps it: the worker can clear its own death signal, and a program
   the worker starts never has one.
-- **Step 3.** Landlock says
+- **Step 5.** Landlock says
   [files opened before the sandboxing are not subject to its restrictions](https://docs.kernel.org/userspace-api/landlock.html),
   so a leaked descriptor is a way out. `close_range` is not wrapped by
   `std` or `rustix`, so it goes in an isolated module with a written
   safety contract, as AGENTS.md requires, and `libc` becomes a regular
-  Linux dependency.
+  Linux dependency. It comes after step 4 so that on a kernel too old for
+  both, before Linux 5.11, the error is the one that names `--unconfined`.
+  Descriptors close at `exec` either way.
 - **Step 6.** Environments often hold tokens, and Landlock does not cover
   them. The launcher's worker already starts with an empty environment.
 

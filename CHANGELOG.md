@@ -14,6 +14,7 @@
 - `fsgate-broker --socket` refuses a path through a directory that another user owns, or can write to without the sticky bit, and exits 1 before binding. Workers find the broker by that path, so such a user could replace the socket with their own and answer the worker's requests.
 - `Gate::open` and `Gate::create` no longer wait on a FIFO. Opening one blocks until its other end is opened, so a FIFO beneath a grant held the caller indefinitely, and in a broker it held the thread serving that connection. `open` now returns it at once, `create` fails with `ENXIO` while it has no reader, and the file blocks as usual afterwards.
 - `fsgate-broker` refuses a grant that a confined worker could read without the broker, and exits 1 before starting it. That is a grant that overlaps a runtime directory (`/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`) or a `--direct` path, in either direction, and gives `READ` or `LIST` where the worker may read or list. The worker read such a grant directly, with no audit event, and revoking the grant did not stop it.
+- On a kernel before Linux 5.11, `fsgate-broker` without `--unconfined` fails with the error that Landlock is unavailable, which names `--unconfined`. It failed first on `close_range`, with an error that named no remedy. The worker applies its Landlock rules before marking inherited descriptors close-on-exec, and both happen before it starts.
 
 ## 0.3.0 (2026-11-09)
 
