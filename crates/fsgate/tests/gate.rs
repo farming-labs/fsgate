@@ -122,6 +122,59 @@ fn open_refuses_a_directory() {
     }
 }
 
+/// A FIFO with no writer would block `open` until one appears, and one with
+/// no reader would block `create`, holding the caller, or a broker's serve
+/// thread, indefinitely. Neither waits: `open` returns the FIFO, `create`
+/// returns it once it has a reader and fails with `ENXIO` before, and the
+/// descriptors block as usual afterwards.
+#[cfg(unix)]
+#[test]
+fn a_fifo_does_not_block_open_or_create() {
+    use std::io::Write;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use rustix::fs::OFlags;
+
+    let (_root, granted, _) = setup();
+    let fifo = granted.join("fifo");
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+    assert!(made.unwrap().success(), "mkfifo failed");
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::READ | Rights::WRITE | Rights::CREATE)
+        .unwrap();
+
+    // The timeout turns a regression into a failure instead of a hang.
+    let (done, finished) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = gate.open(&fifo).expect("open the FIFO");
+        let mut writer = gate.create(&fifo).expect("create with a reader");
+        for file in [&reader, &writer] {
+            let flags = rustix::fs::fcntl_getfl(file).unwrap();
+            assert!(!flags.contains(OFlags::NONBLOCK), "{flags:?}");
+        }
+        writer.write_all(b"x").unwrap();
+        let mut byte = [0; 1];
+        reader.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"x");
+        drop((reader, writer));
+
+        let err = gate.create(&fifo).unwrap_err();
+        let GateError::Io { source, .. } = &err else {
+            panic!("got {err:?}");
+        };
+        assert_eq!(
+            source.raw_os_error(),
+            Some(rustix::io::Errno::NXIO.raw_os_error()),
+            "got {err:?}"
+        );
+        done.send(()).unwrap();
+    });
+    finished
+        .recv_timeout(Duration::from_secs(10))
+        .expect("a FIFO blocked the gate");
+}
+
 #[test]
 fn list_requires_the_list_right() {
     let (_root, granted, _) = setup();
