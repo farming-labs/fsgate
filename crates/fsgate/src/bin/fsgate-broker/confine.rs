@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use fsgate::Rights;
 use landlock::{
-    ABI, Access, AccessFs, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd, PathFdError,
-    Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus, Scope,
+    ABI, Access, AccessFs, BitFlags, CompatLevel, Compatible, LandlockStatus, PathBeneath, PathFd,
+    PathFdError, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus, Scope,
 };
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 
@@ -288,7 +288,10 @@ fn run(request: Request) -> Result<Infallible, String> {
     }
 
     let image = resolve(&request.worker[0])?;
-    restrict(&image, &request.direct)?;
+    let landlock = restrict(&image, &request.direct)?;
+    if !refuses_unix_connects(landlock) {
+        unix_socket_filter::install()?;
+    }
 
     // Landlock does not restrict descriptors opened before it applies. This
     // comes after `restrict` so that on a kernel too old for both, the error
@@ -345,10 +348,17 @@ fn is_executable(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
+/// Whether the Landlock ruleset [`restrict`] applied refuses connects to
+/// pathname Unix sockets, which needs ABI 9 (Linux 7.1). It also scopes
+/// abstract ones there.
+fn refuses_unix_connects(landlock: LandlockStatus) -> bool {
+    matches!(landlock, LandlockStatus::Available { effective_abi, .. } if effective_abi >= ABI::V9)
+}
+
 /// Restricts this process, and so the worker it becomes, to the paths a
 /// program needs to start and the `--direct` paths. Data comes from the
-/// broker.
-fn restrict(image: &Path, direct: &[String]) -> Result<(), String> {
+/// broker. Returns the Landlock status the kernel reported.
+fn restrict(image: &Path, direct: &[String]) -> Result<LandlockStatus, String> {
     let runtime = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
     let mut ruleset = ruleset()?;
     for dir in RUNTIME_DIRS {
@@ -389,7 +399,7 @@ fn restrict(image: &Path, direct: &[String]) -> Result<(), String> {
     if status.ruleset == RulesetStatus::NotEnforced || !status.no_new_privs {
         return Err(unavailable("the kernel did not apply the ruleset"));
     }
-    Ok(())
+    Ok(status.landlock)
 }
 
 /// A ruleset that handles every filesystem right `lock()` handles, and asks
@@ -463,6 +473,189 @@ fn add_rule(
         .map_err(|err| format!("allowing `{}` failed: {err}", path.display()))
 }
 
+/// The seccomp filter that keeps a confined worker off Unix sockets where
+/// Landlock cannot (RFC 0009). It answers:
+///
+/// - `socket(AF_UNIX, ...)` with `EACCES`. With no new Unix socket there is
+///   nothing to connect, by path or by abstract name.
+/// - `socketpair(AF_UNIX, SOCK_DGRAM, ...)` with `EACCES`. A datagram socket
+///   can send to any address and connect to another, even as half of a
+///   pair. Stream and seqpacket pairs stay connected to each other, so they
+///   are allowed.
+/// - `io_uring_setup`, `io_uring_enter`, and `io_uring_register` with
+///   `ENOSYS`, as a kernel without `io_uring` does. Its operations create
+///   and connect sockets without the calls above.
+/// - A call from another architecture, or an x32 call, by killing the
+///   process. Those use call numbers this filter does not know.
+/// - Anything else by allowing it.
+///
+/// Every program the worker starts inherits the filter across `exec`, and
+/// nothing can remove it.
+mod unix_socket_filter {
+    /// Installs the filter on this thread, which becomes the worker. Landlock
+    /// has already set `no_new_privs`, which the kernel requires.
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(
+            target_arch = "aarch64",
+            target_pointer_width = "64",
+            target_endian = "little"
+        ),
+    ))]
+    pub(super) fn install() -> Result<(), String> {
+        super::sys::install_seccomp_filter(&native::PROGRAM).map_err(|err| {
+            format!(
+                "installing the filter that keeps the worker off Unix sockets failed ({err}); \
+                 pass `--unconfined` to run it without confinement"
+            )
+        })
+    }
+
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(
+            target_arch = "aarch64",
+            target_pointer_width = "64",
+            target_endian = "little"
+        ),
+    )))]
+    pub(super) fn install() -> Result<(), String> {
+        Err(format!(
+            "this kernel's Landlock cannot keep the worker off Unix sockets, which needs \
+             Landlock ABI v9 (Linux 7.1), and fsgate has no filter that does it on {}; \
+             pass `--unconfined` to run it without confinement",
+            std::env::consts::ARCH
+        ))
+    }
+
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(
+            target_arch = "aarch64",
+            target_pointer_width = "64",
+            target_endian = "little"
+        ),
+    ))]
+    mod native {
+        use libc::{
+            AF_UNIX, BPF_ABS, BPF_ALU, BPF_AND, BPF_JEQ, BPF_JGE, BPF_JMP, BPF_K, BPF_LD, BPF_RET,
+            BPF_W, EACCES, ENOSYS, SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS,
+            SOCK_DGRAM, SYS_io_uring_enter, SYS_io_uring_register, SYS_io_uring_setup, SYS_socket,
+            SYS_socketpair, sock_filter,
+        };
+
+        /// `AUDIT_ARCH_X86_64`, which `libc` does not define.
+        #[cfg(target_arch = "x86_64")]
+        const AUDIT_ARCH: u32 = 0xc000_003e;
+        /// `AUDIT_ARCH_AARCH64`, which `libc` does not define.
+        #[cfg(target_arch = "aarch64")]
+        const AUDIT_ARCH: u32 = 0xc000_00b7;
+
+        // Offsets into `struct seccomp_data`. Both architectures are little
+        // endian, so an argument's low 32 bits come first. `socket` and
+        // `socketpair` take `int` arguments, and the kernel reads only those
+        // bits too.
+        const NR: u32 = 0;
+        const ARCH: u32 = 4;
+        const ARG0: u32 = 16;
+        const ARG1: u32 = 24;
+
+        /// Set in the number of an x32 call. No native call number on
+        /// either architecture has it.
+        const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+        /// The bits of `socketpair`'s type argument that name the type,
+        /// without `SOCK_CLOEXEC` and `SOCK_NONBLOCK`.
+        const SOCK_TYPE_MASK: u32 = 0xf;
+
+        // Where the steps that several jumps lead to start.
+        const SOCKETPAIR: usize = 9;
+        const SOCKET: usize = 12;
+        const ALLOW: usize = 14;
+        const REFUSE: usize = 15;
+        const MISSING: usize = 16;
+        const KILL: usize = 17;
+
+        /// Each jump names its own index first, then where it goes on when
+        /// its comparison holds and when it does not.
+        pub(super) const PROGRAM: [sock_filter; 18] = [
+            load(ARCH),
+            jeq(1, AUDIT_ARCH, 2, KILL),
+            load(NR),
+            jge(3, X32_SYSCALL_BIT, KILL, 4),
+            jeq(4, number(SYS_socket), SOCKET, 5),
+            jeq(5, number(SYS_socketpair), SOCKETPAIR, 6),
+            jeq(6, number(SYS_io_uring_setup), MISSING, 7),
+            jeq(7, number(SYS_io_uring_enter), MISSING, 8),
+            jeq(8, number(SYS_io_uring_register), MISSING, ALLOW),
+            // SOCKETPAIR: only a datagram pair goes on to the domain.
+            load(ARG1),
+            statement(BPF_ALU | BPF_AND | BPF_K, SOCK_TYPE_MASK),
+            jeq(11, SOCK_DGRAM as u32, SOCKET, ALLOW),
+            // SOCKET
+            load(ARG0),
+            jeq(13, AF_UNIX as u32, REFUSE, ALLOW),
+            answer(SECCOMP_RET_ALLOW),
+            answer(SECCOMP_RET_ERRNO | EACCES as u32),
+            answer(SECCOMP_RET_ERRNO | ENOSYS as u32),
+            answer(SECCOMP_RET_KILL_PROCESS),
+        ];
+
+        // Each label names the step the jumps expect, or this does not build.
+        const _: () = {
+            assert!(PROGRAM[SOCKETPAIR].k == ARG1);
+            assert!(PROGRAM[SOCKET].k == ARG0);
+            assert!(PROGRAM[ALLOW].k == SECCOMP_RET_ALLOW);
+            assert!(PROGRAM[REFUSE].k == SECCOMP_RET_ERRNO | EACCES as u32);
+            assert!(PROGRAM[MISSING].k == SECCOMP_RET_ERRNO | ENOSYS as u32);
+            assert!(PROGRAM[KILL].k == SECCOMP_RET_KILL_PROCESS);
+        };
+
+        /// A call number as the filter sees it. Every number used here is
+        /// small and positive.
+        const fn number(call: libc::c_long) -> u32 {
+            assert!(call > 0 && call < X32_SYSCALL_BIT as libc::c_long);
+            call as u32
+        }
+
+        const fn statement(code: u32, k: u32) -> sock_filter {
+            sock_filter {
+                code: code as u16,
+                jt: 0,
+                jf: 0,
+                k,
+            }
+        }
+
+        const fn load(offset: u32) -> sock_filter {
+            statement(BPF_LD | BPF_W | BPF_ABS, offset)
+        }
+
+        const fn answer(action: u32) -> sock_filter {
+            statement(BPF_RET | BPF_K, action)
+        }
+
+        const fn jeq(at: usize, k: u32, yes: usize, no: usize) -> sock_filter {
+            jump(at, BPF_JEQ, k, yes, no)
+        }
+
+        const fn jge(at: usize, k: u32, yes: usize, no: usize) -> sock_filter {
+            jump(at, BPF_JGE, k, yes, no)
+        }
+
+        /// The jump at index `at` that compares the loaded value with `k`
+        /// and goes on at index `yes` or `no`. A filter only jumps forward.
+        const fn jump(at: usize, test: u32, k: u32, yes: usize, no: usize) -> sock_filter {
+            assert!(yes > at && yes - at <= 256 && no > at && no - at <= 256);
+            sock_filter {
+                code: (BPF_JMP | test | BPF_K) as u16,
+                jt: (yes - at - 1) as u8,
+                jf: (no - at - 1) as u8,
+                k,
+            }
+        }
+    }
+}
+
 /// The `unsafe` calls confinement and its supervisor need, kept apart from
 /// their logic. Neither `std` nor `rustix` wraps them safely.
 ///
@@ -472,6 +665,11 @@ fn add_rule(
 ///   process. With `CLOSE_RANGE_CLOEXEC` it closes nothing now; it only
 ///   marks descriptors to close at `exec`. So it cannot invalidate a
 ///   descriptor that Rust code holds, whatever the range.
+/// - `seccomp(2)` with `SECCOMP_SET_MODE_FILTER` reads a `sock_fprog` and
+///   the instructions it points to, both of which outlive the call, and
+///   copies them into the kernel. It never writes through that pointer, so
+///   one made from a shared slice is sound. The filter then refuses or
+///   kills later system calls; it changes no memory that Rust code holds.
 /// - `sigemptyset`, `sigaddset`, `sigaction`, `pthread_sigmask`, and
 ///   `sigwait` read and write only the `sigset_t`, `sigaction`, and `c_int`
 ///   values passed to them, each a local or a field of [`SignalSet`] that
@@ -578,6 +776,43 @@ mod sys {
         // SAFETY: `raise` takes an integer. See the module contract.
         unsafe { libc::raise(signal) };
         io::Error::other("the signal did not end the process")
+    }
+
+    /// Installs `program` as a seccomp filter on the calling thread, which
+    /// must already have `no_new_privs`.
+    #[cfg_attr(
+        not(any(
+            all(target_arch = "x86_64", target_pointer_width = "64"),
+            all(
+                target_arch = "aarch64",
+                target_pointer_width = "64",
+                target_endian = "little"
+            ),
+        )),
+        allow(dead_code)
+    )]
+    pub(super) fn install_seccomp_filter(program: &[libc::sock_filter]) -> io::Result<()> {
+        let len = u16::try_from(program.len()).map_err(|_| io::ErrorKind::InvalidInput)?;
+        let program = libc::sock_fprog {
+            len,
+            filter: program.as_ptr().cast_mut(),
+        };
+        let flags: libc::c_ulong = 0;
+        // SAFETY: `program` and the instructions it points to outlive the
+        // call, and the kernel only reads them. See the module contract.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                libc::c_ulong::from(libc::SECCOMP_SET_MODE_FILTER),
+                flags,
+                ptr::from_ref(&program),
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
     }
 
     pub(super) fn close_at_exec(first: u32, last: u32) -> io::Result<()> {
