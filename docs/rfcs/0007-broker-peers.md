@@ -94,6 +94,13 @@ on macOS), so the socket is never reachable while its mode is loose. If
 the `chmod` fails, the broker exits with the error before starting the
 command.
 
+Workers find the broker by that path, so a mode on the socket is not
+enough: whoever can rename an entry along the path can put their own
+socket in its place. Before binding, the broker checks every directory
+the path passes through, before and after resolving symlinks. Each must
+belong to the broker's user or root, and must not be writable by others
+unless it is sticky, as `/tmp` is. Otherwise it exits 1 before binding.
+
 ### A peer check in `Broker::serve`
 
 `serve` compares each accepted peer's kernel-reported uid with an allow
