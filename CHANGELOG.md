@@ -10,6 +10,7 @@
 - On Linux, `lock()` no longer fails when a grant holds no rights, whether it was granted that way or narrowed to nothing before the lock. Landlock rejects a rule with no access, so the lock used to fail with `GateError::LockFailed` (`AddRules(Fs(Compat(Access(Empty))))`), in strict and best-effort mode alike, while the same gate locked on macOS. Such a grant now adds no rule, so the kernel refuses everything beneath it, and the gate refuses it with `RightsExceeded`.
 - `fsgate-broker --direct` refuses a relative path, as `--grant` does, with a usage error that asks for an absolute one. It used to resolve one against the broker's working directory, so `--direct .:r` under a service started in `/` let the confined worker read the whole filesystem.
 - `fsgate-broker` gives a usage error (exit 2) for an argument that is not valid UTF-8, naming the argument. It used to panic with exit 101.
+- `Broker::serve` closes a connection it cannot start a thread for, and keeps accepting. It used to panic, which ended its accept loop for good, so later connections waited in the listen backlog and their requests hung instead of failing closed. `fsgate-broker` reports a thread it cannot start as an error (exit 1) instead of panicking (exit 101), and starts the thread that serves an inherited connection before the worker.
 
 ## 0.3.0 (2026-11-09)
 

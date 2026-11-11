@@ -244,11 +244,12 @@ impl Broker {
     }
 
     /// Accepts connections forever, serving each admitted one on its own
-    /// thread. A connection that is not admitted is closed with no answer.
-    /// While the process is out of descriptors, new connections wait in
-    /// the listen backlog. Returns only when the listener fails, or at once
-    /// with [`io::ErrorKind::Unsupported`] if `options` needs a peer's
-    /// identity and this platform cannot provide it.
+    /// thread. A connection that is not admitted is closed with no answer,
+    /// and so is one the process cannot start a thread for. While the
+    /// process is out of descriptors, new connections wait in the listen
+    /// backlog. Returns only when the listener fails, or at once with
+    /// [`io::ErrorKind::Unsupported`] if `options` needs a peer's identity
+    /// and this platform cannot provide it.
     pub fn serve_with(&self, listener: &UnixListener, options: ServeOptions) -> io::Result<()> {
         let allowed = options.allowed_uids()?;
         let active = AtomicUsize::new(0);
@@ -275,8 +276,12 @@ impl Broker {
                 }
                 // Only this thread adds, so the count cannot pass the limit.
                 active.fetch_add(1, Ordering::AcqRel);
-                scope.spawn(move || {
-                    let _slot = Slot(active);
+                let slot = Slot(active);
+                // If no thread can start, the closure is dropped with the
+                // stream and the slot: the peer sees its connection close,
+                // and the next connection may get a thread.
+                let _ = std::thread::Builder::new().spawn_scoped(scope, move || {
+                    let _slot = slot;
                     // A failed connection only ends that connection.
                     let _ = self.serve_conn(stream);
                 });
