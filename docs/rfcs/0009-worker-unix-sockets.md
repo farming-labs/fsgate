@@ -1,6 +1,6 @@
 # RFC 0009: keep a confined worker off other Unix sockets
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-10
 - Roadmap: [M9](../../ROADMAP.md#m9--review-readiness-and-020)
 - Builds on: [RFC 0006](0006-lock-restrictions.md) (restrictions at `lock()`), [RFC 0008](0008-confine-broker-worker.md) (the confined worker), the [threat model](../threat-model.md#3-the-broker-and-its-worker)
@@ -161,3 +161,14 @@ refuses the filter.
    `rustix` marks `io_uring_setup` unsafe. Is a test-only module with its
    own safety contract acceptable, or should that row of the threat model
    say it is untested?
+
+## Decisions
+
+Accepted in [#71](https://github.com/farming-labs/fsgate/pull/71), with its
+open questions answered:
+
+1. The filter applies only below Landlock ABI 9. On Linux 7.1 and later,
+   Landlock refuses connects to sockets created outside the sandbox, and a
+   worker keeps the sockets it makes for itself.
+2. The `io_uring` refusal is tested with an `unsafe` call in a test-only
+   module that has its own safety contract.
