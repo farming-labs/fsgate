@@ -322,23 +322,35 @@ mod kernel {
         let fixture = fixture();
         let sub = fixture.granted.join("sub");
         fs::create_dir(&sub).unwrap();
+        let listed = fixture.outside.join("listed");
+        fs::create_dir_all(listed.join("sub")).unwrap();
         let root = fixture.root.display().to_string();
         let sub = sub.display().to_string();
+        let listed = listed.display().to_string();
+        let flag = |name: &str, value: String| [name.to_string(), value];
         let cases = [
             (
-                ["--grant".to_string(), "/usr/bin:r".to_string()],
+                vec![flag("--grant", "/usr/bin:r".into())],
                 "`/usr`".to_string(),
             ),
             (
-                ["--direct".to_string(), format!("{root}:r")],
+                vec![flag("--direct", format!("{root}:r"))],
                 format!("`--direct {root}:r`"),
             ),
             (
-                ["--direct".to_string(), format!("{sub}:l")],
-                format!("`--direct {sub}:l`"),
+                vec![flag("--direct", format!("{sub}:r"))],
+                format!("`--direct {sub}:r`"),
+            ),
+            (
+                vec![
+                    flag("--grant", format!("{listed}:l")),
+                    flag("--direct", format!("{listed}/sub:l")),
+                ],
+                format!("`--direct {listed}/sub:l`"),
             ),
         ];
         for (extra, named) in cases {
+            let extra = extra.concat();
             let mut flags = confined(&[]);
             flags.extend(extra);
             let output = broker(&fixture, &flags, "kernel::nothing_scenario")
@@ -350,19 +362,27 @@ mod kernel {
             assert!(output.stdout.is_empty(), "{named}: the worker ran");
         }
 
+        // Neither grant gives a right the worker has at the `--direct` path:
+        // a write-only grant beneath a readable one, and a listable path
+        // beneath a grant that can only read.
         let drop = fixture.outside.join("drop");
         fs::create_dir(&drop).unwrap();
-        let mut flags = confined(&[]);
-        flags.extend([
-            "--grant".to_string(),
-            format!("{}:wc", drop.display()),
-            "--direct".to_string(),
-            format!("{}:r", fixture.outside.display()),
-        ]);
-        let output = broker(&fixture, &flags, "kernel::nothing_scenario")
-            .output()
-            .expect("run fsgate-broker");
-        assert_ran(&output);
+        let controls = [
+            [
+                flag("--grant", format!("{}:wc", drop.display())),
+                flag("--direct", format!("{}:r", fixture.outside.display())),
+            ]
+            .concat(),
+            flag("--direct", format!("{sub}:l")).to_vec(),
+        ];
+        for extra in controls {
+            let mut flags = confined(&[]);
+            flags.extend(extra);
+            let output = broker(&fixture, &flags, "kernel::nothing_scenario")
+                .output()
+                .expect("run fsgate-broker");
+            assert_ran(&output);
+        }
     }
 
     #[test]
