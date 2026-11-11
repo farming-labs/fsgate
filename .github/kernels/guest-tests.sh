@@ -65,7 +65,7 @@ no-landlock)
     ;;
 below-floor)
     # Two lock tests and one confined broker test.
-    run_ignored below_landlock_v3 3
+    run_ignored below_landlock_v3 4
     ;;
 *)
     echo "unknown mode: $mode" >&2
