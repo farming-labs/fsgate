@@ -31,8 +31,16 @@ run_ignored() {
     for test in "${tests[@]}"; do
         output=$("$test" --ignored "$filter")
         printf '%s\n' "$output"
-        count=$(sed --quiet 's/^test result: ok\. \([0-9]*\) passed;.*/\1/p' <<<"$output")
-        passed=$((passed + ${count:-0}))
+        # A test that runs this executable again as a child prints the
+        # child's summary first, so only the last summary is this run's.
+        count=$(sed --quiet 's/^test result: ok\. \([0-9]*\) passed;.*/\1/p' <<<"$output" | tail -n 1)
+        # Bash abandons the whole `case` below on an arithmetic error and
+        # goes on to write `<mode>.passed`, so check the count first.
+        if ! [[ $count =~ ^[0-9]+$ ]]; then
+            echo "$test printed no passing summary" >&2
+            exit 1
+        fi
+        passed=$((passed + count))
     done
     if [ "$passed" -ne "$expected" ]; then
         echo "expected $expected passing *$filter* tests, got $passed" >&2
