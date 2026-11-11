@@ -855,10 +855,11 @@ mod kernel {
 
     /// The broker blocks its stop signals for the thread that waits for
     /// them, and a mask survives `exec`. The worker must still be stoppable.
+    /// It starts no program, so only its own exit closes the pipe.
     #[test]
     fn a_confined_worker_can_still_be_stopped_by_a_signal() {
         let fixture = fixture();
-        let mut broker = spawn_piped(&confined(&[]), &fixture, "kernel::keeps_a_program_scenario");
+        let mut broker = spawn_piped(&confined(&[]), &fixture, "kernel::stoppable_scenario");
         let stdin = broker.stdin.take();
         let stderr = broker.stderr.take().expect("piped stderr");
         let (worker, _) = ready_pids(&mut BufReader::new(broker.stdout.take().unwrap()));
@@ -918,6 +919,17 @@ mod kernel {
         let program = start_lingering_program();
         println!("worker ready {} {program}", std::process::id());
         std::process::exit(3);
+    }
+
+    #[test]
+    fn stoppable_scenario() {
+        if !in_child("kernel::stoppable_scenario") {
+            return;
+        }
+        let worker = std::process::id();
+        println!("worker ready {worker} {worker}");
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
     }
 
     #[test]
