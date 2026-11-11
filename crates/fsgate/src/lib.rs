@@ -1028,6 +1028,7 @@ impl Gate {
                 errno,
                 syscall: origin.notified.map(|notified| notified.syscall),
                 notification: origin.notified.map(|notified| notified.notification),
+                peer_uid: None,
             });
         }
     }
@@ -1056,6 +1057,35 @@ impl Gate {
                 errno: None,
                 syscall: None,
                 notification: None,
+                peer_uid: None,
+            });
+        }
+    }
+
+    /// [`emit`](Gate::emit) for a broker decision the gate never saw
+    /// (RFC 0011): a connection, or a request that broke the protocol.
+    #[cfg(unix)]
+    fn emit_broker(
+        &self,
+        op: AuditOp,
+        decision: AuditDecision,
+        reason: AuditReason,
+        peer_uid: Option<u32>,
+    ) {
+        if let Some(sink) = &self.audit {
+            sink.event(&AuditEvent {
+                ts: SystemTime::now(),
+                op,
+                path: None,
+                grant: None,
+                rights: None,
+                restrictions: None,
+                decision,
+                reason,
+                errno: None,
+                syscall: None,
+                notification: None,
+                peer_uid,
             });
         }
     }
@@ -1076,6 +1106,7 @@ impl Gate {
                 errno: None,
                 syscall: None,
                 notification: None,
+                peer_uid: None,
             });
         }
     }
