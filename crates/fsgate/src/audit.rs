@@ -43,6 +43,14 @@ pub enum AuditOp {
     Metadata,
     /// A directory listing.
     ReadDir,
+    /// A connection a [`Broker`](crate::Broker) accepted with
+    /// [`serve_with`](crate::Broker::serve_with), admitted or refused
+    /// before any request (RFC 0011).
+    Connect,
+    /// A broker request that never reached the gate, because its frame or
+    /// its contents broke the protocol (RFC 0011). A request that parses is
+    /// audited by the gate under its own operation.
+    Request,
 }
 
 impl AuditOp {
@@ -57,6 +65,8 @@ impl AuditOp {
             AuditOp::Create => "create",
             AuditOp::Metadata => "metadata",
             AuditOp::ReadDir => "read_dir",
+            AuditOp::Connect => "connect",
+            AuditOp::Request => "request",
         }
     }
 }
@@ -112,6 +122,22 @@ pub enum AuditReason {
     /// worker's memory: unreadable, inaccessible, or with no terminator
     /// within the path limit.
     InvalidMemory,
+    /// A broker connection from a uid the broker does not admit, or whose
+    /// uid could not be read.
+    PeerRefused,
+    /// A broker connection past
+    /// [`ServeOptions::max_connections`](crate::ServeOptions::max_connections).
+    ConnectionLimit,
+    /// A broker connection the process could not start a thread for.
+    NoThread,
+    /// A broker request whose length prefix is over the protocol's 1 MiB
+    /// limit.
+    FrameTooLarge,
+    /// A broker request with bytes past its declared length, or with a
+    /// file descriptor attached.
+    MalformedFrame,
+    /// A broker request whose frame is not a valid request.
+    MalformedRequest,
 }
 
 impl AuditReason {
@@ -127,6 +153,12 @@ impl AuditReason {
             AuditReason::UnknownGrant => "unknown_grant",
             AuditReason::UnsupportedInput => "unsupported_input",
             AuditReason::InvalidMemory => "invalid_memory",
+            AuditReason::PeerRefused => "peer_refused",
+            AuditReason::ConnectionLimit => "connection_limit",
+            AuditReason::NoThread => "no_thread",
+            AuditReason::FrameTooLarge => "frame_too_large",
+            AuditReason::MalformedFrame => "malformed_frame",
+            AuditReason::MalformedRequest => "malformed_request",
         }
     }
 }
@@ -167,6 +199,12 @@ pub struct AuditEvent {
     /// For an intercepted request, its seccomp notification ID. `None`
     /// otherwise.
     pub notification: Option<u64>,
+    /// For a `connect` event, and a `request` event on a connection
+    /// [`Broker::serve_with`](crate::Broker::serve_with) accepted, the
+    /// peer's effective uid. `None` when it could not be read, on a
+    /// connection given to [`Broker::serve_conn`](crate::Broker::serve_conn),
+    /// and for every other operation.
+    pub peer_uid: Option<u32>,
 }
 
 impl AuditEvent {
@@ -188,6 +226,7 @@ impl AuditEvent {
             "errno": self.errno,
             "syscall": self.syscall,
             "notification": self.notification,
+            "peer_uid": self.peer_uid,
         });
         value.to_string()
     }
@@ -329,6 +368,7 @@ mod tests {
             errno: None,
             syscall: None,
             notification: None,
+            peer_uid: None,
         };
         serde_json::from_str(&event.to_json_line()).unwrap()
     }

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- A `Broker` audits what it refuses before its gate sees a request ([RFC 0011](docs/rfcs/0011-audit-broker-refusals.md)), through the sink already installed on the gate. Each connection `serve_with` accepts is one `connect` event: `allow`, or `deny` with `peer_refused`, `connection_limit`, or `no_thread`. A request that breaks the protocol is one `request` event, with `frame_too_large`, `malformed_frame`, or `malformed_request`. Events gain a `peer_uid` key, the peer's uid on those events and `null` on every other. `AuditOp`, `AuditReason`, and `AuditEvent` gain the matching variants and field, which their `#[non_exhaustive]` allows in a minor release. A refused peer used to leave no event, as RFC 0007 had decided.
+
 ### Changed
 
 - Before Linux 7.1, `fsgate-broker` installs a seccomp filter in a confined worker that refuses new Unix sockets, from `socket(AF_UNIX)` or a datagram `socketpair`, with `EACCES`, refuses `io_uring` with `ENOSYS`, and kills a process that makes an x32 call or one from another architecture ([RFC 0009](docs/rfcs/0009-worker-unix-sockets.md)). Landlock refuses Unix socket connects only from Linux 7.1, so before that a confined worker could connect to any socket it could name, such as the session bus, and ask systemd's user manager to start a program outside the confinement. The worker keeps its broker connection, sockets on its standard streams, stream and seqpacket pairs, and the network. A worker that needs a Unix socket service before 7.1, such as D-Bus, X11, or Wayland, must run with `--unconfined`. Before 7.1, a confined worker on an architecture other than x86_64 and aarch64 no longer starts. From 7.1 nothing changes.
