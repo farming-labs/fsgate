@@ -199,7 +199,24 @@ Started. Today each attack in the threat model has a test written for it, and on
 
   Evidence: [CI](https://github.com/farming-labs/fsgate/actions/runs/42907442197) on `0f2e46a` passed both tests in `gate_model.rs` on the `ubuntu-26.04` runner's kernel, where the gate resolves with `openat2`, in all three runs of the `check` job (the checkout, `experimental-intercept`, and the packaged crate), on Rust 1.85 in the `msrv` job, and on macOS, where it uses cap-std's component walk. Each default run is 512 cases. On macOS, two runs of 20,000 cases also passed. The test found two defects in how refusals are recorded, fixed in [#58](https://github.com/farming-labs/fsgate/pull/58) and [#59](https://github.com/farming-labs/fsgate/pull/59); the decisions themselves were correct. The two controls fail within a second. The generator makes no hard links, mounts, or concurrent renames, and the model follows RFC 0001, so it cannot find a flaw in the RFC's own rules.
 - [ ] Gate and kernel agree. On Linux, replay the generated cases as raw opens in a locked child. Acceptance: every place the kernel and the gate answer differently is one the threat model documents, such as a nested grant's lesser right, or it is fixed.
-- [ ] Mutation testing of the security core (`lib.rs`, `containment.rs`, `broker.rs`, `broker_sys.rs`, and `fsgate-broker` with `confine.rs`) with `cargo-mutants`, on Linux and macOS. Acceptance: the caught and missed counts are recorded, and each missed mutant in an authorization, resolution, or confinement path gets a test that catches it or a written reason it cannot change behavior.
+- [x] Mutation testing of the security core (`lib.rs`, `containment.rs`, `broker.rs`, `broker_sys.rs`, and `fsgate-broker` with `confine.rs`) with `cargo-mutants`, on Linux and macOS ([`.cargo/mutants.toml`](.cargo/mutants.toml), [`mutants.yml`](.github/workflows/mutants.yml), [#80](https://github.com/farming-labs/fsgate/pull/80)). Acceptance: the caught and missed counts are recorded, and each missed mutant in an authorization, resolution, or confinement path gets a test that catches it or a written reason it cannot change behavior.
+
+  Evidence: [CI](https://github.com/farming-labs/fsgate/actions/runs/43072183566) on `2d3ef05`, with cargo-mutants 27.1.0:
+
+  | Platform | Mutants | Caught | Timed out | Missed | Did not build |
+  |---|---|---|---|---|---|
+  | The runner's Linux 7.0 (Landlock ABI v8), with `experimental-intercept` | 353 | 248 | 7 | 16 | 82 |
+  | macOS | 270 | 192 | 6 | 6 | 66 |
+
+  The first macOS run, before any new test, missed 26 mutants. The first Linux run, with the tests for those added, missed 28. Two let a lock or a worker hold more than asked for. Building the requested restrictions with `&` instead of `|` left a plain `lock()` restricting nothing beyond files. A `--direct <dir>:l` without its match arm gave the worker execute instead of list. The other new tests cover the rights and restrictions as sets, errnos and remedies, the broker's 1 MiB frame limit, and finding the worker on `PATH`.
+
+  Every remaining miss is listed in [`.github/mutants/`](.github/mutants) with the reason it cannot change behavior on that platform:
+  - code the platform does not build;
+  - `^` for `|` on distinct flags;
+  - checks that only a kernel below Landlock ABI v3 reaches, which the kernels job's boot without Landlock covers;
+  - a descriptor number the broker never uses.
+
+  The workflow fails when the misses differ from the lists, but it runs only on demand and when its setup changes, so a change to the code can add a miss that the next run reports. Doctests are left out. A timeout counts as caught: each one leaves a client waiting for an answer that never comes. Mutation testing also found a flaky coverage check in the model test, fixed in [#79](https://github.com/farming-labs/fsgate/pull/79).
 - [ ] More fuzzing: targets for the `--grant` and `--direct` parsers and for path resolution beneath a fixed tree, where nothing outside the tree may be reached. Run every target on a weekly schedule as well as when the code changes. Acceptance: each target has seeds and a recorded run with its duration, and every crash becomes a regression test.
 - [ ] More kernels and an architecture. Add Linux 6.1 (Landlock ABI v2, below fsgate's floor, where a strict `lock()` and a confined worker must fail closed) and 6.12 (the first kernel with signal and abstract socket scopes) to the `kernels` job, and run `check` on an arm64 runner too. Acceptance: the threat model's row for Landlock ABI below v3 names a test.
 - [ ] The confined worker beyond Ubuntu. Run `tests/broker_confined.rs` in Debian, Fedora, Arch, Alpine (musl), and NixOS containers on the runner's kernel. Acceptance: [RFC 0008](docs/rfcs/0008-confine-broker-worker.md)'s open question is answered with what each system needs, and the default paths or the docs change to match.
