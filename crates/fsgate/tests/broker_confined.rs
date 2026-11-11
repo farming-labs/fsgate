@@ -206,6 +206,21 @@ fn an_environment_name_is_only_a_name() {
     }
 }
 
+/// An argument that is not UTF-8 is a usage error, not a panic.
+#[test]
+fn an_argument_that_is_not_utf8_is_a_usage_error() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fsgate-broker"))
+        .args(["--grant", "/tmp:r", "--unconfined", "--", "true"])
+        .arg(std::ffi::OsStr::from_bytes(b"\xff"))
+        .output()
+        .expect("run fsgate-broker");
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("UTF-8"), "no reason in: {stderr}");
+}
+
 #[cfg(target_os = "linux")]
 mod kernel {
     use std::env;
