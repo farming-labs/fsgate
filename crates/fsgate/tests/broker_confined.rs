@@ -703,4 +703,90 @@ mod kernel {
         std::io::stdin().read_line(&mut line).unwrap();
         println!("alive");
     }
+
+    /// `l` lets the worker list a `--direct` directory, and nothing more: its
+    /// files stay unread.
+    #[test]
+    fn a_direct_path_can_be_listed_and_not_read() {
+        let fixture = fixture();
+        let open = fixture.outside.join("open");
+        fs::create_dir(&open).unwrap();
+        fs::write(open.join("runtime.txt"), b"runtime").unwrap();
+
+        let mut flags = confined(&[]);
+        flags.extend(["--direct".to_string(), format!("{}:l", open.display())]);
+        let output = broker(&fixture, &flags, "kernel::listed_scenario")
+            .output()
+            .expect("run fsgate-broker");
+        assert_ran(&output);
+    }
+
+    #[test]
+    fn listed_scenario() {
+        if !in_child("kernel::listed_scenario") {
+            return;
+        }
+        let open = format!("{}/open", env::var("FSGATE_OUTSIDE").unwrap());
+        let names: Vec<_> = fs::read_dir(&open)
+            .expect("list the direct path")
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["runtime.txt"]);
+        assert_eq!(
+            fs::read(format!("{open}/runtime.txt")).unwrap_err().kind(),
+            ErrorKind::PermissionDenied
+        );
+    }
+
+    /// A worker named without a `/` is looked up on `PATH` the way `execvp`
+    /// would, past an entry where it is missing and one where it is not
+    /// executable, and the image found is the one allowed to run.
+    #[test]
+    fn a_worker_named_without_a_path_is_found_on_path() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let fixture = fixture();
+        let empty = fixture.root.join("empty");
+        let plain = fixture.root.join("plain");
+        let bin = fixture.root.join("bin");
+        for dir in [&empty, &plain, &bin] {
+            fs::create_dir(dir).unwrap();
+        }
+        let name = "fsgate-test-worker";
+        fs::write(plain.join(name), b"not a program").unwrap();
+        fs::set_permissions(plain.join(name), fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(env::current_exe().unwrap(), bin.join(name)).unwrap();
+        let path = env::join_paths([&empty, &plain, &bin]).unwrap();
+
+        let command = broker(&fixture, &confined(&[]), "kernel::found_scenario");
+        let args: Vec<_> = command.get_args().map(ToOwned::to_owned).collect();
+        let worker = args.iter().position(|arg| arg == "--").unwrap() + 1;
+        let mut named = Command::new(command.get_program());
+        named
+            .args(&args[..worker])
+            .arg(name)
+            .args(&args[worker + 1..])
+            .env("PATH", path);
+        for (key, value) in command.get_envs() {
+            if let Some(value) = value {
+                named.env(key, value);
+            }
+        }
+        named.current_dir(&fixture.root);
+        let output = named.output().expect("run fsgate-broker");
+        assert_ran(&output);
+    }
+
+    #[test]
+    fn found_scenario() {
+        if !in_child("kernel::found_scenario") {
+            return;
+        }
+        let mut gate = BrokerGate::from_inherited().expect("adopt the connection");
+        assert!(
+            gate.metadata(format!("{}/a.txt", env::var("FSGATE_GRANTED").unwrap()))
+                .unwrap()
+                .is_file
+        );
+    }
 }

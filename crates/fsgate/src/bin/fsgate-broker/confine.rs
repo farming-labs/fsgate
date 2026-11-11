@@ -371,3 +371,29 @@ mod sys {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A runtime path this system lacks is skipped, which only narrows the
+    /// ruleset. Any other failure to open one stops the worker, so a path
+    /// the broker cannot see is never silently left out of the rules.
+    #[test]
+    fn only_a_missing_runtime_path_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let access = AccessFs::ReadFile.into();
+
+        let missing = dir.path().join("missing");
+        assert!(allow_if_present(ruleset().unwrap(), &missing, access).is_ok());
+        assert!(allow_if_present(ruleset().unwrap(), dir.path(), access).is_ok());
+
+        let shut = dir.path().join("shut");
+        fs::create_dir(&shut).unwrap();
+        fs::set_permissions(&shut, fs::Permissions::from_mode(0o000)).unwrap();
+        let Err(err) = allow_if_present(ruleset().unwrap(), &shut.join("beneath"), access) else {
+            panic!("a path that cannot be searched was skipped");
+        };
+        assert!(err.contains("cannot be opened for the worker"), "{err}");
+    }
+}

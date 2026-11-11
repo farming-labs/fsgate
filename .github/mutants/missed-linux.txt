@@ -2,4 +2,53 @@
 # behavior there. The `mutants` workflow fails when the mutants it misses
 # differ from this list. A line is a mutant as `cargo mutants --list` names
 # it, without its line and column, so a name that occurs twice in a file is
-# listed once for each miss.
+# listed once for each miss. The runner boots Linux 7.0 (Landlock ABI v8).
+
+# Not built on Linux, or not with `experimental-intercept`, which the
+# workflow enables. Each shares its name with a mutant in the code Linux
+# builds, which the tests catch, so the workflow cannot leave these out
+# without a line number.
+crates/fsgate/src/bin/fsgate-broker.rs: replace intercept::run -> ExitCode with Default::default()
+crates/fsgate/src/broker.rs: replace peer_uid -> io::Result<u32> with Ok(0)
+crates/fsgate/src/broker.rs: replace peer_uid -> io::Result<u32> with Ok(1)
+crates/fsgate/src/containment.rs: replace apply -> Result<Applied, GateError> with Ok(Default::default())
+crates/fsgate/src/containment.rs: replace == with != in apply
+
+# The Linux `apply` checks that a strict lock ended fully enforced. The
+# mutant checks a best-effort one instead, which differs only on a kernel
+# below Landlock ABI v3. `best_effort_lock_reports_library_only` catches it
+# in the kernels job's boot without Landlock.
+crates/fsgate/src/containment.rs: replace == with != in apply
+
+# `LockPolicy::BestEffort` turned into the strict default differs only on a
+# kernel below Landlock ABI v3. `best_effort_lock_reports_library_only`
+# catches it without Landlock, and the macOS run catches it too.
+crates/fsgate/src/lib.rs: replace <impl From<LockPolicy> for LockOptions>::from -> LockOptions with Default::default()
+
+# `CAN_READ_PEER_UID` is true on Linux and macOS, so the guard is false
+# without the mutant too.
+crates/fsgate/src/broker.rs: replace match guard !CAN_READ_PEER_UID with false in ServeOptions::allowed_uids
+
+# The access flags are distinct bits, so `^` builds the same set as `|`.
+crates/fsgate/src/containment.rs: replace | with ^ in apply
+crates/fsgate/src/bin/fsgate-broker/confine.rs: replace | with ^ in restrict
+crates/fsgate/src/bin/fsgate-broker/confine.rs: replace | with ^ in restrict
+crates/fsgate/src/bin/fsgate-broker/confine.rs: replace | with ^ in restrict
+
+# The connection is never descriptor 3. std reopens a closed standard stream
+# at startup, the broker opens at least one grant before the connection's
+# socket pair, and the broker keeps the pair's lower number, so the worker's
+# end is 5 or higher.
+crates/fsgate/src/bin/fsgate-broker/confine.rs: replace > with >= in close_others_at_exec
+
+# The ruleset is a hard requirement, so `restrict_self` fails before it can
+# report a ruleset it did not enforce, and it sets `no_new_privs` itself.
+# Both halves are false wherever it succeeds; the check guards against a
+# change in the crate.
+crates/fsgate/src/bin/fsgate-broker/confine.rs: replace || with && in restrict
+
+# The message for a kernel without Landlock ABI v3, which the runner's is
+# not. `the_broker_refuses_to_start_a_worker_without_landlock` checks it in
+# the kernels job's boot without Landlock.
+crates/fsgate/src/bin/fsgate-broker/confine.rs: replace unavailable -> String with String::new()
+crates/fsgate/src/bin/fsgate-broker/confine.rs: replace unavailable -> String with "xyzzy".into()

@@ -905,6 +905,39 @@ mod kernel {
         (std::env::var("FSGATE_GRANTED").unwrap(), secret)
     }
 
+    /// `lock()` requests every restriction and requires none, so it applies
+    /// each one this kernel has and skips the rest. The tests above require
+    /// the restriction they check, which applies it whatever is requested.
+    #[test]
+    fn a_bare_lock_applies_every_restriction_the_kernel_has() {
+        let (_root, granted, outside) = dirs();
+        run_locked("bare_lock_child", &granted, &outside);
+    }
+
+    #[test]
+    fn bare_lock_child() {
+        if child_mode("bare_lock_child").is_none() {
+            return;
+        }
+        // The probe runs a program, so it goes before the lock. Each needed
+        // ABI is the one `Restrictions` documents.
+        let abi = kernel_abi();
+        let expected = [
+            (Restrictions::IOCTL_DEV, 5),
+            (Restrictions::ABSTRACT_UNIX_SOCKET, 6),
+            (Restrictions::SIGNAL, 6),
+            (Restrictions::ALL_THREADS, 8),
+            (Restrictions::RESOLVE_UNIX, 9),
+        ]
+        .into_iter()
+        .filter(|(_, needed)| abi >= *needed)
+        .fold(Restrictions::empty(), |set, (member, _)| set | member);
+        let mut gate = granted_gate();
+
+        lock_and_prove(&mut gate);
+        assert_eq!(gate.restrictions(), Some(expected), "ABI v{abi}");
+    }
+
     /// A grant with no rights, made that way or narrowed to nothing before
     /// the lock, must not stop the lock, and must reach nothing after it.
     #[test]

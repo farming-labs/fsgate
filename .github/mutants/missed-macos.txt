@@ -14,8 +14,9 @@ crates/fsgate/src/lib.rs: replace | with ^ in LockOptions::requested
 # uid, which no CI runner is.
 crates/fsgate/src/broker.rs: replace match guard !CAN_READ_PEER_UID with false in ServeOptions::allowed_uids
 
-# Not built on macOS: the Linux `apply`. The macOS `apply` has a mutant of
-# the same name, which the tests catch, and so the workflow cannot leave this
-# one out without a line number.
+# Not built on macOS: the Linux `apply`, and the interception mode's `run`.
+# Each shares its name with a mutant in the code macOS builds, which the
+# tests catch, so the workflow cannot leave these out without a line number.
+crates/fsgate/src/bin/fsgate-broker.rs: replace intercept::run -> ExitCode with Default::default()
 crates/fsgate/src/containment.rs: replace apply -> Result<Applied, GateError> with Ok(Default::default())
 crates/fsgate/src/containment.rs: replace == with != in apply
