@@ -63,10 +63,14 @@ mod confine;
 #[cfg(not(target_os = "linux"))]
 mod confine {
     use std::os::fd::RawFd;
+    use std::path::PathBuf;
     use std::process::Command;
+
+    use fsgate::Rights;
 
     pub(super) fn command(
         _: RawFd,
+        _: &[(PathBuf, Rights)],
         _: &[String],
         _: &[String],
         _: &[String],
@@ -180,7 +184,7 @@ fn run_inherited(
 
     let mut worker = match start {
         Start::Confined { direct, env } => {
-            confine::command(worker_end.as_raw_fd(), &direct, &env, command)?
+            confine::command(worker_end.as_raw_fd(), grants, &direct, &env, command)?
         }
         Start::Unconfined => {
             let mut worker = Command::new(&command[0]);

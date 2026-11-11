@@ -328,6 +328,81 @@ mod kernel {
         );
     }
 
+    /// A grant the confined worker could read without the broker is refused,
+    /// whichever of the two paths contains the other: those reads would not
+    /// be audited, and revoking the grant would not stop them. A grant that
+    /// gives no right the worker has there is fine.
+    #[test]
+    fn a_grant_the_worker_could_read_directly_is_refused() {
+        let fixture = fixture();
+        let sub = fixture.granted.join("sub");
+        fs::create_dir(&sub).unwrap();
+        let listed = fixture.outside.join("listed");
+        fs::create_dir_all(listed.join("sub")).unwrap();
+        let root = fixture.root.display().to_string();
+        let sub = sub.display().to_string();
+        let listed = listed.display().to_string();
+        let flag = |name: &str, value: String| [name.to_string(), value];
+        let cases = [
+            (
+                vec![flag("--grant", "/usr/bin:r".into())],
+                "`/usr`".to_string(),
+            ),
+            (
+                vec![flag("--direct", format!("{root}:r"))],
+                format!("`--direct {root}:r`"),
+            ),
+            (
+                vec![flag("--direct", format!("{sub}:r"))],
+                format!("`--direct {sub}:r`"),
+            ),
+            (
+                vec![
+                    flag("--grant", format!("{listed}:l")),
+                    flag("--direct", format!("{listed}/sub:l")),
+                ],
+                format!("`--direct {listed}/sub:l`"),
+            ),
+        ];
+        for (extra, named) in cases {
+            let extra = extra.concat();
+            let mut flags = confined(&[]);
+            flags.extend(extra);
+            let output = broker(&fixture, &flags, "kernel::nothing_scenario")
+                .output()
+                .expect("run fsgate-broker");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(1), "{named}: {stderr}");
+            assert!(stderr.contains(&named), "{named}: {stderr}");
+            assert!(output.stdout.is_empty(), "{named}: the worker ran");
+        }
+
+        // Neither grant gives a right the worker has at the `--direct` path:
+        // a write-only grant beneath a readable one, and a listable path
+        // beneath a grant that can only read.
+        let drop = fixture.outside.join("drop");
+        fs::create_dir(&drop).unwrap();
+        let controls = [
+            [
+                flag("--grant", format!("{}:wc", drop.display())),
+                flag("--direct", format!("{}:r", fixture.outside.display())),
+            ]
+            .concat(),
+            flag("--direct", format!("{sub}:l")).to_vec(),
+        ];
+        for extra in controls {
+            let mut flags = confined(&[]);
+            flags.extend(extra);
+            let output = broker(&fixture, &flags, "kernel::nothing_scenario")
+                .output()
+                .expect("run fsgate-broker");
+            assert_ran(&output);
+        }
+    }
+
+    #[test]
+    fn nothing_scenario() {}
+
     #[test]
     fn a_direct_path_can_be_read_and_nothing_beside_it() {
         let fixture = fixture();

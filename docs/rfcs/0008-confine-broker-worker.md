@@ -101,6 +101,14 @@ There is no `w` or `c`, because a write the worker makes directly is one
 the broker never sees. Direct opens are not audited, so `--direct` is for
 runtime files, not data.
 
+A grant that overlaps a runtime directory or a `--direct` path, in either
+direction, would be partly readable without the broker, and revoking it
+would not stop those reads. The broker refuses one before the worker
+starts, when the grant gives a right the worker has there: `READ` where
+it may read, `LIST` where it may list. Paths are compared after resolving
+symlinks, as the rules see them. The image and the single files in the
+table hold no data and are not compared.
+
 The ruleset also requests the RFC 0006 restrictions where the kernel has
 them: device ioctls, abstract sockets, signals, and pathname sockets. The
 worker holds its connection before the lock, so it never needs a connect.
@@ -179,8 +187,7 @@ command line keeps working with one added flag. The library and
 ## What this does not stop
 
 - A compromised worker using its connection. The grants are the ceiling.
-- Reading anything beneath the runtime paths or a `--direct` path,
-  including a granted file beneath one of them.
+- Reading anything beneath the runtime paths or a `--direct` path.
 - File metadata anywhere. Landlock cannot restrict `stat`, `chmod`,
   `chown`, `utime`, or `setxattr`.
 - Network access.

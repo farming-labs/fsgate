@@ -774,9 +774,14 @@ impl Gate {
     /// check is on the opened descriptor, so a path that changes during
     /// resolution cannot get past it. Use [`read_dir`](Gate::read_dir) to
     /// list a directory.
+    ///
+    /// A FIFO opens at once, without waiting for a writer, and the file
+    /// blocks as usual afterwards.
     pub fn open(&self, path: impl AsRef<Path>) -> Result<File, GateError> {
         self.gated(AuditOp::Open, path.as_ref(), Rights::READ, |entry, rel| {
-            let file = entry.dir.open(rel)?.into_std();
+            let mut options = cap_std::fs::OpenOptions::new();
+            options.read(true);
+            let file = open_without_waiting(&entry.dir, rel, &mut options)?;
             if file.metadata()?.is_dir() {
                 return Err(rustix::io::Errno::ISDIR.into());
             }
@@ -861,12 +866,19 @@ impl Gate {
 
     /// Creates (or truncates) a file for writing. Needs [`Rights::CREATE`]
     /// and [`Rights::WRITE`], because the returned handle writes data.
+    ///
+    /// An existing FIFO does not wait for a reader: without one it fails
+    /// with `ENXIO`, and with one the file blocks as usual afterwards.
     pub fn create(&self, path: impl AsRef<Path>) -> Result<File, GateError> {
         self.gated(
             AuditOp::Create,
             path.as_ref(),
             Rights::CREATE | Rights::WRITE,
-            |entry, rel| entry.dir.create(rel).map(cap_std::fs::File::into_std),
+            |entry, rel| {
+                let mut options = cap_std::fs::OpenOptions::new();
+                options.write(true).create(true).truncate(true);
+                open_without_waiting(&entry.dir, rel, &mut options)
+            },
         )
     }
 
@@ -1129,6 +1141,24 @@ impl From<AuditOp> for Origin {
 struct Notified {
     syscall: &'static str,
     notification: u64,
+}
+
+/// Opens `rel` beneath `dir` without waiting, then restores blocking mode.
+/// Opening a FIFO waits for its other end, which would hold the caller, or
+/// a broker's serve thread, until some other process opened it.
+fn open_without_waiting(
+    dir: &cap_std::fs::Dir,
+    rel: &Path,
+    options: &mut cap_std::fs::OpenOptions,
+) -> io::Result<File> {
+    use cap_std::fs::OpenOptionsExt;
+    use rustix::fs::OFlags;
+
+    let nonblocking = options.custom_flags(OFlags::NONBLOCK.bits() as i32);
+    let file = dir.open_with(rel, nonblocking)?.into_std();
+    let flags = rustix::fs::fcntl_getfl(&file)?;
+    rustix::fs::fcntl_setfl(&file, flags - OFlags::NONBLOCK)?;
+    Ok(file)
 }
 
 /// Normalizes an absolute path lexically: resolves `.` and `..` without
