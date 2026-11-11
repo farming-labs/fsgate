@@ -86,13 +86,23 @@ After the worker starts, one thread waits for them with `sigwait`:
    default action, unblocks it, and raises it, so the broker's parent
    sees it die by that signal.
 
-`std`'s `Command` resets the signal mask in the child before `exec`, so
-the confining process and the worker start with no signal blocked.
+`std`'s `Command` keeps the signal mask in the processes it starts, and
+`exec` keeps it too. So the confining process unblocks the three signals
+before it becomes the worker, and the worker and its programs can still
+be stopped by them. A stop signal the broker inherited as ignored, as
+under `nohup`, is not blocked or waited for, so it stays ignored.
 
 Blocking and waiting are not wrapped safely by `std` or `rustix`, so
-`pthread_sigmask` and `sigwait` go in the `sys` module of `confine.rs`,
-next to `close_range`, with a written safety contract. `libc` is already
-a Linux dependency.
+`pthread_sigmask`, `sigaction`, and `sigwait` go in the `sys` module of
+`confine.rs`, next to `close_range`, with a written safety contract.
+`libc` is already a Linux dependency.
+
+The supervisor's thread starts before the worker, as the thread that
+serves the worker's connection does, so no worker runs without it. The
+two threads share the worker's ID only until just before it is reaped,
+behind a lock, so a late signal cannot reach a reused ID. Until the
+confining process calls `setsid`, the worker is not in a group of its
+own, so each kill also names the worker by ID.
 
 ### Why the process group
 
@@ -128,7 +138,8 @@ assert the kill and the absence of the side effect:
   pipe reaches end of file, and the broker's status is death by `SIGTERM`.
   The same for `SIGINT` and `SIGHUP`.
 - **The worker's own signals.** `SIGTERM` sent to the worker directly
-  still ends it, so the blocked mask did not leak into it.
+  still ends it, so the blocked mask did not leak into it. Without the
+  confining process unblocking them, it would have.
 - **The documented limit.** A program that calls `setsid` survives the
   worker's exit. The test then kills it.
 - **`SIGKILL` to the broker.** The existing test that shows a program

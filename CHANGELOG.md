@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- `fsgate-broker` kills a confined worker's process group when the worker exits, and when the broker gets `SIGINT`, `SIGTERM`, or `SIGHUP`, after which the broker dies by that signal ([RFC 0010](docs/rfcs/0010-worker-process-group.md)). A program a confined worker left running used to keep its `--direct` paths, the network, and the terminal after the worker and the broker were gone. A worker that needs a program to outlive it must run with `--unconfined`, which is unchanged. A stop signal the broker inherited as ignored, as under `nohup`, stays ignored. Not covered: a program that calls `setsid` or `setpgid`, and anything after `SIGKILL` to the broker.
+
 ### Fixed
 
 - An audit event for a request that no grant covers, and for a `grant` refused after `lock()`, records the normalized path, as [RFC 0002](docs/rfcs/0002-audit-events.md) specifies. It recorded the path as requested, so `/srv/data/../../etc/shadow` appeared to be a request inside `/srv/data`. The decision itself was always correct.
