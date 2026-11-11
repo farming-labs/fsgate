@@ -106,7 +106,14 @@ enum Start {
 }
 
 fn main() -> ExitCode {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let argv = match utf8_args(std::env::args_os().skip(1)) {
+        Ok(argv) => argv,
+        Err(message) => {
+            eprintln!("fsgate-broker: {message}");
+            eprintln!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
     #[cfg(target_os = "linux")]
     if argv.first().is_some_and(|first| first == confine::ENTRY) {
         return confine::main(argv.into_iter().skip(1));
@@ -287,6 +294,23 @@ const USAGE: &str = "usage: fsgate-broker --grant <path>:<rights> [--grant ...] 
                      [--audit] [--apply] -- <static-binary> [args...]\n\
                      rights letters: r read, w write, c create, l list; \
                      for --direct: r read, l list, x execute";
+
+/// The arguments as strings. `std::env::args` would panic on one that is not
+/// UTF-8, and the broker protocol carries paths as UTF-8 anyway.
+fn utf8_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Vec<String>, String> {
+    args.enumerate()
+        .map(|(index, arg)| {
+            arg.into_string().map_err(|arg| {
+                format!(
+                    "argument {} (`{}`) is not valid UTF-8; fsgate-broker accepts only UTF-8 \
+                     arguments, so pass this value to the worker another way",
+                    index + 1,
+                    arg.to_string_lossy()
+                )
+            })
+        })
+        .collect()
+}
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut grants = Vec::new();
