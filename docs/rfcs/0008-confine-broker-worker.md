@@ -196,10 +196,11 @@ command line keeps working with one added flag. The library and
 - File metadata anywhere. Landlock cannot restrict `stat`, `chmod`,
   `chown`, `utime`, or `setxattr`.
 - Network access.
-- Before Linux 6.12, signals to the broker and connects to abstract
-  sockets. Before Linux 7.1, connects to pathname sockets, which include
-  services that act for their caller, such as systemd's user manager on
-  the session bus.
+- Before Linux 6.12, signals to the broker. Before Linux 7.1, Landlock
+  does not refuse connects to Unix sockets, which include services that
+  act for their caller, such as systemd's user manager on the session
+  bus. [RFC 0009](0009-worker-unix-sockets.md) refuses the worker new
+  Unix sockets there instead.
 - After `SIGKILL` to the broker, a worker that cleared its death signal,
   and programs it started, which never had one. Otherwise RFC 0010 ends
   them, except a program that left the worker's process group with
