@@ -268,6 +268,11 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Request, String> {
 }
 
 fn run(request: Request) -> Result<Infallible, String> {
+    // The broker blocked these for its supervisor, and neither `std` nor
+    // `exec` clears a mask, so the worker would start with them blocked.
+    sys::unblock(&STOP_SIGNALS)
+        .map_err(|err| format!("unblocking the worker's stop signals failed: {err}"))?;
+
     // `TIOCSTI` lets a process type into its controlling terminal, so a
     // worker could queue commands for the user's shell. A new session has
     // no controlling terminal.
@@ -533,6 +538,15 @@ mod sys {
         }
         mask(libc::SIG_BLOCK, &set)?;
         Ok(SignalSet(set))
+    }
+
+    /// Unblocks each of `signals` in the calling thread.
+    pub(super) fn unblock(signals: &[libc::c_int]) -> io::Result<()> {
+        let mut set = empty();
+        for &signal in signals {
+            add(&mut set, signal)?;
+        }
+        mask(libc::SIG_UNBLOCK, &set)
     }
 
     /// Waits for one of `set`, which every thread must have blocked.
