@@ -13,7 +13,7 @@ The trusted side is everything that runs before the boundary: the code that call
 
 Each section names one boundary, what it trusts, what it stops, and what it does not stop. Every row names the test that shows it, or says "none". A "none" row is a claim from the code or the kernel documentation that no fsgate test exercises.
 
-Test names are `file::test`. Files are in `crates/fsgate/tests/` unless they start with `src/`, which marks a unit test. Linux tests run in CI on the runner's kernel (Linux 7.0) and on Linux 6.6.162 and 7.3.3, each booted in a VM; the [roadmap](../ROADMAP.md) records the runs. Tests under `kernel::` re-execute the test binary as a separate locked child, so the lock does not reach the test harness.
+Test names are `file::test`. Files are in `crates/fsgate/tests/` unless they start with `src/`, which marks a unit test. Linux tests run in CI on the runner's kernel (Linux 7.0), on x86_64 and arm64, and on Linux 6.6.162, 6.12.117, and 7.3.3, each booted in a VM on x86_64. Linux 6.1.192, whose Landlock is below fsgate's floor, runs only the tests that show it failing closed. The [roadmap](../ROADMAP.md) records the runs. Tests under `kernel::` re-execute the test binary as a separate locked child, so the lock does not reach the test harness.
 
 ## 1. The gate before `lock()`
 
@@ -70,6 +70,7 @@ Beyond these chosen cases, `gate_model.rs::the_gate_matches_the_model_and_never_
 | A thread started before the lock reading or writing outside the grants (7.0+) | `PermissionDenied`, and no file is created | `lock.rs::kernel::kernel_restricts_threads_that_predate_the_lock` |
 | Requiring a restriction the kernel does not provide | `LockUnsupported` naming it; nothing is applied, so a raw read outside still succeeds and the gate stays unlocked | the restriction tests above on a kernel without each one (Linux 6.6, and the runner's for `RESOLVE_UNIX`); `src/containment.rs::a_missing_requirement_names_the_kernel_that_provides_it` |
 | A strict lock without Landlock | `LockUnsupported`, and the granting phase continues | `lock.rs::strict_lock_fails_closed_without_kernel_support` (non-Linux), `lock.rs::without_landlock::strict_lock_fails_closed` (Linux booted without Landlock) |
+| A strict lock on a kernel below Landlock ABI v3 | `LockUnsupported`; nothing is applied, so a raw read outside still succeeds, and the granting phase continues | `lock.rs::kernel::below_landlock_v3::strict_lock_fails_closed` (Linux 6.1, ABI v2) |
 
 **Does not stop:**
 
@@ -82,7 +83,7 @@ Beyond these chosen cases, `gate_model.rs::the_gate_matches_the_model_and_never_
 | `stat`, `access`, `chdir`, `flock`, `chmod`, `chown`, `setxattr`, `utime`, and `fcntl` on paths outside the grants | Landlock cannot restrict these call families ([kernel documentation](https://docs.kernel.org/userspace-api/landlock.html)). A locked process can learn whether any path exists and read its metadata, and can change the mode, times, or extended attributes of files it owns outside the grants. | `lock.rs::kernel::metadata_and_modes_outside_the_grants_are_not_restricted`, for `stat` and `chmod`; the other families are from the kernel documentation |
 | Narrowing or revoking after the lock | The installed ruleset never changes. Only operations through the gate see the change ([RFC 0005](rfcs/0005-grant-narrowing.md#kernel-enforcement)). | `lock.rs::kernel::narrowing_or_revoking_after_the_lock_changes_only_the_gate` |
 | A nested grant with fewer rights than its parent | Landlock allows an access when any rule allows it, so the kernel enforces the parent's rights beneath the nested grant | `lock.rs::kernel::a_nested_grant_with_fewer_rights_binds_only_the_gate` |
-| `LockPolicy::BestEffort` on a kernel below ABI v3 | The caller asked for weaker rules; `LockStatus` reports `PartiallyEnforced` or `LibraryOnly` | `src/containment.rs::status_follows_the_filesystem_floor_alone` |
+| `LockPolicy::BestEffort` on a kernel below ABI v3 | The caller asked for weaker rules; `LockStatus` reports `PartiallyEnforced` or `LibraryOnly`. On ABI v2 the kernel refuses reads and creates outside the grants but not truncation, so a file beneath a read-only grant can be emptied. | `src/containment.rs::status_follows_the_filesystem_floor_alone`, `lock.rs::kernel::below_landlock_v3::best_effort_lock_enforces_only_the_abi_v2_rules` (Linux 6.1) |
 | Network, memory, environment, and syscalls that are not file operations | Out of scope ([README](../README.md#what-fsgate-does-not-do)) | none |
 
 ## 3. The broker and its worker
@@ -118,7 +119,7 @@ A trusted broker holds the `Gate` and serves `BrokerGate` requests over a Unix s
 | A peer of another user connecting through `Broker::serve` | Closed with no answer and no side effect, unless the embedder admits that uid | `broker_serve.rs::a_peer_of_another_user_gets_no_answer` |
 | More connections than the limit through `Broker::serve` | Each one past the limit (64 by default) is closed at once, and served again once a slot frees | `broker_serve.rs::connections_past_the_limit_are_closed_until_one_ends` |
 | A confined worker, or a program it starts, opening files directly (Linux) | `EACCES`, and no file is created. The grants never become worker rules, so a granted file is refused too. A grant that overlaps a runtime path or a `--direct` path is refused before the worker starts (see below). | `broker_confined.rs::kernel::a_confined_worker_cannot_reach_files_on_its_own`, `broker_confined.rs::kernel::a_granted_file_comes_only_through_the_broker`, `broker_confined.rs::kernel::a_direct_path_can_be_read_and_nothing_beside_it` |
-| A worker that cannot be confined | It does not start unless the command line says `--unconfined` | `broker_confined.rs::the_broker_refuses_to_start_a_worker_without_landlock` (on Linux booted with `lsm=capability`), `broker_confined.rs::a_platform_that_cannot_confine_refuses_to_start_the_worker` (macOS) |
+| A worker that cannot be confined | It does not start unless the command line says `--unconfined` | `broker_confined.rs::the_broker_refuses_to_start_a_worker_without_landlock` (on Linux booted with `lsm=capability`), `broker_confined.rs::the_broker_refuses_to_start_a_worker_below_landlock_v3` (Linux 6.1, ABI v2), `broker_confined.rs::a_platform_that_cannot_confine_refuses_to_start_the_worker` (macOS) |
 | Descriptors the broker's parent left open reaching a confined worker | Closed when the worker starts, since Landlock does not restrict what was opened before it | `broker_confined.rs::kernel::a_descriptor_the_parent_left_open_is_closed_in_the_worker` |
 | Secrets in the broker's environment reaching a confined worker | It gets only the names given with `--env` | `broker_confined.rs::kernel::a_confined_worker_inherits_only_the_named_variables` |
 | A confined worker typing into the user's terminal with `TIOCSTI` | It leads its own session, so it has no controlling terminal | `broker_confined.rs::kernel::a_confined_worker_leads_its_own_session`, which checks the session and not the ioctl |
@@ -180,7 +181,7 @@ Behind the `experimental-intercept` feature, `intercept::Launch` and `fsgate-bro
 | Files delivered before a revoke | They stay usable | `launch.rs::a_revoked_grant_denies_later_opens_but_delivered_files_stay_usable` |
 | Dynamic binaries, scripts, other architectures, and opens outside the read-only subset | Not mediated; refused instead | the refusal tests above |
 | A compromised supervisor | It holds the grants | none; trusted by design |
-| Kernels other than 6.6.162, 7.3.3, and the runner's, kernels without seccomp user notifications, and Landlock ABI below v3 | Untested ([M6](../ROADMAP.md#m6--linux-filesystem-interception-experimental)) | none |
+| Kernels other than 6.6.162, 6.12.117, 7.3.3, and the runner's, kernels without seccomp user notifications, and Landlock ABI below v3 | Untested ([M6](../ROADMAP.md#m6--linux-filesystem-interception-experimental)) | none |
 
 ## Audit is observation, not a boundary
 
