@@ -1,0 +1,17 @@
+# Mutation testing of the security core with `cargo-mutants` (ROADMAP M10).
+# `cargo mutants` reads this file, and the `mutants` workflow runs it on Linux
+# and macOS. `.github/mutants/` lists each mutant the tests miss, and why.
+
+examine_globs = [
+  "crates/fsgate/src/lib.rs",
+  "crates/fsgate/src/containment.rs",
+  "crates/fsgate/src/broker.rs",
+  "crates/fsgate/src/broker_sys.rs",
+  "crates/fsgate/src/bin/fsgate-broker.rs",
+  "crates/fsgate/src/bin/fsgate-broker/confine.rs",
+]
+
+# Doctests are left out. They only build the documentation's examples, and
+# rebuilding them doubles the time each mutant takes. Leaving out tests can
+# only turn a caught mutant into a missed one, never the reverse.
+additional_cargo_test_args = ["--all-targets"]

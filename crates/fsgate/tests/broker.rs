@@ -9,7 +9,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -126,6 +126,35 @@ fn denials_cross_the_wire_typed_and_leave_no_side_effect() {
         other => panic!("expected RightsExceeded, got {other:?}"),
     }
     assert!(!target.exists());
+
+    // A relative path: typed too, and nothing created where the broker runs.
+    let err = client.create("planted.txt").unwrap_err();
+    assert!(matches!(err, GateError::NotAbsolute { .. }), "got {err:?}");
+    assert!(!Path::new("planted.txt").exists());
+}
+
+/// A failed connect names the likelier fix: a refused one points at `lock`
+/// and the socket's permissions, and any other asks whether the broker runs.
+#[test]
+fn a_failed_connect_names_its_remedy() {
+    let (root, _, _) = setup();
+    let message = |socket: &Path| match BrokerGate::connect(socket) {
+        Err(GateError::Broker { message }) => message,
+        Err(other) => panic!("expected a broker error, got {other:?}"),
+        Ok(_) => panic!("connected to {}", socket.display()),
+    };
+
+    let missing = message(&root.path().join("missing.sock"));
+    assert!(missing.contains("is the broker running?"), "{missing}");
+
+    let socket = root.path().join("broker.sock");
+    let _listener = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o000)).unwrap();
+    let refused = message(&socket);
+    assert!(
+        refused.contains("connect before calling `lock`"),
+        "{refused}"
+    );
 }
 
 /// RFC 0003 rejects sending directory descriptors: one would let the worker
@@ -320,11 +349,14 @@ fn a_lost_response_fails_every_later_request_closed() {
 fn bytes_beyond_the_declared_length_fail_the_connection_closed() {
     let (_root, granted, _) = setup();
     let planted = granted.join("planted.txt");
-    // Declares 2 bytes, then sends a whole request.
-    let bytes = frame(2, &create_request(&planted));
-
-    let (result, response) = serve_raw(writable_gate(&granted), &bytes);
-    assert_closed_without_acting(result, &response, &planted);
+    let request = create_request(&planted);
+    // Declares 2 bytes, then sends a whole request; then one byte too many.
+    let declared = u32::try_from(request.len()).unwrap();
+    for declared in [2, declared - 1] {
+        let bytes = frame(declared, &request);
+        let (result, response) = serve_raw(writable_gate(&granted), &bytes);
+        assert_closed_without_acting(result, &response, &planted);
+    }
 }
 
 /// RFC 0003 caps a frame at 1 MiB. A larger prefix fails the connection
@@ -337,6 +369,130 @@ fn a_prefix_over_the_size_limit_fails_the_connection_closed() {
 
     let (result, response) = serve_raw(writable_gate(&granted), &bytes);
     assert_closed_without_acting(result, &response, &planted);
+}
+
+/// A peer that hangs up between requests ends the connection normally:
+/// `serve_conn` answers what it was sent, then returns `Ok`.
+#[test]
+fn a_hang_up_between_requests_ends_the_connection_cleanly() {
+    let (_root, granted, _) = setup();
+    let body = serde_json::json!({ "op": "metadata", "path": granted.join("a.txt") }).to_string();
+    let read_only = || {
+        let mut gate = Gate::new();
+        gate.grant(&granted, Rights::READ).unwrap();
+        gate
+    };
+
+    let (result, response) = serve_raw(read_only(), &[]);
+    result.expect("a hang-up before any request");
+    assert!(response.is_empty());
+
+    let (result, response) = serve_raw(read_only(), &frame(body.len() as u32, body.as_bytes()));
+    result.expect("a hang-up after an answered request");
+    let answer = answer_of(&response);
+    assert_eq!(answer["result"], "stat", "{answer}");
+    assert_eq!(answer["stat"]["is_file"], true, "{answer}");
+}
+
+/// The JSON body of the one frame in `response`.
+fn answer_of(response: &[u8]) -> serde_json::Value {
+    let (prefix, body) = response.split_at(4);
+    let declared = u32::from_le_bytes(prefix.try_into().unwrap());
+    assert_eq!(declared as usize, body.len(), "not one whole frame");
+    serde_json::from_slice(body).unwrap()
+}
+
+/// RFC 0003's frame limit, which a frame may reach.
+const MAX_FRAME_BYTES: usize = 1 << 20;
+
+/// A metadata request beneath `granted` whose body is exactly `len` bytes,
+/// and its path.
+fn metadata_request_of(granted: &Path, len: usize) -> (PathBuf, Vec<u8>) {
+    let encode = |path: &Path| {
+        serde_json::json!({ "op": "metadata", "path": path })
+            .to_string()
+            .into_bytes()
+    };
+    let pad = len - encode(&granted.join("x")).len();
+    let path = granted.join("x".repeat(1 + pad));
+    let body = encode(&path);
+    assert_eq!(body.len(), len);
+    (path, body)
+}
+
+/// A request of exactly 1 MiB is within the limit: the client sends it
+/// whole, and the broker reads it and answers.
+#[test]
+fn a_request_of_exactly_the_frame_limit_is_sent_and_served() {
+    let (_root, granted, _) = setup();
+    let (path, body) = metadata_request_of(&granted, MAX_FRAME_BYTES);
+
+    let (client, mut broker) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        let mut gate = BrokerGate::from_stream(client);
+        gate.metadata(&path).map(|stat| stat.len)
+    });
+    let mut prefix = [0; 4];
+    broker
+        .read_exact(&mut prefix)
+        .expect("the client sent no frame");
+    assert_eq!(u32::from_le_bytes(prefix) as usize, MAX_FRAME_BYTES);
+    let mut sent = vec![0; MAX_FRAME_BYTES];
+    broker.read_exact(&mut sent).unwrap();
+    assert!(sent == body, "the client sent another body");
+    let answer = br#"{"result":"stat","stat":{"is_dir":false,"is_file":true,"len":7}}"#;
+    broker
+        .write_all(&frame(answer.len() as u32, answer))
+        .unwrap();
+    assert_eq!(worker.join().unwrap().unwrap(), 7);
+
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::READ).unwrap();
+    let (result, response) = serve_raw(gate, &frame(MAX_FRAME_BYTES as u32, &body));
+    result.expect("the broker refused a frame within the limit");
+    // No file has that name, and the error repeats the path, so the answer
+    // is the error that fits.
+    let answer = answer_of(&response);
+    assert_eq!(answer["result"], "error", "{answer}");
+}
+
+/// A response of exactly 1 MiB is within the limit too: a listing that
+/// encodes to that length is delivered whole.
+#[test]
+fn a_response_of_exactly_the_frame_limit_is_delivered() {
+    let (_root, granted, _) = setup();
+    let crowded = granted.join("crowded");
+    fs::create_dir(&crowded).unwrap();
+    let encoded_name = |name: &str| serde_json::to_string(name).unwrap().len();
+    // As below, JSON writes U+0001 as six bytes, so these names are long.
+    let stem = "\u{1}".repeat(250);
+    let mut names: Vec<String> = Vec::new();
+    let mut len = serde_json::json!({ "result": "entries", "entries": names })
+        .to_string()
+        .len();
+    // Each name after the first also takes a comma.
+    while MAX_FRAME_BYTES - len >= encoded_name(&stem) + 5 + 1 + 4 {
+        let name = format!("{stem}{:05}", names.len());
+        len += encoded_name(&name) + usize::from(!names.is_empty());
+        names.push(name);
+    }
+    // The last name fills what is left after its comma and quotes.
+    let left = MAX_FRAME_BYTES - len - 3;
+    let last = format!("{}{}", "\u{1}".repeat(left / 6), "y".repeat(left % 6));
+    names.push(last);
+    let encoded = serde_json::json!({ "result": "entries", "entries": names }).to_string();
+    assert_eq!(encoded.len(), MAX_FRAME_BYTES);
+    for name in &names {
+        fs::write(crowded.join(name), b"").unwrap();
+    }
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::READ | Rights::LIST).unwrap();
+    let (mut client, _server) = brokered(gate);
+
+    let mut listed = client.read_dir(&crowded).unwrap();
+    listed.sort();
+    names.sort();
+    assert!(listed == names, "the listing came back changed");
 }
 
 /// A listing too large for one frame fails that request. The broker answers
@@ -597,6 +753,28 @@ fn interception_flags_do_not_mix_with_socket_mode() {
     assert!(String::from_utf8_lossy(&both.stderr).contains("separate modes"));
     assert_eq!(stray.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&stray.stderr).contains("need `--experimental-intercept`"));
+}
+
+/// The interception mode brings its own worker profile, so it takes none of
+/// the options that shape the confined worker's, even one alone.
+#[test]
+fn interception_mode_refuses_the_confined_worker_options() {
+    for options in [
+        &["--unconfined"][..],
+        &["--direct", "/tmp:r"],
+        &["--env", "HOME"],
+    ] {
+        let mut args = vec!["--experimental-intercept"];
+        args.extend_from_slice(options);
+        args.extend(["--grant", "/tmp:r", "--", "/bin/true"]);
+        let output = broker_usage(&args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{options:?}: {stderr}");
+        assert!(
+            stderr.contains("has its own worker profile"),
+            "{options:?}: {stderr}"
+        );
+    }
 }
 
 #[cfg(not(all(

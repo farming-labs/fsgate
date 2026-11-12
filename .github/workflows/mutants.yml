@@ -1,0 +1,103 @@
+name: mutants
+
+# Mutation testing of the security core. cargo-mutants changes the code one
+# small way at a time (a `true` for a check, a `>=` for a `>`) and runs the
+# tests against each change; a change no test fails on is "missed".
+# `.cargo/mutants.toml` names the files, and `.github/mutants/` lists, with a
+# reason for each, every mutant the tests are known to miss. A run tests
+# every mutant, so it runs when that setup changes, and on demand.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .cargo/mutants.toml
+      - .github/mutants/**
+      - .github/workflows/mutants.yml
+
+permissions:
+  contents: read
+
+jobs:
+  mutants:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    env:
+      # Debug info is not needed to run the tests, and it doubles each build.
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - run: cargo install cargo-mutants --locked --version 27.1.0
+      - name: Test every mutant
+        shell: bash
+        run: |
+          uname -srm
+          # cargo-mutants does not read `cfg`, so a mutant in code this
+          # platform does not build passes every test. These leave out the
+          # ones that can be named without a line number; the lists in
+          # .github/mutants/ name the rest.
+          case $RUNNER_OS in
+          Linux)
+            args=(
+              --features experimental-intercept
+              --exclude-re 'fsgate-broker\.rs:\d+:\d+: .*confine::'
+              --exclude-re 'broker_sys\.rs:\d+:\d+: .*peer_uid'
+            )
+            ;;
+          macOS)
+            args=(
+              --exclude crates/fsgate/src/bin/fsgate-broker/confine.rs
+              --exclude-re 'containment\.rs:\d+:\d+: .*(unsupported_floor|unsupported_or_failed|member_error|lock_failed)'
+              --exclude-re 'containment\.rs:\d+:\d+: (replace \|=|replace \| with|delete match arm LandlockStatus|replace >= with <|replace && with \|\||replace != with ==).* in apply$'
+              --exclude-re 'lib\.rs:\d+:\d+: .*(open_regular_strict|open_intercepted)'
+              --exclude-re 'fsgate-broker\.rs:\d+:\d+: (replace == with != in main|.*intercept::(exit_for|print_plan|<impl AuditSink)|delete ! in intercept::run)'
+              --exclude-re 'src/broker\.rs:\d+:\d+: replace peer_uid'
+            )
+            ;;
+          *)
+            echo "::error::no exclusions for $RUNNER_OS"
+            exit 1
+            ;;
+          esac
+          status=0
+          cargo mutants --jobs 2 --output "$RUNNER_TEMP" "${args[@]}" || status=$?
+          # 2 means some mutants were missed, and 3 that some timed out, which
+          # counts as caught. The next step compares the missed ones with the
+          # list. Any other failure, such as tests that fail unmutated, stops
+          # here.
+          case $status in
+          0 | 2 | 3) ;;
+          *) exit "$status" ;;
+          esac
+      - name: Compare the missed mutants with the list
+        shell: bash
+        run: |
+          out=$RUNNER_TEMP/mutants.out
+          {
+            echo "### $RUNNER_OS"
+            for outcome in caught missed timeout unviable; do
+              echo "- $outcome: $(wc -l <"$out/$outcome.txt")"
+            done
+          } >>"$GITHUB_STEP_SUMMARY"
+          # Line numbers move with every edit, so the list leaves them out.
+          sed -E 's/:[0-9]+:[0-9]+: /: /' "$out/missed.txt" | sort >"$RUNNER_TEMP/actual"
+          list=.github/mutants/missed-$(echo "$RUNNER_OS" | tr '[:upper:]' '[:lower:]').txt
+          grep -v -e '^#' -e '^$' "$list" | sort >"$RUNNER_TEMP/expected"
+          if ! diff --unified=0 "$RUNNER_TEMP/expected" "$RUNNER_TEMP/actual"; then
+            echo "::error file=$list::the missed mutants differ from $list: a + line is a new miss, which needs a test that catches it or a reason in the list, and a - line is a listed mutant the tests now catch, which leaves the list"
+            exit 1
+          fi
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mutants-${{ runner.os }}
+          path: ${{ runner.temp }}/mutants.out/
+          if-no-files-found: ignore

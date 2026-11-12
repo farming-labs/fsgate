@@ -52,6 +52,32 @@ fn best_effort_lock_ends_the_granting_phase() {
     assert!(matches!(err, GateError::Locked), "got {err:?}");
 }
 
+/// `restrict` and `require` take sets built with these operators, and a
+/// set prints as its members.
+#[test]
+fn restrictions_combine_and_print_as_a_set() {
+    let signal = Restrictions::SIGNAL;
+    let devices_and_signal = Restrictions::IOCTL_DEV | signal;
+    assert_eq!(devices_and_signal | signal, devices_and_signal);
+    assert_eq!(
+        Restrictions::all() - signal,
+        Restrictions::IOCTL_DEV
+            | Restrictions::ABSTRACT_UNIX_SOCKET
+            | Restrictions::ALL_THREADS
+            | Restrictions::RESOLVE_UNIX
+    );
+    assert_eq!(signal - Restrictions::all(), Restrictions::empty());
+    assert_eq!(devices_and_signal & signal, signal);
+
+    assert!(Restrictions::empty().is_empty());
+    assert!(!signal.is_empty());
+    assert!(devices_and_signal.contains(signal));
+    assert!(!signal.contains(devices_and_signal));
+
+    assert_eq!(format!("{devices_and_signal:?}"), "IOCTL_DEV | SIGNAL");
+    assert_eq!(format!("{:?}", Restrictions::empty()), "(none)");
+}
+
 /// A required restriction binds even under `BestEffort`, and a lock that
 /// cannot meet it changes nothing (RFC 0006).
 #[cfg(not(target_os = "linux"))]
@@ -877,6 +903,39 @@ mod kernel {
         let err = fs::read(&secret).expect_err("read outside the grants after the lock");
         assert_eq!(err.kind(), ErrorKind::PermissionDenied);
         (std::env::var("FSGATE_GRANTED").unwrap(), secret)
+    }
+
+    /// `lock()` requests every restriction and requires none, so it applies
+    /// each one this kernel has and skips the rest. The tests above require
+    /// the restriction they check, which applies it whatever is requested.
+    #[test]
+    fn a_bare_lock_applies_every_restriction_the_kernel_has() {
+        let (_root, granted, outside) = dirs();
+        run_locked("bare_lock_child", &granted, &outside);
+    }
+
+    #[test]
+    fn bare_lock_child() {
+        if child_mode("bare_lock_child").is_none() {
+            return;
+        }
+        // The probe runs a program, so it goes before the lock. Each needed
+        // ABI is the one `Restrictions` documents.
+        let abi = kernel_abi();
+        let expected = [
+            (Restrictions::IOCTL_DEV, 5),
+            (Restrictions::ABSTRACT_UNIX_SOCKET, 6),
+            (Restrictions::SIGNAL, 6),
+            (Restrictions::ALL_THREADS, 8),
+            (Restrictions::RESOLVE_UNIX, 9),
+        ]
+        .into_iter()
+        .filter(|(_, needed)| abi >= *needed)
+        .fold(Restrictions::empty(), |set, (member, _)| set | member);
+        let mut gate = granted_gate();
+
+        lock_and_prove(&mut gate);
+        assert_eq!(gate.restrictions(), Some(expected), "ABI v{abi}");
     }
 
     /// A grant with no rights, made that way or narrowed to nothing before
