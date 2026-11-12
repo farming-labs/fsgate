@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 (unreleased)
+
+Not independently reviewed. Upgrade from 0.3.0 or earlier for the fixes listed under Fixed, among them a relative `--direct` path that let a confined worker read the whole filesystem, and a `--socket` path another user could replace. A confined worker no longer reaches Unix sockets before Linux 7.1 or leaves programs running after it exits, as listed under Changed; a worker that needs either must run with `--unconfined`. Those changes to `fsgate-broker`'s defaults are why this is a minor release. Everything behind the `experimental-intercept` feature is not part of this release: it builds only from the repository, and the published crate refuses the feature with a compile error.
 
 ### Added
 
