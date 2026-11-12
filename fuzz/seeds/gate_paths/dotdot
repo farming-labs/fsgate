@@ -1,0 +1,5 @@
+ogranted/../outside/secret.txt
+ogranted/sub/../../outside/secret.txt
+mgranted/..
+dgranted/sub/..
+ogranted/dotdot/outside/secret.txt

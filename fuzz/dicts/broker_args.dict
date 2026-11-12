@@ -1,0 +1,21 @@
+# The options and rights letters of `fsgate-broker`'s command line.
+# libFuzzer inserts these while it mutates the seeds. Arguments are split
+# at NUL bytes, so each option ends in one: inserted after another
+# argument's NUL, it becomes an argument of its own.
+"--grant\x00"
+"--direct\x00"
+"--env\x00"
+"--socket\x00"
+"--unconfined\x00"
+"--experimental-intercept\x00"
+"--apply\x00"
+"--audit\x00"
+"--\x00"
+"--help\x00"
+"-h\x00"
+"\x00"
+":"
+":r"
+":rwcl"
+":rlx"
+"="

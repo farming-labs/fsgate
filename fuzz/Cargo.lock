@@ -132,6 +132,7 @@ dependencies = [
 name = "fsgate-fuzz"
 version = "0.0.0"
 dependencies = [
+ "cap-std",
  "fsgate",
  "libfuzzer-sys",
  "rustix",
