@@ -806,8 +806,11 @@ mod kernel {
         );
         let stdin = broker.stdin.take();
         let stderr = broker.stderr.take().expect("piped stderr");
-        let (_, program) = ready_pids(&mut BufReader::new(broker.stdout.take().unwrap()));
-        assert!(is_running(program), "the program never ran");
+        // The worker reports only after its program says it is ready, so the
+        // program ran. Do not check that it is still running: the worker
+        // exits as soon as it reports, and the broker may already have
+        // killed the group.
+        ready_pids(&mut BufReader::new(broker.stdout.take().unwrap()));
 
         let status = broker.wait().expect("reap the broker");
         assert_eq!(status.code(), Some(3));
