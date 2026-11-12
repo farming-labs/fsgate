@@ -212,8 +212,9 @@ fn run_inherited(
         // Held open here, the broker would never see the worker hang up.
         drop(worker_end);
         if let Some(supervisor) = supervisor {
-            let finished = supervisor.finish(child)?;
-            match finished {}
+            // `finish` returns only when it fails.
+            let Err(err) = supervisor.finish(child);
+            return Err(err);
         }
         let status = child
             .wait()
