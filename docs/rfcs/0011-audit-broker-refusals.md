@@ -100,9 +100,12 @@ broker did not accept. Like
 emits through its gate's sink with a crate-private method, so only fsgate
 creates events, as RFC 0002 requires.
 
-`serve_with` emits `connect` events on its accepting thread, and
-`serve_conn` emits `request` events on the connection's thread. Both are
-synchronous, as every event is.
+`serve_with` emits a refused connection's `connect` event on its
+accepting thread, before it closes the connection. An admitted one's
+`allow` is emitted on the connection's thread before it reads a request,
+so it comes before every other event for that connection. `request`
+events come from the connection's thread. All are synchronous, as every
+event is.
 
 ### Compatibility
 
@@ -137,9 +140,8 @@ and assert the event and the refusal:
 - A connection given to `serve_conn` directly produces `request` events
   with `peer_uid` `null`, and no `connect` event.
 - A gate with no sink behaves as today.
-- On Linux, `no_thread` lowers `RLIMIT_NPROC` on the running broker, as
-  the test for a connection without a thread does
-  ([#66](https://github.com/farming-labs/fsgate/pull/66)).
+- On Linux, `no_thread` is tested in a process of its own, which lowers
+  its own `RLIMIT_NPROC` while its broker accepts a connection.
 
 ## Alternatives considered
 

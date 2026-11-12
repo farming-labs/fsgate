@@ -1,0 +1,5 @@
+# actionlint 1.7.12 predates GitHub's `ubuntu-26.04-arm` runner, which the
+# `arm64` job in ci.yml runs on, and reports it as an unknown label.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04-arm

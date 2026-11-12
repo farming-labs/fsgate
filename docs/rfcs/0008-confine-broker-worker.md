@@ -149,7 +149,10 @@ Each step closes a specific hole:
 - **Step 2.** After `setsid`, Ctrl-C reaches only the broker. Without this
   a killed broker would leave its worker running. It binds only a worker
   that keeps it: the worker can clear its own death signal, and a program
-  the worker starts never has one.
+  the worker starts never has one. [RFC 0010](0010-worker-process-group.md)
+  kills the worker's process group when the worker exits or the broker
+  gets `SIGINT`, `SIGTERM`, or `SIGHUP`, which covers those programs
+  unless the broker gets `SIGKILL`.
 - **Step 5.** Landlock says
   [files opened before the sandboxing are not subject to its restrictions](https://docs.kernel.org/userspace-api/landlock.html),
   so a leaked descriptor is a way out. `close_range` is not wrapped by
@@ -193,12 +196,15 @@ command line keeps working with one added flag. The library and
 - File metadata anywhere. Landlock cannot restrict `stat`, `chmod`,
   `chown`, `utime`, or `setxattr`.
 - Network access.
-- Before Linux 6.12, signals to the broker and connects to abstract
-  sockets. Before Linux 7.1, connects to pathname sockets, which include
-  services that act for their caller, such as systemd's user manager on
-  the session bus.
-- A worker outliving its broker after clearing its death signal, and
-  programs it starts, which never had one.
+- Before Linux 6.12, signals to the broker. Before Linux 7.1, Landlock
+  does not refuse connects to Unix sockets, which include services that
+  act for their caller, such as systemd's user manager on the session
+  bus. [RFC 0009](0009-worker-unix-sockets.md) refuses the worker new
+  Unix sockets there instead.
+- After `SIGKILL` to the broker, a worker that cleared its death signal,
+  and programs it started, which never had one. Otherwise RFC 0010 ends
+  them, except a program that left the worker's process group with
+  `setsid` or `setpgid`.
 - The worker's use of the terminal it inherited. It leads its own
   session, so job control does not stop it.
 - Any containment on macOS.

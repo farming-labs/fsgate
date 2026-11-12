@@ -70,11 +70,29 @@ mod confine;
 
 #[cfg(not(target_os = "linux"))]
 mod confine {
+    use std::convert::Infallible;
     use std::os::fd::RawFd;
     use std::path::PathBuf;
-    use std::process::Command;
+    use std::process::{Child, Command};
 
     use fsgate::Rights;
+
+    /// No worker is confined here, so there is never one to supervise.
+    pub(super) enum Supervisor {}
+
+    pub(super) enum Running {}
+
+    impl Supervisor {
+        pub(super) fn start(self) -> Result<Running, String> {
+            match self {}
+        }
+    }
+
+    impl Running {
+        pub(super) fn finish(self, _: Child) -> Result<Infallible, String> {
+            match self {}
+        }
+    }
 
     pub(super) fn command(
         _: RawFd,
@@ -82,7 +100,7 @@ mod confine {
         _: &[String],
         _: &[String],
         _: &[String],
-    ) -> Result<Command, String> {
+    ) -> Result<(Command, Supervisor), String> {
         Err(
             "this platform has no way for `fsgate-broker` to confine a worker; \
              pass `--unconfined` to run it without confinement"
@@ -163,16 +181,18 @@ fn run_inherited(
     rustix::io::fcntl_setfd(&worker_end, rustix::io::FdFlags::empty())
         .map_err(|err| format!("preparing the worker's connection failed: {err}"))?;
 
-    let mut worker = match start {
+    let (mut worker, supervisor) = match start {
         Start::Confined { direct, env } => {
-            confine::command(worker_end.as_raw_fd(), grants, &direct, &env, command)?
+            let (worker, supervisor) =
+                confine::command(worker_end.as_raw_fd(), grants, &direct, &env, command)?;
+            (worker, Some(supervisor))
         }
         Start::Unconfined => {
             let mut worker = Command::new(&command[0]);
             worker
                 .args(&command[1..])
                 .env("FSGATE_BROKER_FD", worker_end.as_raw_fd().to_string());
-            worker
+            (worker, None)
         }
     };
     std::thread::scope(|scope| {
@@ -184,11 +204,17 @@ fn run_inherited(
                 let _ = broker.serve_conn(broker_end);
             })
             .map_err(|err| format!("starting the thread that serves the worker failed: {err}"))?;
+        // Also before the worker, for the same reason.
+        let supervisor = supervisor.map(confine::Supervisor::start).transpose()?;
         let mut child = worker
             .spawn()
             .map_err(|err| format!("spawning `{}` failed: {err}", command[0]))?;
         // Held open here, the broker would never see the worker hang up.
         drop(worker_end);
+        if let Some(supervisor) = supervisor {
+            let finished = supervisor.finish(child)?;
+            match finished {}
+        }
         let status = child
             .wait()
             .map_err(|err| format!("waiting for `{}` failed: {err}", command[0]))?;

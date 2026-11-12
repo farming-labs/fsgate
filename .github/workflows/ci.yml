@@ -88,12 +88,30 @@ jobs:
       - run: cargo clippy -p fsgate --all-targets --features experimental-intercept -- -D warnings
       - run: cargo test --locked
 
-  # Kernels a runner does not boot: RFC 0004's declared baseline and a kernel
-  # with RFC 0006's newest restriction. `check` covers the runner's own kernel;
-  # this job boots each kernel below in a VM (virtme-ng with KVM, sharing the
-  # runner's filesystem read-only) and runs the packaged crate's tests,
-  # built with --release. A second boot without Landlock runs the
-  # unsupported-host tests, which no runner kernel can.
+  # The Linux tests on arm64, on the runner's own kernel. `check` runs them
+  # on x86_64, and the `experimental-intercept` ones, whose launcher is
+  # x86_64 only, there alone.
+  arm64:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  # Kernels a runner does not boot: one below fsgate's Landlock floor, RFC
+  # 0004's declared baseline, the first with RFC 0006's scopes, and one with
+  # its newest restriction. `check` covers the runner's own kernel; this job
+  # boots each kernel below in a VM (virtme-ng with KVM, sharing the runner's
+  # filesystem read-only) and runs the packaged crate's tests, built with
+  # --release. On a kernel above the floor, a second boot without Landlock
+  # runs the unsupported-host tests, which no runner kernel can.
   kernels:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -101,16 +119,30 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Landlock ABI v2, below the v3 floor, so only the tests that a
+          # strict lock and a confined worker fail closed run here. The 6.1
+          # LTS release current when added.
+          - kernel: 6.1.192
+            sha256: 1e88e317e20dbc79a2cb9e3d9667e908b262d12e76eb66eed894c5460eb87fca
+            mode: below-floor
           # The RFC 0004 baseline, at the 6.6 LTS release current when added.
           - kernel: 6.6.162
             sha256: 4aa89f3652fc131e5d39990f3bcd4b9e131028af3f315dbe83f3a8557dc06f06
+            mode: supported
+          # Signal and abstract socket scopes need Linux 6.12 (Landlock ABI
+          # v6); this is the 6.12 LTS release current when added.
+          - kernel: 6.12.117
+            sha256: 74e99aa5e60e242e0a165fed8cb2ea0d054bf7a401f01861d403d75733456613
+            mode: supported
           # RESOLVE_UNIX needs Linux 7.1 (Landlock ABI v9); this is the stable
           # release current when added.
           - kernel: 7.3.3
             sha256: 79c66dde66cd96877fcde8f7d36aec946b1f423d2b97b5a7b1751b75c764f3d1
+            mode: supported
     env:
       KERNEL: ${{ matrix.kernel }}
       KERNEL_SHA256: ${{ matrix.sha256 }}
+      MODE: ${{ matrix.mode }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -199,25 +231,26 @@ jobs:
           jq --raw-output 'select(.reason == "compiler-artifact" and .profile.test
             and (.target.name == "launch" or .target.name == "lock"
               or .target.name == "broker_confined"))
-            | .executable' "$RUNNER_TEMP/build.json" >"$results/no-landlock-tests"
+            | .executable' "$RUNNER_TEMP/build.json" >"$results/ignored-tests"
           cat "$results/tests"
           # The library's unit tests, the broker's, and one per tests/*.rs.
           integration=("$(dirname "$manifest")"/tests/*.rs)
           expected=$((2 + ${#integration[@]}))
           found=$(wc -l <"$results/tests")
-          if [ "$found" -ne "$expected" ] || [ "$(wc -l <"$results/no-landlock-tests")" -ne 3 ]; then
+          if [ "$found" -ne "$expected" ] || [ "$(wc -l <"$results/ignored-tests")" -ne 3 ]; then
             echo "::error::expected $expected test executables, three of them launch, lock, and broker_confined; found $found"
             exit 1
           fi
-      - name: Run the tests on Linux ${{ matrix.kernel }}
+      - name: Run the ${{ matrix.mode }} tests on Linux ${{ matrix.kernel }}
         run: |
           results=$RUNNER_TEMP/results
           vng --run kernel/bzImage --user "$(id -un)" --cpus "$(nproc)" --memory 4G \
             --rwdir "$results" \
-            --exec "$GITHUB_WORKSPACE/.github/kernels/guest-tests.sh $results supported"
-          test "$(cat "$results/supported.kernel")" = "$KERNEL"
-          test -f "$results/supported.passed"
+            --exec "$GITHUB_WORKSPACE/.github/kernels/guest-tests.sh $results $MODE"
+          test "$(cat "$results/$MODE.kernel")" = "$KERNEL"
+          test -f "$results/$MODE.passed"
       - name: Run the unsupported-host tests on Linux ${{ matrix.kernel }} without Landlock
+        if: matrix.mode == 'supported'
         run: |
           results=$RUNNER_TEMP/results
           vng --run kernel/bzImage --user "$(id -un)" --cpus "$(nproc)" --memory 4G \

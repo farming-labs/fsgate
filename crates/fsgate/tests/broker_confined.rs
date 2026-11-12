@@ -126,6 +126,27 @@ fn the_broker_refuses_to_start_a_worker_without_landlock() {
     assert_refused_until_unconfined();
 }
 
+/// Runs only on Linux 6.1, whose Landlock ABI v2 lacks the truncation right
+/// the worker's rules need. CI's `kernels` job boots it.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs Landlock ABI v2 (Linux 6.1); CI's kernels job runs it"]
+fn the_broker_refuses_to_start_a_worker_below_landlock_v3() {
+    use landlock::{ABI, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr};
+
+    let handles = |abi| {
+        Ruleset::default()
+            .set_compatibility(CompatLevel::HardRequirement)
+            .handle_access(AccessFs::from_all(abi))
+            .is_ok()
+    };
+    assert!(
+        handles(ABI::V2) && !handles(ABI::V3),
+        "needs Landlock ABI v2 (Linux 6.1)"
+    );
+    assert_refused_until_unconfined();
+}
+
 fn usage_error(flags: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_fsgate-broker"))
         .args(flags)
@@ -227,14 +248,18 @@ mod kernel {
     use std::fs::{self, File};
     use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
     use std::os::fd::{AsFd, AsRawFd};
+    use std::os::linux::net::SocketAddrExt;
     use std::os::unix::fs::MetadataExt;
+    use std::os::unix::net::{SocketAddr, UnixDatagram, UnixListener, UnixStream};
     use std::os::unix::process::parent_id;
-    use std::process::{Command, Stdio};
+    use std::path::PathBuf;
+    use std::process::{Child, ChildStderr, Command, Stdio};
     use std::sync::mpsc;
     use std::time::Duration;
 
     use fsgate::BrokerGate;
     use rustix::io::FdFlags;
+    use rustix::process::{Pid, Signal};
 
     use super::{assert_ran, broker, confined, fixture, in_child, unconfined};
 
@@ -693,6 +718,255 @@ mod kernel {
         println!("alive");
     }
 
+    /// Reads the line a worker prints once it and its program run:
+    /// `worker ready <worker pid> <program pid>`.
+    fn ready_pids(stdout: &mut impl BufRead) -> (Pid, Pid) {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(
+                stdout.read_line(&mut line).expect("read the worker"),
+                0,
+                "the worker exited before it was ready"
+            );
+            if let Some(pids) = line.trim().strip_prefix("worker ready ") {
+                let (worker, program) = pids.split_once(' ').expect("two pids");
+                let pid = |raw: &str| Pid::from_raw(raw.parse().unwrap()).unwrap();
+                return (pid(worker), pid(program));
+            }
+        }
+    }
+
+    /// Fails unless every process holding the other end of `stderr` exits.
+    /// The worker and its program inherit it and never close it, so its end
+    /// shows they are gone. The timeout only turns a regression into a
+    /// failure instead of a hang.
+    fn assert_all_exit(mut stderr: ChildStderr, what: &str) {
+        let (done, finished) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut rest = Vec::new();
+            let _ = stderr.read_to_end(&mut rest);
+            let _ = done.send(());
+        });
+        if finished.recv_timeout(Duration::from_secs(30)).is_err() {
+            panic!("{what}");
+        }
+    }
+
+    /// Whether `pid` exists and has not exited.
+    fn is_running(pid: Pid) -> bool {
+        fs::read_to_string(format!("/proc/{}/stat", pid.as_raw_nonzero())).is_ok_and(|stat| {
+            stat.rsplit_once(')')
+                .is_some_and(|(_, rest)| !rest.trim_start().starts_with(['Z', 'X']))
+        })
+    }
+
+    /// The broker running `scenario`, with all three streams piped. Its
+    /// standard input stays open until the test drops it, so a worker or
+    /// program reading it waits.
+    fn spawn_piped(flags: &[String], fixture: &super::Fixture, scenario: &str) -> Child {
+        broker(fixture, flags, scenario)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn fsgate-broker")
+    }
+
+    /// RFC 0010: when a confined worker exits, a program it left running in
+    /// its process group is killed before the broker exits, and the broker
+    /// still exits with the worker's code.
+    #[test]
+    fn a_program_a_confined_worker_leaves_running_ends_with_it() {
+        let fixture = fixture();
+        let mut broker = spawn_piped(
+            &confined(&[]),
+            &fixture,
+            "kernel::leaves_a_program_scenario",
+        );
+        let stdin = broker.stdin.take();
+        let stderr = broker.stderr.take().expect("piped stderr");
+        let (_, program) = ready_pids(&mut BufReader::new(broker.stdout.take().unwrap()));
+        assert!(is_running(program), "the program never ran");
+
+        let status = broker.wait().expect("reap the broker");
+        assert_eq!(status.code(), Some(3));
+        assert_all_exit(stderr, "a program outlived its confined worker");
+        drop(stdin);
+    }
+
+    /// The documented limit, and the control for the case above: a program
+    /// that leaves the group with `setsid` survives its worker, so that test
+    /// would see a survivor.
+    #[test]
+    fn a_program_that_leaves_the_group_outlives_its_worker() {
+        let fixture = fixture();
+        let mut broker = broker(
+            &fixture,
+            &confined(&["FSGATE_ESCAPE"]),
+            "kernel::leaves_a_program_scenario",
+        )
+        .env("FSGATE_ESCAPE", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn fsgate-broker");
+        let stdin = broker.stdin.take();
+        let stderr = broker.stderr.take().expect("piped stderr");
+        let (_, program) = ready_pids(&mut BufReader::new(broker.stdout.take().unwrap()));
+
+        let status = broker.wait().expect("reap the broker");
+        assert_eq!(status.code(), Some(3));
+        // The broker killed the group before it exited, and this program
+        // was not in it.
+        assert!(
+            is_running(program),
+            "the program did not outlive its worker"
+        );
+        rustix::process::kill_process(program, Signal::KILL).unwrap();
+        assert_all_exit(stderr, "the program survived SIGKILL");
+        drop(stdin);
+    }
+
+    /// `--unconfined` is unchanged: its worker shares the broker's process
+    /// group, so nothing is killed when it exits.
+    #[test]
+    fn an_unconfined_worker_leaves_its_program_running() {
+        let fixture = fixture();
+        let mut broker = spawn_piped(&unconfined(), &fixture, "kernel::leaves_a_program_scenario");
+        let stdin = broker.stdin.take();
+        let stderr = broker.stderr.take().expect("piped stderr");
+        let (_, program) = ready_pids(&mut BufReader::new(broker.stdout.take().unwrap()));
+
+        let status = broker.wait().expect("reap the broker");
+        assert_eq!(status.code(), Some(3));
+        assert!(
+            is_running(program),
+            "the broker killed an unconfined program"
+        );
+        rustix::process::kill_process(program, Signal::KILL).unwrap();
+        assert_all_exit(stderr, "the program survived SIGKILL");
+        drop(stdin);
+    }
+
+    /// RFC 0010: a broker stopped by `SIGTERM`, `SIGINT`, or `SIGHUP` kills
+    /// its confined worker and the worker's programs, then dies by the same
+    /// signal.
+    #[test]
+    fn stopping_the_broker_ends_a_confined_worker_and_its_programs() {
+        use std::os::unix::process::ExitStatusExt;
+
+        for signal in [Signal::TERM, Signal::INT, Signal::HUP] {
+            let fixture = fixture();
+            let mut broker =
+                spawn_piped(&confined(&[]), &fixture, "kernel::keeps_a_program_scenario");
+            let stdin = broker.stdin.take();
+            let stderr = broker.stderr.take().expect("piped stderr");
+            let (worker, program) = ready_pids(&mut BufReader::new(broker.stdout.take().unwrap()));
+            assert!(is_running(worker) && is_running(program));
+
+            rustix::process::kill_process(Pid::from_child(&broker), signal).unwrap();
+            let status = broker.wait().expect("reap the broker");
+            assert_eq!(status.signal(), Some(signal.as_raw()), "{signal:?}");
+            assert_all_exit(
+                stderr,
+                "the worker or its program outlived a stopped broker",
+            );
+            drop(stdin);
+        }
+    }
+
+    /// The broker blocks its stop signals for the thread that waits for
+    /// them, and a mask survives `exec`. The worker must still be stoppable.
+    /// It starts no program, so only its own exit closes the pipe.
+    #[test]
+    fn a_confined_worker_can_still_be_stopped_by_a_signal() {
+        let fixture = fixture();
+        let mut broker = spawn_piped(&confined(&[]), &fixture, "kernel::stoppable_scenario");
+        let stdin = broker.stdin.take();
+        let stderr = broker.stderr.take().expect("piped stderr");
+        let (worker, _) = ready_pids(&mut BufReader::new(broker.stdout.take().unwrap()));
+
+        rustix::process::kill_process(worker, Signal::TERM).unwrap();
+        assert_all_exit(stderr, "SIGTERM did not stop the confined worker");
+        // A worker ended by a signal has no exit code to pass on.
+        assert_eq!(broker.wait().expect("reap the broker").code(), Some(1));
+        drop(stdin);
+    }
+
+    /// Starts a program sharing this worker's standard input and error,
+    /// waits until it runs, and returns its pid. It then waits on standard
+    /// input, so it runs until the test closes that or it is killed.
+    // Never waited for on purpose: the program is meant to outlive this
+    // worker, and whoever ends it reaps it.
+    #[allow(clippy::zombie_processes)]
+    fn start_lingering_program() -> u32 {
+        let mut program = Command::new(env::current_exe().unwrap())
+            .args(["--exact", "kernel::lingering_scenario", "--nocapture"])
+            .env("FSGATE_CHILD", "kernel::lingering_scenario")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = BufReader::new(program.stdout.take().unwrap());
+        let mut line = String::new();
+        while !line.contains("program ready") {
+            line.clear();
+            assert_ne!(
+                stdout.read_line(&mut line).unwrap(),
+                0,
+                "the program exited"
+            );
+        }
+        // Dropping a `Child` leaves the process running.
+        program.id()
+    }
+
+    #[test]
+    fn lingering_scenario() {
+        if !in_child("kernel::lingering_scenario") {
+            return;
+        }
+        if env::var_os("FSGATE_ESCAPE").is_some() {
+            rustix::process::setsid().unwrap();
+        }
+        println!("program ready");
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+    }
+
+    #[test]
+    fn leaves_a_program_scenario() {
+        if !in_child("kernel::leaves_a_program_scenario") {
+            return;
+        }
+        let program = start_lingering_program();
+        println!("worker ready {} {program}", std::process::id());
+        std::process::exit(3);
+    }
+
+    #[test]
+    fn stoppable_scenario() {
+        if !in_child("kernel::stoppable_scenario") {
+            return;
+        }
+        let worker = std::process::id();
+        println!("worker ready {worker} {worker}");
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+    }
+
+    #[test]
+    fn keeps_a_program_scenario() {
+        if !in_child("kernel::keeps_a_program_scenario") {
+            return;
+        }
+        let program = start_lingering_program();
+        println!("worker ready {} {program}", std::process::id());
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+    }
+
     #[test]
     fn waiting_scenario() {
         if !in_child("kernel::waiting_scenario") {
@@ -702,5 +976,322 @@ mod kernel {
         let mut line = String::new();
         std::io::stdin().read_line(&mut line).unwrap();
         println!("alive");
+    }
+
+    /// Whether this kernel's Landlock refuses connects to pathname Unix
+    /// sockets, which needs ABI 9 (Linux 7.1). Below that, RFC 0009's filter
+    /// keeps a confined worker off them. This only asks; it confines nothing.
+    fn landlock_refuses_unix_connects() -> bool {
+        use landlock::{AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr};
+
+        Ruleset::default()
+            .set_compatibility(CompatLevel::HardRequirement)
+            .handle_access(AccessFs::ResolveUnix)
+            .is_ok()
+    }
+
+    /// Runs the scenario this process is running again, as a program it
+    /// starts, and fails unless that passes too. Confinement survives `exec`,
+    /// so the program must see what its worker saw.
+    fn assert_a_program_sees_the_same(scenario: &str) {
+        if env::var_os("FSGATE_PROGRAM").is_some() {
+            return;
+        }
+        let output = Command::new(env::current_exe().unwrap())
+            .args(["--exact", scenario, "--nocapture"])
+            .env("FSGATE_PROGRAM", "1")
+            .output()
+            .unwrap();
+        assert_ran(&output);
+    }
+
+    /// Drains `listener` without waiting and counts the connections it had.
+    fn accepted(listener: &UnixListener) -> usize {
+        let mut count = 0;
+        loop {
+            match listener.accept() {
+                Ok(_) => count += 1,
+                Err(err) if err.kind() == ErrorKind::WouldBlock => return count,
+                Err(err) => panic!("accept failed: {err}"),
+            }
+        }
+    }
+
+    /// Drains `socket` without waiting and counts the datagrams it had.
+    fn received(socket: &UnixDatagram) -> usize {
+        let mut count = 0;
+        let mut buffer = [0; 8];
+        loop {
+            match socket.recv(&mut buffer) {
+                Ok(_) => count += 1,
+                Err(err) if err.kind() == ErrorKind::WouldBlock => return count,
+                Err(err) => panic!("recv failed: {err}"),
+            }
+        }
+    }
+
+    /// RFC 0009: on every kernel, a confined worker and a program it starts
+    /// reach no Unix socket outside the worker's confinement: not a stream
+    /// socket by path or by abstract name, and not a datagram socket by
+    /// path, from a socket of its own or from half of a pair. Below Linux
+    /// 7.1 the filter refuses those sockets, and from 7.1 Landlock refuses
+    /// the connects and sends. Nothing reaches the test's sockets. The
+    /// unconfined control reaches all of them, so the test would notice.
+    #[test]
+    fn a_confined_worker_cannot_reach_a_unix_socket() {
+        let denied = confined(&["FSGATE_EXPECT", "FSGATE_ABSTRACT"]);
+        for (flags, expect) in [(denied, "denied"), (unconfined(), "allowed")] {
+            let fixture = fixture();
+            let stream = UnixListener::bind(fixture.outside.join("stream.sock")).unwrap();
+            let name = format!("fsgate-test-{}-{expect}", std::process::id());
+            let address = SocketAddr::from_abstract_name(&name).unwrap();
+            let abstract_stream = UnixListener::bind_addr(&address).unwrap();
+            let datagram = UnixDatagram::bind(fixture.outside.join("datagram.sock")).unwrap();
+            for listener in [&stream, &abstract_stream] {
+                listener.set_nonblocking(true).unwrap();
+            }
+            datagram.set_nonblocking(true).unwrap();
+
+            let output = broker(&fixture, &flags, "kernel::unix_reach_scenario")
+                .env("FSGATE_EXPECT", expect)
+                .env("FSGATE_ABSTRACT", &name)
+                .output()
+                .expect("run fsgate-broker");
+            assert_ran(&output);
+
+            // The worker and its program each try once, and each tries a
+            // datagram two ways.
+            let (connections, datagrams) = if expect == "allowed" { (2, 4) } else { (0, 0) };
+            assert_eq!(accepted(&stream), connections, "{expect}: by path");
+            assert_eq!(
+                accepted(&abstract_stream),
+                connections,
+                "{expect}: by abstract name"
+            );
+            assert_eq!(received(&datagram), datagrams, "{expect}: datagrams");
+        }
+    }
+
+    #[test]
+    fn unix_reach_scenario() {
+        if !in_child("kernel::unix_reach_scenario") {
+            return;
+        }
+        let outside = PathBuf::from(env::var("FSGATE_OUTSIDE").unwrap());
+        let datagram = outside.join("datagram.sock");
+        let address = SocketAddr::from_abstract_name(env::var("FSGATE_ABSTRACT").unwrap()).unwrap();
+        let attempts = [
+            (
+                "a connect by path",
+                UnixStream::connect(outside.join("stream.sock")).map(drop),
+            ),
+            (
+                "a connect by abstract name",
+                UnixStream::connect_addr(&address).map(drop),
+            ),
+            (
+                "a datagram from a socket of its own",
+                UnixDatagram::unbound()
+                    .and_then(|socket| socket.send_to(b"x", &datagram).map(drop)),
+            ),
+            (
+                "a datagram from half of a pair",
+                UnixDatagram::pair()
+                    .and_then(|(socket, _)| socket.send_to(b"x", &datagram).map(drop)),
+            ),
+        ];
+        for (what, result) in attempts {
+            if expect_denied() {
+                // `EACCES` from the filter or from Landlock's path rules,
+                // `EPERM` from Landlock's abstract socket scope.
+                let err = result.expect_err(what);
+                assert_eq!(err.kind(), ErrorKind::PermissionDenied, "{what}: {err}");
+            } else {
+                result.expect(what);
+            }
+        }
+        assert_a_program_sees_the_same("kernel::unix_reach_scenario");
+    }
+
+    /// RFC 0009: below Linux 7.1 a confined worker and a program it starts
+    /// cannot create a Unix socket or a datagram pair, `io_uring` answers as
+    /// if it were missing, and an x32 call kills the process. Stream and
+    /// seqpacket pairs, network sockets, and the broker connection still
+    /// work. From 7.1 Landlock refuses connects instead, so the filter is not
+    /// installed and all of these work, as they do for the unconfined
+    /// control.
+    #[test]
+    fn below_linux_7_1_a_confined_worker_cannot_create_a_unix_socket() {
+        let filtered = if landlock_refuses_unix_connects() {
+            "unfiltered"
+        } else {
+            "filtered"
+        };
+        for (flags, expect) in [
+            (confined(&["FSGATE_EXPECT"]), filtered),
+            (unconfined(), "unfiltered"),
+        ] {
+            let fixture = fixture();
+            let output = broker(&fixture, &flags, "kernel::unix_create_scenario")
+                .env("FSGATE_EXPECT", expect)
+                .output()
+                .expect("run fsgate-broker");
+            assert_ran(&output);
+        }
+    }
+
+    #[test]
+    fn unix_create_scenario() {
+        use rustix::io::Errno;
+        use rustix::net::{AddressFamily, SocketFlags, SocketType};
+
+        if !in_child("kernel::unix_create_scenario") {
+            return;
+        }
+        let filtered = env::var("FSGATE_EXPECT").unwrap() == "filtered";
+        let socket = |kind, flags| {
+            rustix::net::socket_with(AddressFamily::UNIX, kind, flags, None).map(drop)
+        };
+        let pair = |kind| {
+            let flags = SocketFlags::CLOEXEC | SocketFlags::NONBLOCK;
+            rustix::net::socketpair(AddressFamily::UNIX, kind, flags, None).map(drop)
+        };
+        // The flags ride in the type argument, which the filter masks.
+        let refused = [
+            (
+                "a stream socket",
+                socket(SocketType::STREAM, SocketFlags::empty()),
+            ),
+            (
+                "a datagram socket",
+                socket(SocketType::DGRAM, SocketFlags::CLOEXEC),
+            ),
+            (
+                "a seqpacket socket",
+                socket(SocketType::SEQPACKET, SocketFlags::NONBLOCK),
+            ),
+            ("a datagram pair", pair(SocketType::DGRAM)),
+        ];
+        for (what, result) in refused {
+            let expected = if filtered { Err(Errno::ACCESS) } else { Ok(()) };
+            assert_eq!(result, expected, "{what}");
+        }
+        pair(SocketType::STREAM).expect("a stream pair");
+        pair(SocketType::SEQPACKET).expect("a seqpacket pair");
+        rustix::net::socket(AddressFamily::INET, SocketType::STREAM, None).expect("a TCP socket");
+
+        for (call, errno) in raw_calls::io_uring_errnos() {
+            if filtered {
+                assert_eq!(errno, libc::ENOSYS, "{call}");
+            } else {
+                assert_ne!(errno, libc::ENOSYS, "{call}: this kernel has no io_uring");
+            }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::os::unix::process::ExitStatusExt;
+
+            let status = Command::new(env::current_exe().unwrap())
+                .args(["--exact", "kernel::x32_call_scenario", "--nocapture"])
+                .env("FSGATE_CHILD", "kernel::x32_call_scenario")
+                .stdout(Stdio::null())
+                .status()
+                .unwrap();
+            if filtered {
+                assert_eq!(status.signal(), Some(libc::SIGSYS), "{status:?}");
+            } else {
+                assert!(status.success(), "{status:?}");
+            }
+        }
+
+        if env::var_os("FSGATE_PROGRAM").is_none() {
+            let path = format!("{}/a.txt", env::var("FSGATE_GRANTED").unwrap());
+            let mut gate = BrokerGate::from_inherited().expect("adopt the connection");
+            let mut content = String::new();
+            gate.open(&path)
+                .expect("the broker serves its grant")
+                .read_to_string(&mut content)
+                .unwrap();
+            assert_eq!(content, "inside");
+        }
+        assert_a_program_sees_the_same("kernel::unix_create_scenario");
+    }
+
+    /// Makes one x32 call. The filter kills a process for it; without the
+    /// filter it returns, with a process ID or `ENOSYS`.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x32_call_scenario() {
+        if !in_child("kernel::x32_call_scenario") {
+            return;
+        }
+        raw_calls::x32_getpid();
+    }
+
+    /// The system calls RFC 0009's tests make that neither `std` nor
+    /// `rustix` offers safely (RFC 0009, decision 2).
+    ///
+    /// # Safety contract
+    ///
+    /// - Each `io_uring` call gets arguments a kernel refuses before it reads
+    ///   or writes this process's memory or creates anything:
+    ///   `io_uring_setup` gets a null `params`, so it fails copying it with
+    ///   `EFAULT`, or earlier with `EPERM` where `io_uring` is disabled.
+    ///   `io_uring_enter` gets flags and `io_uring_register` an opcode that
+    ///   no kernel defines, so each fails with `EINVAL` first. Under the
+    ///   filter, none reaches the kernel's implementation at all.
+    /// - The x32 `getpid` takes no arguments, and reads and writes no memory.
+    #[allow(unsafe_code)]
+    mod raw_calls {
+        use std::io;
+        use std::ptr;
+
+        fn errno(result: libc::c_long) -> i32 {
+            assert_eq!(result, -1, "the call succeeded");
+            io::Error::last_os_error().raw_os_error().unwrap()
+        }
+
+        /// The errno each `io_uring` call fails with.
+        pub(super) fn io_uring_errnos() -> [(&'static str, i32); 3] {
+            let fd: libc::c_int = -1;
+            let entries: libc::c_uint = 1;
+            let none: libc::c_uint = 0;
+            let no_size: libc::size_t = 0;
+            let undefined = libc::c_uint::MAX;
+            let null = ptr::null_mut::<libc::c_void>();
+            // SAFETY: a null `params`. See the module contract.
+            let setup = unsafe { libc::syscall(libc::SYS_io_uring_setup, entries, null) };
+            // SAFETY: undefined flags and a null argument. See the module
+            // contract.
+            let enter = unsafe {
+                libc::syscall(
+                    libc::SYS_io_uring_enter,
+                    fd,
+                    none,
+                    none,
+                    undefined,
+                    null,
+                    no_size,
+                )
+            };
+            // SAFETY: an undefined opcode and a null argument. See the module
+            // contract.
+            let register =
+                unsafe { libc::syscall(libc::SYS_io_uring_register, fd, undefined, null, none) };
+            [
+                ("io_uring_setup", errno(setup)),
+                ("io_uring_enter", errno(enter)),
+                ("io_uring_register", errno(register)),
+            ]
+        }
+
+        /// `getpid` through the x32 call table.
+        #[cfg(target_arch = "x86_64")]
+        pub(super) fn x32_getpid() -> libc::c_long {
+            const X32_SYSCALL_BIT: libc::c_long = 0x4000_0000;
+            // SAFETY: no arguments. See the module contract.
+            unsafe { libc::syscall(X32_SYSCALL_BIT | libc::SYS_getpid) }
+        }
     }
 }

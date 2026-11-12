@@ -1,6 +1,6 @@
 # RFC 0009: keep a confined worker off other Unix sockets
 
-- Status: accepted
+- Status: accepted ([#71](https://github.com/farming-labs/fsgate/pull/71)); implemented in [#76](https://github.com/farming-labs/fsgate/pull/76)
 - Date: 2026-11-10
 - Roadmap: [M9](../../ROADMAP.md#m9--review-readiness-and-020)
 - Builds on: [RFC 0006](0006-lock-restrictions.md) (restrictions at `lock()`), [RFC 0008](0008-confine-broker-worker.md) (the confined worker), the [threat model](../threat-model.md#3-the-broker-and-its-worker)
@@ -59,6 +59,7 @@ The filter answers:
 | Call | Answer |
 |---|---|
 | `socket` with domain `AF_UNIX` | `EACCES` |
+| `socketpair` with domain `AF_UNIX` and type `SOCK_DGRAM` | `EACCES` |
 | `io_uring_setup`, `io_uring_enter`, `io_uring_register` | `ENOSYS` |
 | a call from another architecture, or an x32 call | kills the process |
 | anything else | allowed |
@@ -66,9 +67,12 @@ The filter answers:
 - **`socket(AF_UNIX)`.** Without a new Unix socket there is nothing to
   connect, pathname or abstract. `EACCES` matches the other refusals a
   confined worker gets.
-- **`socketpair(AF_UNIX)` stays allowed.** Its two ends are connected to
-  each other and reach nothing else, and programs use it for their own
-  pipes.
+- **Stream and seqpacket pairs stay allowed.** `socketpair` with
+  `SOCK_STREAM` or `SOCK_SEQPACKET` makes two ends that stay connected to
+  each other and reach nothing else, and programs use them for their own
+  pipes. A `SOCK_DGRAM` pair is refused: either end can send to any
+  datagram socket by address, and connect to another. The filter compares
+  the type without `SOCK_CLOEXEC` and `SOCK_NONBLOCK`.
 - **`io_uring`.** `IORING_OP_SOCKET` and `IORING_OP_CONNECT` create and
   connect sockets without the system calls a filter sees. `ENOSYS` is
   what a kernel without `io_uring` answers, and libraries fall back to
@@ -79,11 +83,11 @@ The filter answers:
   x32 call sets bit 30 of the number. The filter knows only the native
   table, so it kills the process for those calls instead of guessing.
 
-The domain argument is an `int`, so the filter compares its low 32 bits,
-as the kernel does.
+The domain and type arguments are `int`s, so the filter compares their
+low 32 bits, as the kernel does.
 
-The filter is about a dozen BPF instructions, written in fsgate for x86_64
-and aarch64. Installing it passes a pointer to the kernel, which needs
+The filter is 18 BPF instructions, written in fsgate for x86_64 and
+aarch64. Installing it passes a pointer to the kernel, which needs
 `unsafe`. It goes in the existing `sys` module of `confine.rs` with a
 written safety contract, as `close_range` does. On any other
 architecture, confinement fails before the worker starts and names
@@ -129,7 +133,15 @@ assert the refusal and the absence of the side effect:
   applies, and on 7.3, where Landlock refuses the connect.
 - On Linux 6.6, `socket(AF_UNIX)` itself fails with `EACCES`, and so does
   binding an abstract name. On 7.3, creating one succeeds.
-- A program the worker starts gets the same refusal, so the filter
+- A datagram to a pathname socket outside the grants, from a socket of
+  the worker's own and from half of a datagram pair, reaches nothing on
+  either kernel, and does with `--unconfined`.
+- On Linux 6.6, a datagram pair fails with `EACCES`, and stream and
+  seqpacket pairs and a TCP socket still work. `io_uring_setup`,
+  `io_uring_enter`, and `io_uring_register` fail with `ENOSYS`, from a
+  test-only module with its own safety contract. On x86_64, a program
+  that makes an x32 call is killed by `SIGSYS`.
+- A program the worker starts gets the same refusals, so the filter
   survives `exec`.
 - The worker still reaches the broker through its inherited connection.
 
@@ -172,3 +184,22 @@ open questions answered:
    worker keeps the sockets it makes for itself.
 2. The `io_uring` refusal is tested with an `unsafe` call in a test-only
    module that has its own safety contract.
+
+## Changes during implementation
+
+1. **A datagram pair is refused.** As accepted, the filter allowed every
+   `socketpair(AF_UNIX)`, on the grounds that its ends reach only each
+   other. That holds for stream and seqpacket pairs, which stay connected,
+   but not for a datagram pair: either end can `sendto` any datagram
+   socket by path or abstract name, and `connect` to another. The
+   unconfined control in
+   `broker_confined.rs::kernel::a_confined_worker_cannot_reach_a_unix_socket`
+   shows a datagram from half of a pair reaching a socket outside the
+   grants, and the confined run shows the filter refusing the pair.
+2. **The x32 refusal is tested** on x86_64, by a program that makes an
+   x32 `getpid` and is killed by `SIGSYS`. A call from another
+   architecture is still not tested.
+3. **Where the filter is written for.** x86_64 means the 64-bit ABI, not
+   an x32 build, and aarch64 means little-endian with 64-bit pointers.
+   Below Linux 7.1, a confined worker on any other target does not start,
+   and the error names `--unconfined`.
