@@ -228,7 +228,7 @@ Started. Today each attack in the threat model has a test written for it, and on
 
   Evidence ([#81](https://github.com/farming-labs/fsgate/pull/81)): two targets join `broker_requests` in [`fuzz/`](fuzz/README.md), each with seeds and a dictionary.
   - `gate_paths` runs `open`, `create`, `metadata`, and `read_dir` on arbitrary paths through one gate. Its three nested grants cover a fixed tree whose symlinks stay inside, climb out, are absolute, dangle, or loop. It fails if a success reaches an object outside the grant the path routes to, checked by device and inode. It also fails if a refusal is not the one the routing calls for, or if anything changes but the file a `create` returned.
-  - `broker_args` compares `fsgate-broker`'s parser with a restatement of its rules, for each `--grant` and `--direct` spec and for the mode the options select. The parser moved unchanged into [`fsgate-broker/args.rs`](crates/fsgate/src/bin/fsgate-broker/args.rs) so the target can include it.
+  - `broker_args` compares `fsgate-broker`'s parser with a restatement of its rules, for each `--grant` and `--direct` spec and for the mode the options select. The parser moved unchanged into [`fsgate-broker/args.rs`](crates/fsgate/src/bin/fsgate-broker/args.rs) so the target can include it, and [`.cargo/mutants.toml`](.cargo/mutants.toml) examines it there.
   - [`fuzz.yml`](.github/workflows/fuzz.yml) runs every target on Linux, and `gate_paths` on macOS too. Each runs for 15 minutes when the crate or a harness changes, and for an hour every Monday.
 
   Controls: each defect below was put in on purpose, and fuzzing from one or two seeds found it, with libFuzzer seed 1 on macOS.

@@ -8,6 +8,7 @@ examine_globs = [
   "crates/fsgate/src/broker.rs",
   "crates/fsgate/src/broker_sys.rs",
   "crates/fsgate/src/bin/fsgate-broker.rs",
+  "crates/fsgate/src/bin/fsgate-broker/args.rs",
   "crates/fsgate/src/bin/fsgate-broker/confine.rs",
 ]
 
