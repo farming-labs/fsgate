@@ -1,6 +1,6 @@
 # RFC 0008: confine the worker `fsgate-broker` starts
 
-- Status: accepted and implemented in [#51](https://github.com/farming-labs/fsgate/pull/51)
+- Status: accepted and implemented in [#51](https://github.com/farming-labs/fsgate/pull/51); the open question was answered, and `/nix/store` added, in [#83](https://github.com/farming-labs/fsgate/pull/83)
 - Date: 2026-11-09
 - Roadmap: [M9](../../ROADMAP.md#m9--review-readiness-and-020)
 - Builds on: [RFC 0003](0003-broker-protocol.md) (broker protocol), [RFC 0004](0004-filesystem-interception.md) (the launcher's worker profile), [RFC 0006](0006-lock-restrictions.md) (restrictions at `lock()`), [RFC 0007](0007-broker-peers.md) (the inherited connection), the [threat model](../threat-model.md#3-the-broker-and-its-worker)
@@ -81,7 +81,7 @@ handles and allows only:
 
 | Path | Allowed |
 |---|---|
-| `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin` | read, list, execute |
+| `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/nix/store` | read, list, execute |
 | `/etc/ld.so.cache` | read |
 | `/dev/null` | read, write |
 | `/dev/urandom` | read |
@@ -221,7 +221,9 @@ the denial and the absence of the side effect:
   a direct read of that same file gets `EACCES`. This shows the grants did
   not become worker rules.
 - The test binaries are dynamically linked, so passing shows the default
-  list is enough on the CI systems.
+  list is enough on the CI systems. CI's `distros` job runs these tests in
+  Debian, Fedora, Arch, Alpine, and Nix containers too, each built with
+  the system's own toolchain.
 - On macOS and on the kernel booted with `lsm=capability`, the broker
   exits 1 without `--unconfined` and the worker's marker is absent.
 - A descriptor left open by the parent is closed in the worker.
@@ -264,6 +266,8 @@ Accepted by the maintainer, with these answers:
 1. Confinement is the default, and `--unconfined` opts out.
 2. macOS refuses to start a worker without `--unconfined`, because the flag
    states what is true there.
+3. `/nix/store` is a runtime directory, which answers the
+   [open question](#open-question) below.
 
 ## Open question
 
@@ -271,3 +275,31 @@ Is the default path list right? It starts dynamically linked programs on
 CI's Ubuntu 26.04 systems, and that is all it has been measured on. Some
 layouts will need `--direct`, such as NixOS with
 `--direct /nix/store:rlx`.
+
+### Answer
+
+[#83](https://github.com/farming-labs/fsgate/pull/83) ran this RFC's tests
+on other systems, on the runner's kernel (Linux 7.0) with no `--direct`.
+Each container built them with the system's own toolchain, so they load
+the way its programs do:
+
+| System | Dynamic loader | `/bin/sh` | Tests |
+|---|---|---|---|
+| Debian 13 | `/lib64/ld-linux-x86-64.so.2` | dash | 47 passed |
+| Fedora 45 | `/lib64/ld-linux-x86-64.so.2` | bash | 47 passed |
+| Arch | `/lib64/ld-linux-x86-64.so.2` | bash | 47 passed |
+| Alpine 3.24 (musl) | `/lib/ld-musl-x86_64.so.1` | busybox | 47 passed |
+| Nix (the `nixos/nix` image) | in `/nix/store` | in `/nix/store` | 18 failed with `EACCES`; 47 passed once `/nix/store` was added |
+
+The first four keep the loader and libraries beneath the default
+directories, and musl reads no `/etc/ld.so.cache`. Nix keeps every
+program, loader, and library in `/nix/store`, so a worker could not start
+at all. NixOS has the same layout. `/nix/store` is now a default runtime
+directory, skipped where it does not exist, rather than a `--direct` every
+Nix user must know to pass. It holds build outputs, which every local user
+can already read, and a grant that overlaps it is refused like one that
+overlaps `/usr`.
+
+Not measured: a full NixOS system, Guix's `/gnu/store`, architectures
+other than x86_64, and programs that need files outside these directories
+to start, such as locale or timezone data.

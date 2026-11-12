@@ -33,7 +33,9 @@ pub(super) const ENTRY: &str = "--confined-exec";
 
 /// Directories an ordinary program needs in order to start. One that does
 /// not exist on this system is skipped, which only narrows the ruleset.
-const RUNTIME_DIRS: [&str; 5] = ["/usr", "/lib", "/lib64", "/bin", "/sbin"];
+/// Nix, and so NixOS, keeps every program, loader, and library in
+/// `/nix/store`.
+const RUNTIME_DIRS: [&str; 6] = ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/nix/store"];
 
 /// Signals that stop the broker. Before it dies of one, the broker ends its
 /// confined worker's process group (RFC 0010).

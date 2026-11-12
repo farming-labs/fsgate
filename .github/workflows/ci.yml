@@ -259,6 +259,44 @@ jobs:
           test "$(cat "$results/no-landlock.kernel")" = "$KERNEL"
           test -f "$results/no-landlock.passed"
 
+  # RFC 0008's default rules for a confined worker, on systems besides the
+  # runner's Ubuntu and on the runner's kernel. Each container builds the
+  # tests with the system's own toolchain, so they load the way its programs
+  # do, and runs them as the runner's user (.github/distros/).
+  distros:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: debian
+            image: debian:13-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
+          - system: fedora
+            image: fedora:45@sha256:a7d72ba2745b100a3351087472e5ee7b2450af7cf331e7673007e3817612839c
+          - system: arch
+            image: archlinux:base-20261108.0.623074@sha256:d4594bb2300cba11f41c2f27923eb56f63d9988909c402f9c95517d1e362c899
+          # musl, through Alpine's dynamically linking rustc.
+          - system: alpine
+            image: alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
+          # Not NixOS itself, but its layout: every program in /nix/store.
+          - system: nix
+            image: nixos/nix:2.35.6@sha256:b49cb33f3a7e5cf3933ad8774529de0e3807ec5cf54987aa7ccdfb49f2fc55ed
+    env:
+      SYSTEM: ${{ matrix.system }}
+      IMAGE: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Start the container
+        run: >-
+          docker run --detach --name distro --volume "$PWD:/src" --workdir /src
+          "$IMAGE" tail -f /dev/null
+      - name: Install the system's toolchain
+        run: docker exec distro /bin/sh .github/distros/setup.sh "$SYSTEM"
+      - name: Run the confined worker's tests
+        run: docker exec --user "$(id -u):$(id -g)" distro /bin/sh .github/distros/test.sh
   workflows:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -272,7 +310,7 @@ jobs:
       - run: shellcheck --version
       - run: pipx run --spec actionlint-py==1.7.12.25 actionlint
       # Scripts the workflows call, which actionlint does not read.
-      - run: shellcheck .github/kernels/*.sh
+      - run: shellcheck .github/kernels/*.sh .github/distros/*.sh
       # Online audits use the read-only job token to check that pinned
       # action SHAs exist in their repositories and have no known advisories.
       - run: pipx run zizmor==1.32.0 .github/workflows
