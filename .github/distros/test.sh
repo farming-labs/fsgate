@@ -19,6 +19,9 @@ if [ -f /etc/os-release ]; then
     # shellcheck source=/dev/null
     . /etc/os-release
     echo "system: $PRETTY_NAME"
+else
+    # The nixos/nix image has none.
+    echo "system: no /etc/os-release"
 fi
 uname -r
 rustc --version

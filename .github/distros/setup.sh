@@ -40,7 +40,7 @@ nix)
     nix --extra-experimental-features 'nix-command flakes' build \
         --no-link --print-out-paths \
         "$nixpkgs#cargo" "$nixpkgs#rustc" "$nixpkgs#gcc" \
-        "$nixpkgs#binutils" "$nixpkgs#coreutils" >/tmp/outputs
+        "$nixpkgs#binutils" "$nixpkgs#coreutils" "$nixpkgs#gnused" >/tmp/outputs
     path=
     while read -r output; do
         if [ -d "$output/bin" ]; then
