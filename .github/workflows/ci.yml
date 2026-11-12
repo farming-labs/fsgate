@@ -297,6 +297,27 @@ jobs:
         run: docker exec distro /bin/sh .github/distros/setup.sh "$SYSTEM"
       - name: Run the confined worker's tests
         run: docker exec --user "$(id -u):$(id -g)" distro /bin/sh .github/distros/test.sh
+  # flake.nix's development shells must have the tools at the versions the
+  # workflows pin.
+  flake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The image the distros job uses.
+      IMAGE: nixos/nix:2.35.6@sha256:b49cb33f3a7e5cf3933ad8774529de0e3807ec5cf54987aa7ccdfb49f2fc55ed
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Start the container
+        run: >-
+          docker run --detach --name nix --volume "$PWD:/src" --workdir /src
+          "$IMAGE" tail -f /dev/null
+      # Nix reads the checkout through Git as root, and the runner's user
+      # owns it.
+      - run: docker exec nix git config --global --add safe.directory /src
+      - name: Compare the shells' tools with the workflows' pins
+        run: docker exec nix /bin/sh .github/nix/check-pins.sh
   workflows:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -310,7 +331,7 @@ jobs:
       - run: shellcheck --version
       - run: pipx run --spec actionlint-py==1.7.12.25 actionlint
       # Scripts the workflows call, which actionlint does not read.
-      - run: shellcheck .github/kernels/*.sh .github/distros/*.sh
+      - run: shellcheck .github/kernels/*.sh .github/distros/*.sh .github/nix/*.sh
       # Online audits use the read-only job token to check that pinned
       # action SHAs exist in their repositories and have no known advisories.
       - run: pipx run zizmor==1.32.0 .github/workflows

@@ -37,7 +37,7 @@ The target feeds arbitrary argument lists to the parser in [`fsgate-broker/args.
 
 ## Running
 
-Needs a nightly toolchain and `cargo install cargo-fuzz --locked`.
+Needs a nightly toolchain and `cargo install cargo-fuzz --locked`. Or `nix develop .#fuzz` from the repository root gives CI's nightly and cargo-fuzz; drop `+nightly` from the commands there.
 
 ```sh
 cd fuzz

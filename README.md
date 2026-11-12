@@ -68,6 +68,16 @@ fsgate-broker --experimental-intercept --grant /srv/data:r --audit --apply -- ./
 
 v0.1.0 is the signed tag `v0.1.0` on `0ad477f`, prepared in [PR #1](https://github.com/farming-labs/fsgate/pull/1) and [PR #3](https://github.com/farming-labs/fsgate/pull/3). The README example compiles as a doctest, public documentation is required by `missing_docs = "deny"`, and CI tests the packaged crate as well as the checkout. v0.1.0 kept `publish = false` and is not on crates.io. 0.1.1 is the first crates.io release and adds the broker close-on-exec fix ([PR #15](https://github.com/farming-labs/fsgate/pull/15)). 0.2.0 adds the M8 restrictions and the [RFC 0007](docs/rfcs/0007-broker-peers.md) broker changes, and is the first release published by the trusted-publishing workflow. 0.3.0 makes `Gate::open` refuse directories ([PR #55](https://github.com/farming-labs/fsgate/pull/55)), a defect in 0.1.1 and 0.2.0, and has `fsgate-broker` confine its worker by default. Releases follow [the release procedure](docs/RELEASING.md). Design: [RFC 0001](docs/rfcs/0001-core-design.md); plan and evidence: [ROADMAP.md](ROADMAP.md).
 
+## Developing
+
+Nothing here needs Nix: Rust 1.85 or later and cargo are enough to build and test. With [Nix](https://nixos.org) and flakes enabled, `flake.nix` has optional shells with the tool versions CI pins, and CI fails when they differ:
+
+| Command | Tools |
+|---|---|
+| `nix develop` | stable Rust with rustfmt and clippy, `cargo-mutants`, `actionlint`, `zizmor`, `shellcheck` |
+| `nix develop .#msrv` | Rust 1.85.0, the minimum supported version |
+| `nix develop .#fuzz` | `nightly-2026-11-08` and `cargo-fuzz`; run `cargo fuzz` without `+nightly` |
+
 ## Prior art
 
 [libpreopen](https://github.com/musec/libpreopen) (the idea), [cap-std](https://github.com/bytecodealliance/cap-std) (safe beneath-handle resolution), WASI preopens, Capsicum, Landlock.
