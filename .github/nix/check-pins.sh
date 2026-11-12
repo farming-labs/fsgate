@@ -10,6 +10,8 @@ nix() {
 }
 
 status=0
+err=$(mktemp)
+trap 'rm -f "$err"' EXIT
 
 # Prints the version in the one match of an extended regular expression in
 # a workflow, or exits if there is not exactly one.
@@ -31,13 +33,15 @@ pin() {
 check() {
     shell=$1 want=$2
     shift 2
-    got=$(nix develop --no-update-lock-file ".#$shell" --command "$@" 2>&1) || {
-        printf '%s\n' "$got" >&2
+    # Only the command's own output: Nix reports its downloads on stderr,
+    # and their store paths name versions too.
+    got=$(nix develop --no-update-lock-file ".#$shell" --command "$@" 2>"$err") || {
+        cat "$err" >&2
         echo "\`$*\` failed in .#$shell" >&2
         exit 1
     }
     got=$(printf '%s\n' "$got" | head -n 1)
-    if printf '%s\n' "$got" | grep -Fqw -- "$want"; then
+    if [ -n "$got" ] && printf '%s\n' "$got" | grep -Fqw -- "$want"; then
         echo "ok: \`$*\` in .#$shell: $got"
     else
         echo "\`$*\` in .#$shell reports '$got', but CI pins $want" >&2
