@@ -230,8 +230,8 @@ mod without_landlock {
 /// provides a restriction, they prove it is enforced and run a control without
 /// it. Where it does not, they prove that requiring it fails before anything is
 /// applied and that a bare lock skips it. CI covers both: the runners boot
-/// Linux 7.0 (ABI v8) and the `kernels` job boots Linux 6.6 (ABI v4) and
-/// Linux 7.3 (ABI v9 or later).
+/// Linux 7.0 (ABI v8) and the `kernels` job boots Linux 6.6 (ABI v4), 6.12
+/// (ABI v6), and 7.3 (ABI v9 or later).
 #[cfg(target_os = "linux")]
 mod kernel {
     use std::ffi::OsStr;
@@ -1195,5 +1195,114 @@ mod kernel {
         let err = gate.open(format!("{granted}/a.txt")).unwrap_err();
         assert!(matches!(err, GateError::NoGrant { .. }), "got {err:?}");
         assert_eq!(fs::read(format!("{granted}/a.txt")).unwrap(), b"inside");
+    }
+
+    /// Linux 6.1, whose Landlock ABI v2 lacks the truncation right that the
+    /// v3 floor adds. CI's `kernels` job boots it and runs these with
+    /// `--ignored`. Each first checks that the kernel is v2, so on any other
+    /// kernel they fail.
+    mod below_landlock_v3 {
+        use super::*;
+
+        fn run(mode: &str, granted: &std::path::Path, outside: &std::path::Path) {
+            assert_eq!(kernel_abi(), 2, "needs Landlock ABI v2 (Linux 6.1)");
+            run_child(
+                "below_landlock_v3::child",
+                mode,
+                &[
+                    ("FSGATE_GRANTED", granted.as_os_str()),
+                    ("FSGATE_OUTSIDE", outside.as_os_str()),
+                ],
+            );
+        }
+
+        #[test]
+        #[ignore = "needs Landlock ABI v2 (Linux 6.1); CI's kernels job runs it"]
+        fn strict_lock_fails_closed() {
+            let (_root, granted, outside) = dirs();
+            run("strict", &granted, &outside);
+        }
+
+        /// The kernel refuses reads and creates outside the grants, but not
+        /// truncation, so a file beneath a read-only grant can be emptied.
+        #[test]
+        #[ignore = "needs Landlock ABI v2 (Linux 6.1); CI's kernels job runs it"]
+        fn best_effort_lock_enforces_only_the_abi_v2_rules() {
+            let (_root, granted, outside) = dirs();
+            fs::write(granted.join("a.txt"), b"inside").unwrap();
+
+            run("best-effort", &granted, &outside);
+
+            assert!(!outside.join("created.txt").exists());
+            assert_eq!(fs::read(granted.join("a.txt")).unwrap(), b"");
+        }
+
+        #[test]
+        fn child() {
+            let Some(mode) = child_mode("below_landlock_v3::child") else {
+                return;
+            };
+            let mut gate = granted_gate();
+            let granted = std::env::var("FSGATE_GRANTED").unwrap();
+            let outside = std::env::var("FSGATE_OUTSIDE").unwrap();
+            let secret = format!("{outside}/secret.txt");
+            match mode.as_str() {
+                "strict" => {
+                    let err = gate.lock().expect_err("a strict lock below ABI v3");
+                    assert!(
+                        matches!(err, GateError::LockUnsupported { .. }),
+                        "got {err:?}"
+                    );
+                    assert!(
+                        err.to_string()
+                            .contains("does not fully enforce Landlock ABI v3"),
+                        "{err}"
+                    );
+                    // Nothing was applied: the kernel still allows a raw read
+                    // outside the grants, and the gate is still granting.
+                    fs::read(&secret).expect("a failed lock applied nothing");
+                    assert_eq!(gate.restrictions(), None);
+                    gate.grant(&outside, Rights::READ)
+                        .expect("the gate is still granting");
+                }
+                "best-effort" => {
+                    let status = gate.lock_with(LockPolicy::BestEffort).unwrap();
+                    assert_eq!(status, LockStatus::PartiallyEnforced);
+                    assert_eq!(gate.restrictions(), Some(Restrictions::empty()));
+                    let err = fs::read(&secret).expect_err("read outside the grants");
+                    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+                    let err = fs::File::create(format!("{outside}/created.txt"))
+                        .expect_err("create outside the grants");
+                    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+                    raw::truncate(format!("{granted}/a.txt"))
+                        .expect("truncating needs ABI v3, so the kernel allows it");
+                }
+                other => panic!("unknown mode {other}"),
+            }
+        }
+
+        /// `truncate(2)` by path, which neither std nor rustix wraps.
+        ///
+        /// Safety contract: the call reads a NUL-terminated path that
+        /// outlives it, and writes no memory of this process.
+        #[allow(unsafe_code)]
+        mod raw {
+            use std::ffi::CString;
+            use std::io;
+            use std::os::unix::ffi::OsStrExt;
+            use std::path::Path;
+
+            /// Empties the file at `path` without opening it.
+            pub(super) fn truncate(path: impl AsRef<Path>) -> io::Result<()> {
+                let path = CString::new(path.as_ref().as_os_str().as_bytes())?;
+                // SAFETY: `path` is NUL-terminated and lives until the call
+                // returns, and `truncate` only reads it.
+                if unsafe { libc::truncate(path.as_ptr(), 0) } == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            }
+        }
     }
 }

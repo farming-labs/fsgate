@@ -126,6 +126,27 @@ fn the_broker_refuses_to_start_a_worker_without_landlock() {
     assert_refused_until_unconfined();
 }
 
+/// Runs only on Linux 6.1, whose Landlock ABI v2 lacks the truncation right
+/// the worker's rules need. CI's `kernels` job boots it.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs Landlock ABI v2 (Linux 6.1); CI's kernels job runs it"]
+fn the_broker_refuses_to_start_a_worker_below_landlock_v3() {
+    use landlock::{ABI, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr};
+
+    let handles = |abi| {
+        Ruleset::default()
+            .set_compatibility(CompatLevel::HardRequirement)
+            .handle_access(AccessFs::from_all(abi))
+            .is_ok()
+    };
+    assert!(
+        handles(ABI::V2) && !handles(ABI::V3),
+        "needs Landlock ABI v2 (Linux 6.1)"
+    );
+    assert_refused_until_unconfined();
+}
+
 fn usage_error(flags: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_fsgate-broker"))
         .args(flags)
