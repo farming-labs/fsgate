@@ -1,13 +1,16 @@
 name: fuzz
 
-# Fuzzing needs nightly and takes 15 minutes, so it runs when the broker's
-# decoder or its harness changes, and on demand. The check job in ci.yml
-# builds and lints the harness on every change.
+# Fuzzing needs nightly and takes 15 minutes a target, so it runs when the
+# crate or a harness changes, every week, and on demand. The check job in
+# ci.yml builds and lints the harnesses on every change.
 on:
   workflow_dispatch:
+  schedule:
+    # Mondays at 04:23 UTC, for an hour a target.
+    - cron: "23 4 * * 1"
   pull_request:
     paths:
-      - crates/fsgate/src/broker.rs
+      - crates/fsgate/src/**
       - fuzz/**
       - .github/workflows/fuzz.yml
 
@@ -15,9 +18,28 @@ permissions:
   contents: read
 
 jobs:
-  broker-requests:
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
+  fuzz:
+    name: ${{ matrix.target }} (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: broker_requests
+            os: ubuntu-latest
+            flags: -max_len=131072
+          - target: broker_args
+            os: ubuntu-latest
+            flags: -max_len=4096 -dict=dicts/broker_args.dict
+          - target: gate_paths
+            os: ubuntu-latest
+            flags: -max_len=4096 -dict=dicts/gate_paths.dict
+          # The gate resolves with openat2 on Linux and with cap-std's
+          # component walk on macOS.
+          - target: gate_paths
+            os: macos-latest
+            flags: -max_len=4096 -dict=dicts/gate_paths.dict
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -27,17 +49,23 @@ jobs:
         with:
           toolchain: nightly-2026-11-08
       - run: cargo install cargo-fuzz --locked --version 0.13.2
-      - name: Fuzz the broker's request decoder
+      - name: Fuzz
         working-directory: fuzz
+        env:
+          TARGET: ${{ matrix.target }}
+          FLAGS: ${{ matrix.flags }}
+          SECONDS_TO_RUN: ${{ github.event_name == 'schedule' && 3600 || 900 }}
         run: |
           uname -srm
-          mkdir -p corpus/broker_requests
-          cargo fuzz run broker_requests corpus/broker_requests seeds/broker_requests -- \
-            -max_len=131072 -timeout=10 -max_total_time=900
+          mkdir -p "corpus/$TARGET"
+          # FLAGS holds several libFuzzer flags, split on purpose.
+          # shellcheck disable=SC2086
+          cargo fuzz run "$TARGET" "corpus/$TARGET" "seeds/$TARGET" -- \
+            $FLAGS -timeout=10 -max_total_time="$SECONDS_TO_RUN"
       # The input is what reproduces a finding, and the job's disk is gone
       # once it ends.
       - if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: broker-requests-artifacts
+          name: ${{ matrix.target }}-${{ runner.os }}-artifacts
           path: fuzz/artifacts/

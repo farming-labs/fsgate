@@ -224,7 +224,39 @@ Started. Today each attack in the threat model has a test written for it, and on
   - a descriptor number the broker never uses.
 
   The workflow fails when the misses differ from the lists, but it runs only on demand and when its setup changes, so a change to the code can add a miss that the next run reports. Doctests are left out. A timeout counts as caught: each one leaves a client waiting for an answer that never comes. Mutation testing also found a flaky coverage check in the model test, fixed in [#79](https://github.com/farming-labs/fsgate/pull/79). A flaky test can also make a listed miss look caught and fail the run: in one run, `a_program_a_confined_worker_leaves_running_ends_with_it` reported "the program never ran" under an equivalent mutant.
-- [ ] More fuzzing: targets for the `--grant` and `--direct` parsers and for path resolution beneath a fixed tree, where nothing outside the tree may be reached. Run every target on a weekly schedule as well as when the code changes. Acceptance: each target has seeds and a recorded run with its duration, and every crash becomes a regression test.
+- [x] More fuzzing: targets for the `--grant` and `--direct` parsers and for path resolution beneath a fixed tree, where nothing outside the tree may be reached. Run every target on a weekly schedule as well as when the code changes. Acceptance: each target has seeds and a recorded run with its duration, and every crash becomes a regression test.
+
+  Evidence ([#81](https://github.com/farming-labs/fsgate/pull/81)): two targets join `broker_requests` in [`fuzz/`](fuzz/README.md), each with seeds and a dictionary.
+  - `gate_paths` runs `open`, `create`, `metadata`, and `read_dir` on arbitrary paths through one gate. Its three nested grants cover a fixed tree whose symlinks stay inside, climb out, are absolute, dangle, or loop. It fails if a success reaches an object outside the grant the path routes to, checked by device and inode. It also fails if a refusal is not the one the routing calls for, or if anything changes but the file a `create` returned.
+  - `broker_args` compares `fsgate-broker`'s parser with a restatement of its rules, for each `--grant` and `--direct` spec and for the mode the options select. The parser moved unchanged into [`fsgate-broker/args.rs`](crates/fsgate/src/bin/fsgate-broker/args.rs) so the target can include it, and [`.cargo/mutants.toml`](.cargo/mutants.toml) examines it there.
+  - [`fuzz.yml`](.github/workflows/fuzz.yml) runs every target on Linux, and `gate_paths` on macOS too. Each runs for 15 minutes when the crate or a harness changes, and for an hour every Monday.
+
+  Controls: each defect below was put in on purpose, and fuzzing from one or two seeds found it, with libFuzzer seed 1 on macOS.
+
+  | Defect | Target | Found after | Check that failed |
+  |---|---|---|---|
+  | `open` follows the path from the root, not beneath the grant | `gate_paths` | 100,511 inputs, about a minute | `granted/up` reached the secret outside the grant |
+  | Routing picks the shortest covering grant | `gate_paths` | 51,386 inputs, under 40 seconds | A `create` in the writable grant was refused with the outer grant's rights |
+  | `create` follows the path from the root | `gate_paths` | 15,937 inputs, under 40 seconds | `create` through `w/wup` truncated `granted/a.txt` |
+  | `--direct` accepts `w` | `broker_args` | 6,155 inputs, under 3 seconds | `--direct /data:rldata:rw` was accepted |
+  | Interception mode accepts `--unconfined` | `broker_args` | 303,507 inputs, under 12 seconds | An interception command line with `--unconfined` was accepted |
+
+  At first the last control was not found in five minutes, twice: once with a dictionary of the option names and once with each name ending in a NUL. One input byte now stands for an option, so changing it swaps one option for another.
+
+  Recorded runs, none with a crash, hang, or check failure. The first two ran locally; the rest are the [`fuzz` jobs](https://github.com/farming-labs/fsgate/actions/runs/43089069857) on `144078d`, with the same seeds and flags.
+
+  | Target | Where | Seconds | Inputs | Per second | Corpus | Coverage counters | libFuzzer seed |
+  |---|---|---|---|---|---|---|---|
+  | `gate_paths` | macOS 26.2, Apple M1 | 901 | 371,858 | 412 | 9 seeds to 564 inputs (82 KiB) | 1,037 to 1,095 | 4200607416 |
+  | `broker_args` | macOS 26.2, Apple M1 | 901 | 5,846,233 | 6,488 | 19 seeds to 733 inputs (167 KiB) | 442 to 614 | 4200606091 |
+  | `gate_paths` | Linux 7.0.0-1019-azure x86_64 | 901 | 411,576 | 456 | 9 seeds to 405 inputs (63 KiB) | 840 to 873 | 859958495 |
+  | `broker_args` | Linux 7.0.0-1019-azure x86_64 | 901 | 3,155,653 | 3,502 | 19 seeds to 759 inputs (211 KiB) | 444 to 622 | 2992076140 |
+  | `broker_requests` | Linux 7.0.0-1019-azure x86_64 | 901 | 26,466,766 | 29,374 | 14 seeds to 1,376 inputs (74 KiB) | 1,013 to 2,111 | 2081091315 |
+  | `gate_paths` | macOS runner, Darwin 25.6.0 arm64 | 901 | 385,580 | 427 | 9 seeds to 566 inputs (82 KiB) | 1,037 to 1,098 | 1508359095 |
+
+  Toolchain everywhere: rustc 1.102.0-nightly (`f5cedb83a` 2026-11-07), cargo-fuzz 0.13.2, libfuzzer-sys 0.4.13, with AddressSanitizer. No run found a crash, so there is no crash regression test. `gate_paths` resolves with `openat2` on Linux and with cap-std's component walk on macOS, so the two platforms cover different code. The weekly run starts once this workflow is on `main`.
+
+  The tree has no hard links or mounts, and no rename happens while a path resolves; the threat model lists those gaps. The parser's restatement follows the same rules, so it cannot find a flaw in the rules themselves. The corpus is not kept between CI runs, so each run starts from the seeds.
 - [x] More kernels and an architecture. Add Linux 6.1 (Landlock ABI v2, below fsgate's floor, where a strict `lock()` and a confined worker must fail closed) and 6.12 (the first kernel with signal and abstract socket scopes) to the `kernels` job, and run `check` on an arm64 runner too. Acceptance: the threat model's row for Landlock ABI below v3 names a test. ([#77](https://github.com/farming-labs/fsgate/pull/77))
 
   Evidence: [CI](https://github.com/farming-labs/fsgate/actions/runs/43115468823) on `6f7cb0f`. The threat model's rows for a strict lock, a best-effort lock, and a confined worker below Landlock ABI v3 name the 6.1 tests.
