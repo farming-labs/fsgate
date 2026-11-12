@@ -603,6 +603,48 @@ struct Coverage {
     revoked: usize,
 }
 
+impl Coverage {
+    /// The kinds of answer this run has not reached yet.
+    fn missing(&self) -> Vec<String> {
+        let mut missing = Vec::new();
+        for (name, count) in [
+            ("NotAbsolute", self.not_absolute),
+            ("NoGrant", self.no_grant),
+            ("RightsExceeded", self.rights_exceeded),
+            ("UnknownGrant", self.unknown_grant),
+            ("WouldWiden", self.would_widen),
+            ("narrow", self.narrowed),
+            ("revoke", self.revoked),
+            (
+                "a create through a dangling symlink",
+                self.either_created + self.either_refused,
+            ),
+            (
+                "a create refused for leaving its grant",
+                self.create_escape_refused,
+            ),
+        ] {
+            if count == 0 {
+                missing.push(name.to_string());
+            }
+        }
+        for op in ["open", "create", "metadata", "read_dir"] {
+            if !self.reached.contains_key(op) {
+                missing.push(format!("a successful {op}"));
+            }
+            if !self.through_link.contains_key(op) {
+                missing.push(format!("a successful {op} through a symlink"));
+            }
+        }
+        for why in [Refusal::Escape, Refusal::Absolute, Refusal::Loop] {
+            if !self.refused.contains_key(&format!("{why:?}")) {
+                missing.push(format!("a refusal for {why:?}"));
+            }
+        }
+        missing
+    }
+}
+
 #[derive(Clone)]
 struct ModelGrant {
     path: PathBuf,
@@ -1184,55 +1226,34 @@ fn config() -> ProptestConfig {
 
 /// The model test. It also requires that the run reached every kind of
 /// answer, so that a change to the generator cannot quietly make it test
-/// nothing.
+/// nothing. A few answers are rare enough that 512 cases miss one now and
+/// then, so a run that misses one goes on with another 512, up to `RUNS`
+/// in all. An answer the generator can no longer reach still fails.
 #[test]
 fn the_gate_matches_the_model_and_never_leaves_its_grants() {
+    const RUNS: usize = 4;
     let coverage = Mutex::new(Coverage::default());
-    let mut runner = TestRunner::new(config());
-    if let Err(err) = runner.run(&case(), |case| {
-        run(&case, &coverage).map_err(TestCaseError::fail)
-    }) {
-        panic!("{err}");
+    let mut first = TestRunner::new(config());
+    let mut missing = Vec::new();
+    for _ in 0..RUNS {
+        // A runner stops once it has passed `cases`, so each run takes a new
+        // one. Its generator comes from the first runner's, so a fixed
+        // `PROPTEST_RNG_SEED` still repeats the whole test.
+        let mut runner = TestRunner::new_with_rng(config(), first.new_rng());
+        if let Err(err) = runner.run(&case(), |case| {
+            run(&case, &coverage).map_err(TestCaseError::fail)
+        }) {
+            panic!("{err}");
+        }
+        missing = coverage.lock().unwrap().missing();
+        if missing.is_empty() {
+            break;
+        }
     }
     let coverage = coverage.into_inner().unwrap();
-    let mut missing = Vec::new();
-    for (name, count) in [
-        ("NotAbsolute", coverage.not_absolute),
-        ("NoGrant", coverage.no_grant),
-        ("RightsExceeded", coverage.rights_exceeded),
-        ("UnknownGrant", coverage.unknown_grant),
-        ("WouldWiden", coverage.would_widen),
-        ("narrow", coverage.narrowed),
-        ("revoke", coverage.revoked),
-        (
-            "a create through a dangling symlink",
-            coverage.either_created + coverage.either_refused,
-        ),
-        (
-            "a create refused for leaving its grant",
-            coverage.create_escape_refused,
-        ),
-    ] {
-        if count == 0 {
-            missing.push(name.to_string());
-        }
-    }
-    for op in ["open", "create", "metadata", "read_dir"] {
-        if !coverage.reached.contains_key(op) {
-            missing.push(format!("a successful {op}"));
-        }
-        if !coverage.through_link.contains_key(op) {
-            missing.push(format!("a successful {op} through a symlink"));
-        }
-    }
-    for why in [Refusal::Escape, Refusal::Absolute, Refusal::Loop] {
-        if !coverage.refused.contains_key(&format!("{why:?}")) {
-            missing.push(format!("a refusal for {why:?}"));
-        }
-    }
     assert!(
         missing.is_empty(),
-        "the run never reached: {missing:?}\n{coverage:?}"
+        "{RUNS} runs never reached: {missing:?}\n{coverage:?}"
     );
     eprintln!("{coverage:?}");
 }

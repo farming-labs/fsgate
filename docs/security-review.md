@@ -20,7 +20,7 @@ Review one named commit of `main` and record its full SHA. Use `6070452` or late
 |---|---|---|
 | Handle layer | `lib.rs` | [Threat model 1](threat-model.md#1-the-gate-before-lock), [RFC 0001](rfcs/0001-core-design.md) |
 | Containment, including the M8 restrictions | `containment.rs` | [Threat model 2](threat-model.md#2-the-locked-process-linux), [RFC 0006](rfcs/0006-lock-restrictions.md) |
-| Broker, including its confined worker | `broker.rs`, `broker_sys.rs`, `bin/fsgate-broker.rs`, `bin/fsgate-broker/confine.rs` | [Threat model 3](threat-model.md#3-the-broker-and-its-worker), [RFC 0003](rfcs/0003-broker-protocol.md), [RFC 0007](rfcs/0007-broker-peers.md), [RFC 0008](rfcs/0008-confine-broker-worker.md) |
+| Broker, including its confined worker | `broker.rs`, `broker_sys.rs`, `bin/fsgate-broker.rs`, `bin/fsgate-broker/args.rs`, `bin/fsgate-broker/confine.rs` | [Threat model 3](threat-model.md#3-the-broker-and-its-worker), [RFC 0003](rfcs/0003-broker-protocol.md), [RFC 0007](rfcs/0007-broker-peers.md), [RFC 0008](rfcs/0008-confine-broker-worker.md) |
 | Audit sink | `audit.rs` | [Threat model, audit](threat-model.md#audit-is-observation-not-a-boundary), [RFC 0002](rfcs/0002-audit-events.md) |
 
 Out of scope:
@@ -58,9 +58,9 @@ Kernel enforcement needs Linux. On macOS these commands cover the handle layer a
 
 What the Linux tests exercise depends on the kernel running them. Strict `lock()` needs Linux 6.2 (Landlock ABI v3). Device ioctls need 6.10, abstract sockets and signals 6.12, all threads 7.0, and pathname sockets 7.1. On a kernel without one of these, the same test checks the refusal instead.
 
-The `kernels` job in [`ci.yml`](../.github/workflows/ci.yml) boots Linux 6.6.162 and 7.3.3 under virtme-ng and is the recipe for running them. [`guest-tests.sh`](../.github/kernels/guest-tests.sh) is what runs in the guest.
+The `kernels` job in [`ci.yml`](../.github/workflows/ci.yml) boots Linux 6.1.192, 6.6.162, 6.12.117, and 7.3.3 under virtme-ng and is the recipe for running them. 6.1 is below the Landlock floor, so it runs only the tests that show a strict `lock()` and a confined worker failing closed. [`guest-tests.sh`](../.github/kernels/guest-tests.sh) is what runs in the guest.
 
-[`fuzz/README.md`](../fuzz/README.md) has the command for the broker's fuzz target, and M9 records the runs so far. To confirm that the crate on crates.io is the tagged commit, use the checks at the end of [Manual fallback](RELEASING.md#manual-fallback).
+[`fuzz/README.md`](../fuzz/README.md) has the commands for the fuzz targets: the broker's requests, the gate's paths, and the broker's command line. M9 and M10 record the runs so far. To confirm that the crate on crates.io is the tagged commit, use the checks at the end of [Manual fallback](RELEASING.md#manual-fallback).
 
 ## What the review leaves behind
 

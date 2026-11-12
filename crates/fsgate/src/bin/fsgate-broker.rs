@@ -56,17 +56,43 @@ use std::process::{Command, ExitCode};
 
 use fsgate::{Broker, Gate, Rights};
 
+#[path = "fsgate-broker/args.rs"]
+mod args;
+
+use args::{Args, Mode, Start, parse_args, utf8_args};
+// `confine` reads `--direct` specs again as `super::parse_direct`.
+#[cfg(target_os = "linux")]
+use args::parse_direct;
+
 #[cfg(target_os = "linux")]
 #[path = "fsgate-broker/confine.rs"]
 mod confine;
 
 #[cfg(not(target_os = "linux"))]
 mod confine {
+    use std::convert::Infallible;
     use std::os::fd::RawFd;
     use std::path::PathBuf;
-    use std::process::Command;
+    use std::process::{Child, Command};
 
     use fsgate::Rights;
+
+    /// No worker is confined here, so there is never one to supervise.
+    pub(super) enum Supervisor {}
+
+    pub(super) enum Running {}
+
+    impl Supervisor {
+        pub(super) fn start(self) -> Result<Running, String> {
+            match self {}
+        }
+    }
+
+    impl Running {
+        pub(super) fn finish(self, _: Child) -> Result<Infallible, String> {
+            match self {}
+        }
+    }
 
     pub(super) fn command(
         _: RawFd,
@@ -74,40 +100,13 @@ mod confine {
         _: &[String],
         _: &[String],
         _: &[String],
-    ) -> Result<Command, String> {
+    ) -> Result<(Command, Supervisor), String> {
         Err(
             "this platform has no way for `fsgate-broker` to confine a worker; \
              pass `--unconfined` to run it without confinement"
                 .into(),
         )
     }
-}
-
-struct Args {
-    grants: Vec<(PathBuf, Rights)>,
-    mode: Mode,
-    command: Vec<String>,
-}
-
-enum Mode {
-    /// Serve the grants to the command over a connection it inherits.
-    Inherited(Start),
-    /// Serve the grants over a Unix socket at this path.
-    Socket(PathBuf),
-    /// Experimental: intercept the worker's file opens (RFC 0004).
-    Intercept { apply: bool, audit: bool },
-}
-
-/// How the command of [`Mode::Inherited`] starts.
-enum Start {
-    /// Confined (RFC 0008), with these validated `--direct` specs and
-    /// `--env` names.
-    Confined {
-        direct: Vec<String>,
-        env: Vec<String>,
-    },
-    /// With this process's own environment and filesystem access.
-    Unconfined,
 }
 
 fn main() -> ExitCode {
@@ -182,16 +181,18 @@ fn run_inherited(
     rustix::io::fcntl_setfd(&worker_end, rustix::io::FdFlags::empty())
         .map_err(|err| format!("preparing the worker's connection failed: {err}"))?;
 
-    let mut worker = match start {
+    let (mut worker, supervisor) = match start {
         Start::Confined { direct, env } => {
-            confine::command(worker_end.as_raw_fd(), grants, &direct, &env, command)?
+            let (worker, supervisor) =
+                confine::command(worker_end.as_raw_fd(), grants, &direct, &env, command)?;
+            (worker, Some(supervisor))
         }
         Start::Unconfined => {
             let mut worker = Command::new(&command[0]);
             worker
                 .args(&command[1..])
                 .env("FSGATE_BROKER_FD", worker_end.as_raw_fd().to_string());
-            worker
+            (worker, None)
         }
     };
     std::thread::scope(|scope| {
@@ -203,11 +204,17 @@ fn run_inherited(
                 let _ = broker.serve_conn(broker_end);
             })
             .map_err(|err| format!("starting the thread that serves the worker failed: {err}"))?;
+        // Also before the worker, for the same reason.
+        let supervisor = supervisor.map(confine::Supervisor::start).transpose()?;
         let mut child = worker
             .spawn()
             .map_err(|err| format!("spawning `{}` failed: {err}", command[0]))?;
         // Held open here, the broker would never see the worker hang up.
         drop(worker_end);
+        if let Some(supervisor) = supervisor {
+            let finished = supervisor.finish(child)?;
+            match finished {}
+        }
         let status = child
             .wait()
             .map_err(|err| format!("waiting for `{}` failed: {err}", command[0]))?;
@@ -354,171 +361,6 @@ const USAGE: &str = "usage: fsgate-broker --grant <path>:<rights> [--grant ...] 
                      [--audit] [--apply] -- <static-binary> [args...]\n\
                      rights letters: r read, w write, c create, l list; \
                      for --direct: r read, l list, x execute";
-
-/// The arguments as strings. `std::env::args` would panic on one that is not
-/// UTF-8, and the broker protocol carries paths as UTF-8 anyway.
-fn utf8_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Vec<String>, String> {
-    args.enumerate()
-        .map(|(index, arg)| {
-            arg.into_string().map_err(|arg| {
-                format!(
-                    "argument {} (`{}`) is not valid UTF-8; fsgate-broker accepts only UTF-8 \
-                     arguments, so pass this value to the worker another way",
-                    index + 1,
-                    arg.to_string_lossy()
-                )
-            })
-        })
-        .collect()
-}
-
-fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
-    let mut grants = Vec::new();
-    let mut socket = None;
-    let mut intercept = false;
-    let mut apply = false;
-    let mut audit = false;
-    let mut unconfined = false;
-    let mut direct = Vec::new();
-    let mut env = Vec::new();
-    let mut command = Vec::new();
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--grant" => {
-                let spec = args.next().ok_or("`--grant` needs `<path>:<rights>`")?;
-                grants.push(parse_grant(&spec)?);
-            }
-            "--socket" => {
-                let path = args.next().ok_or("`--socket` needs a path")?;
-                socket = Some(PathBuf::from(path));
-            }
-            "--unconfined" => unconfined = true,
-            "--direct" => {
-                let spec = args.next().ok_or("`--direct` needs `<path>:<rights>`")?;
-                parse_direct(&spec)?;
-                direct.push(spec);
-            }
-            "--env" => {
-                let name = args.next().ok_or("`--env` needs a variable name")?;
-                if name.is_empty() || name.contains('=') {
-                    return Err(format!(
-                        "`--env` takes a variable name, not `{name}`; \
-                         set the variable in the broker's environment"
-                    ));
-                }
-                env.push(name);
-            }
-            "--experimental-intercept" => intercept = true,
-            "--apply" => apply = true,
-            "--audit" => audit = true,
-            "--" => {
-                command.extend(args);
-                break;
-            }
-            "--help" | "-h" => return Err("help requested".into()),
-            other => return Err(format!("unknown argument `{other}`")),
-        }
-    }
-
-    if grants.is_empty() {
-        return Err("at least one `--grant` is required".into());
-    }
-    if command.is_empty() {
-        return Err("a command after `--` is required".into());
-    }
-    let shapes_confinement = !direct.is_empty() || !env.is_empty();
-    if unconfined && shapes_confinement {
-        return Err(
-            "`--direct` and `--env` describe a confined worker; drop them or drop `--unconfined`"
-                .into(),
-        );
-    }
-    let mode = match (intercept, socket) {
-        (true, Some(_)) => {
-            return Err(
-                "`--socket` and `--experimental-intercept` are separate modes; pass one".into(),
-            );
-        }
-        (true, None) if unconfined || shapes_confinement => {
-            return Err(
-                "`--experimental-intercept` has its own worker profile; drop `--unconfined`, \
-                 `--direct`, and `--env`"
-                    .into(),
-            );
-        }
-        (true, None) => Mode::Intercept { apply, audit },
-        (false, _) if apply || audit => {
-            return Err("`--apply` and `--audit` need `--experimental-intercept`".into());
-        }
-        (false, Some(_)) if !unconfined => {
-            return Err(
-                "a worker that connects to `--socket` cannot be confined, because a confined \
-                 worker makes no new connections; drop `--socket` or pass `--unconfined`"
-                    .into(),
-            );
-        }
-        (false, Some(socket)) => Mode::Socket(socket),
-        (false, None) if unconfined => Mode::Inherited(Start::Unconfined),
-        (false, None) => Mode::Inherited(Start::Confined { direct, env }),
-    };
-    Ok(Args {
-        grants,
-        mode,
-        command,
-    })
-}
-
-fn parse_grant(spec: &str) -> Result<(PathBuf, Rights), String> {
-    let (path, letters) = spec
-        .rsplit_once(':')
-        .ok_or_else(|| format!("grant `{spec}` is not `<path>:<rights>`"))?;
-    let mut rights = Rights::from_bits_truncate(0);
-    for letter in letters.chars() {
-        rights = rights
-            | match letter {
-                'r' => Rights::READ,
-                'w' => Rights::WRITE,
-                'c' => Rights::CREATE,
-                'l' => Rights::LIST,
-                other => {
-                    return Err(format!(
-                        "unknown rights letter `{other}` in `{spec}`; use r, w, c, l"
-                    ));
-                }
-            };
-    }
-    if rights == Rights::from_bits_truncate(0) {
-        return Err(format!("grant `{spec}` names no rights"));
-    }
-    Ok((PathBuf::from(path), rights))
-}
-
-/// Splits a `--direct` spec into its path and its letters, which are `r`,
-/// `l`, and `x`. A write the worker makes directly is one the broker never
-/// sees, so there is no `w` or `c`. The path must be absolute, as for
-/// `--grant`, because a relative one would depend on the broker's working
-/// directory.
-fn parse_direct(spec: &str) -> Result<(PathBuf, &str), String> {
-    let (path, letters) = spec
-        .rsplit_once(':')
-        .ok_or_else(|| format!("`--direct {spec}` is not `<path>:<rights>`"))?;
-    if !Path::new(path).is_absolute() {
-        return Err(format!(
-            "`--direct {spec}` names a relative path; give an absolute one, as for `--grant`"
-        ));
-    }
-    if letters.is_empty() {
-        return Err(format!("`--direct {spec}` names no rights"));
-    }
-    if let Some(other) = letters.chars().find(|letter| !"rlx".contains(*letter)) {
-        return Err(format!(
-            "unknown rights letter `{other}` in `--direct {spec}`; use r, l, x, \
-             and `--grant` for anything the worker writes"
-        ));
-    }
-    Ok((PathBuf::from(path), letters))
-}
 
 #[cfg(all(
     feature = "experimental-intercept",

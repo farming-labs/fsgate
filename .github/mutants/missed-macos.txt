@@ -1,0 +1,22 @@
+# Mutants the tests miss on macOS, each with the reason it cannot change
+# behavior there. The `mutants` workflow fails when the mutants it misses
+# differ from this list. A line is a mutant as `cargo mutants --list` names
+# it, without its line and column, so a name that occurs twice in a file is
+# listed once for each miss.
+
+# macOS has no Landlock, so `lock` intersects the requested restrictions with
+# an empty set and never reads the result. Linux runs the tests that need it.
+crates/fsgate/src/lib.rs: replace | with & in LockOptions::requested
+crates/fsgate/src/lib.rs: replace | with ^ in LockOptions::requested
+
+# `CAN_READ_PEER_UID` is true on Linux and macOS, so the guard is false
+# without the mutant too. It matters only where fsgate cannot read a peer's
+# uid, which no CI runner is.
+crates/fsgate/src/broker.rs: replace match guard !CAN_READ_PEER_UID with false in ServeOptions::allowed_uids
+
+# Not built on macOS: the Linux `apply`, and the interception mode's `run`.
+# Each shares its name with a mutant in the code macOS builds, which the
+# tests catch, so the workflow cannot leave these out without a line number.
+crates/fsgate/src/bin/fsgate-broker.rs: replace intercept::run -> ExitCode with Default::default()
+crates/fsgate/src/containment.rs: replace apply -> Result<Applied, GateError> with Ok(Default::default())
+crates/fsgate/src/containment.rs: replace == with != in apply
