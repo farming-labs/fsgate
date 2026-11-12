@@ -247,7 +247,7 @@ mod kernel {
     use std::env;
     use std::fs::{self, File};
     use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
-    use std::os::fd::{AsFd, AsRawFd};
+    use std::os::fd::AsRawFd;
     use std::os::linux::net::SocketAddrExt;
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::net::{SocketAddr, UnixDatagram, UnixListener, UnixStream};
@@ -463,25 +463,44 @@ mod kernel {
 
     /// A descriptor the broker's parent left open would outlive the sandbox,
     /// because Landlock does not restrict what was opened before it applied.
+    /// The worker closes two, one on each side of its connection's number:
+    /// 3, which `sh` opens before it becomes the broker, and one numbered 900
+    /// or more. A stray at whatever number the test process had free could
+    /// land on either side, and then only that side was checked.
     #[test]
     fn a_descriptor_the_parent_left_open_is_closed_in_the_worker() {
         let fixture = fixture();
-        let stray = File::open(fixture.outside.join("secret.txt")).unwrap();
-        rustix::io::fcntl_setfd(stray.as_fd(), FdFlags::empty()).unwrap();
-        let number = stray.as_raw_fd().to_string();
+        let secret = fixture.outside.join("secret.txt");
+        let stray = File::open(&secret).unwrap();
+        let high = rustix::io::fcntl_dupfd_cloexec(&stray, 900).unwrap();
+        rustix::io::fcntl_setfd(&high, FdFlags::empty()).unwrap();
+        let numbers = format!("3,{}", high.as_raw_fd());
         let inode = stray.metadata().unwrap().ino().to_string();
 
-        let extra = ["FSGATE_EXPECT", "FSGATE_STRAY", "FSGATE_STRAY_INODE"];
+        let extra = ["FSGATE_EXPECT", "FSGATE_STRAYS", "FSGATE_STRAY_INODE"];
         for (flags, expect) in [(confined(&extra), "denied"), (unconfined(), "allowed")] {
-            let output = broker(&fixture, &flags, "kernel::stray_scenario")
+            let command = broker(&fixture, &flags, "kernel::stray_scenario");
+            let mut through_sh = Command::new("sh");
+            through_sh
+                .args(["-c", "exec 3<\"$0\" && exec \"$@\""])
+                .arg(&secret)
+                .arg(command.get_program())
+                .args(command.get_args())
                 .env("FSGATE_EXPECT", expect)
-                .env("FSGATE_STRAY", &number)
-                .env("FSGATE_STRAY_INODE", &inode)
-                .output()
-                .expect("run fsgate-broker");
+                .env("FSGATE_STRAYS", &numbers)
+                .env("FSGATE_STRAY_INODE", &inode);
+            for (key, value) in command.get_envs() {
+                if let Some(value) = value {
+                    through_sh.env(key, value);
+                }
+            }
+            if let Some(dir) = command.get_current_dir() {
+                through_sh.current_dir(dir);
+            }
+            let output = through_sh.output().expect("run fsgate-broker through sh");
             assert_ran(&output);
         }
-        drop(stray);
+        drop(high);
     }
 
     #[test]
@@ -489,13 +508,14 @@ mod kernel {
         if !in_child("kernel::stray_scenario") {
             return;
         }
-        let number = env::var("FSGATE_STRAY").unwrap();
         let inode: u64 = env::var("FSGATE_STRAY_INODE").unwrap().parse().unwrap();
-        // `stat` works under Landlock. The inode tells this descriptor from
-        // something else that took its number.
-        let open =
-            fs::metadata(format!("/proc/self/fd/{number}")).is_ok_and(|meta| meta.ino() == inode);
-        assert_eq!(open, !expect_denied());
+        for number in env::var("FSGATE_STRAYS").unwrap().split(',') {
+            // `stat` works under Landlock. The inode tells this descriptor
+            // from something else that took its number.
+            let open = fs::metadata(format!("/proc/self/fd/{number}"))
+                .is_ok_and(|meta| meta.ino() == inode);
+            assert_eq!(open, !expect_denied(), "descriptor {number}");
+        }
     }
 
     #[test]
@@ -976,6 +996,92 @@ mod kernel {
         let mut line = String::new();
         std::io::stdin().read_line(&mut line).unwrap();
         println!("alive");
+    }
+
+    /// `l` lets the worker list a `--direct` directory, and nothing more: its
+    /// files stay unread.
+    #[test]
+    fn a_direct_path_can_be_listed_and_not_read() {
+        let fixture = fixture();
+        let open = fixture.outside.join("open");
+        fs::create_dir(&open).unwrap();
+        fs::write(open.join("runtime.txt"), b"runtime").unwrap();
+
+        let mut flags = confined(&[]);
+        flags.extend(["--direct".to_string(), format!("{}:l", open.display())]);
+        let output = broker(&fixture, &flags, "kernel::listed_scenario")
+            .output()
+            .expect("run fsgate-broker");
+        assert_ran(&output);
+    }
+
+    #[test]
+    fn listed_scenario() {
+        if !in_child("kernel::listed_scenario") {
+            return;
+        }
+        let open = format!("{}/open", env::var("FSGATE_OUTSIDE").unwrap());
+        let names: Vec<_> = fs::read_dir(&open)
+            .expect("list the direct path")
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["runtime.txt"]);
+        assert_eq!(
+            fs::read(format!("{open}/runtime.txt")).unwrap_err().kind(),
+            ErrorKind::PermissionDenied
+        );
+    }
+
+    /// A worker named without a `/` is looked up on `PATH` the way `execvp`
+    /// would, past an entry where it is missing and one where it is not
+    /// executable, and the image found is the one allowed to run.
+    #[test]
+    fn a_worker_named_without_a_path_is_found_on_path() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let fixture = fixture();
+        let empty = fixture.root.join("empty");
+        let plain = fixture.root.join("plain");
+        let bin = fixture.root.join("bin");
+        for dir in [&empty, &plain, &bin] {
+            fs::create_dir(dir).unwrap();
+        }
+        let name = "fsgate-test-worker";
+        fs::write(plain.join(name), b"not a program").unwrap();
+        fs::set_permissions(plain.join(name), fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(env::current_exe().unwrap(), bin.join(name)).unwrap();
+        let path = env::join_paths([&empty, &plain, &bin]).unwrap();
+
+        let command = broker(&fixture, &confined(&[]), "kernel::found_scenario");
+        let args: Vec<_> = command.get_args().map(ToOwned::to_owned).collect();
+        let worker = args.iter().position(|arg| arg == "--").unwrap() + 1;
+        let mut named = Command::new(command.get_program());
+        named
+            .args(&args[..worker])
+            .arg(name)
+            .args(&args[worker + 1..])
+            .env("PATH", path);
+        for (key, value) in command.get_envs() {
+            if let Some(value) = value {
+                named.env(key, value);
+            }
+        }
+        named.current_dir(&fixture.root);
+        let output = named.output().expect("run fsgate-broker");
+        assert_ran(&output);
+    }
+
+    #[test]
+    fn found_scenario() {
+        if !in_child("kernel::found_scenario") {
+            return;
+        }
+        let mut gate = BrokerGate::from_inherited().expect("adopt the connection");
+        assert!(
+            gate.metadata(format!("{}/a.txt", env::var("FSGATE_GRANTED").unwrap()))
+                .unwrap()
+                .is_file
+        );
     }
 
     /// Whether this kernel's Landlock refuses connects to pathname Unix

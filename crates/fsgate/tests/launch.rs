@@ -516,6 +516,26 @@ fn the_broker_plans_without_starting_anything() {
     assert!(plan.contains("Nothing was started"), "{plan}");
     // The worker would have printed the file.
     assert!(!plan.contains("inside"), "{plan}");
+    assert!(!plan.contains("WRITE and CREATE are unused"), "{plan}");
+}
+
+/// The profile only reads, so the plan says when a grant gives `WRITE` or
+/// `CREATE`, either one alone.
+#[test]
+fn the_plan_names_rights_the_profile_leaves_unused() {
+    let dirs = Dirs::new();
+    let worker = worker().to_str().unwrap();
+    for letters in ["w", "c"] {
+        let grant = format!("{}:{letters}", dirs.outside.display());
+        let output = broker(&dirs, &["--grant", &grant, "--", worker, "read", "/"]);
+
+        let plan = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(0), "{letters}: {plan}");
+        assert!(
+            plan.contains("the profile only reads; WRITE and CREATE are unused"),
+            "{letters}: {plan}"
+        );
+    }
 }
 
 #[test]
