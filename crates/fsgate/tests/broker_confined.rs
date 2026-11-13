@@ -927,14 +927,15 @@ mod kernel {
         drop(stdin);
     }
 
-    /// RFC 0010: a broker stopped by `SIGTERM`, `SIGINT`, or `SIGHUP` kills
-    /// its confined worker and the worker's programs, then dies by the same
-    /// signal.
+    /// RFC 0010: a broker stopped by `SIGTERM`, `SIGINT`, `SIGHUP`, or
+    /// `SIGQUIT` kills its confined worker and the worker's programs, then
+    /// dies by the same signal.
     #[test]
     fn stopping_the_broker_ends_a_confined_worker_and_its_programs() {
+        use rustix::process::{Resource, Rlimit};
         use std::os::unix::process::ExitStatusExt;
 
-        for signal in [Signal::TERM, Signal::INT, Signal::HUP] {
+        for signal in [Signal::TERM, Signal::INT, Signal::HUP, Signal::QUIT] {
             let fixture = fixture();
             let mut broker =
                 spawn_piped(&confined(&[]), &fixture, "kernel::keeps_a_program_scenario");
@@ -942,6 +943,14 @@ mod kernel {
             let stderr = broker.stderr.take().expect("piped stderr");
             let (worker, program) = ready_pids(&mut BufReader::new(broker.stdout.take().unwrap()));
             assert!(is_running(worker) && is_running(program));
+            // `SIGQUIT` dumps core by default. A core file in the test's
+            // directory would be noise, so the broker gets none.
+            let no_core = Rlimit {
+                current: Some(0),
+                maximum: Some(0),
+            };
+            rustix::process::prlimit(Some(Pid::from_child(&broker)), Resource::Core, no_core)
+                .expect("turn off the broker's core dumps");
 
             rustix::process::kill_process(Pid::from_child(&broker), signal).unwrap();
             let status = broker.wait().expect("reap the broker");
