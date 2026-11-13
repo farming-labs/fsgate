@@ -1142,7 +1142,8 @@ mod kernel {
     /// RFC 0009: on every kernel, a confined worker and a program it starts
     /// reach no Unix socket outside the worker's confinement: not a stream
     /// socket by path or by abstract name, and not a datagram socket by
-    /// path, from a socket of its own or from half of a pair. Below Linux
+    /// path, from a socket of its own or from half of a datagram or raw
+    /// pair. Below Linux
     /// 7.1 the filter refuses those sockets, and from 7.1 Landlock refuses
     /// the connects and sends. Nothing reaches the test's sockets. The
     /// unconfined control reaches all of them, so the test would notice.
@@ -1169,8 +1170,8 @@ mod kernel {
             assert_ran(&output);
 
             // The worker and its program each try once, and each tries a
-            // datagram two ways.
-            let (connections, datagrams) = if expect == "allowed" { (2, 4) } else { (0, 0) };
+            // datagram three ways.
+            let (connections, datagrams) = if expect == "allowed" { (2, 6) } else { (0, 0) };
             assert_eq!(accepted(&stream), connections, "{expect}: by path");
             assert_eq!(
                 accepted(&abstract_stream),
@@ -1189,6 +1190,18 @@ mod kernel {
         let outside = PathBuf::from(env::var("FSGATE_OUTSIDE").unwrap());
         let datagram = outside.join("datagram.sock");
         let address = SocketAddr::from_abstract_name(env::var("FSGATE_ABSTRACT").unwrap()).unwrap();
+        // The kernel makes a Unix `SOCK_RAW` socket a datagram one.
+        let raw_pair = || {
+            use rustix::net::{AddressFamily, SocketFlags, SocketType};
+            rustix::net::socketpair(
+                AddressFamily::UNIX,
+                SocketType::RAW,
+                SocketFlags::CLOEXEC,
+                None,
+            )
+            .map(|(end, _)| UnixDatagram::from(end))
+            .map_err(std::io::Error::from)
+        };
         let attempts = [
             (
                 "a connect by path",
@@ -1207,6 +1220,10 @@ mod kernel {
                 "a datagram from half of a pair",
                 UnixDatagram::pair()
                     .and_then(|(socket, _)| socket.send_to(b"x", &datagram).map(drop)),
+            ),
+            (
+                "a datagram from half of a raw pair",
+                raw_pair().and_then(|socket| socket.send_to(b"x", &datagram).map(drop)),
             ),
         ];
         for (what, result) in attempts {
@@ -1280,10 +1297,26 @@ mod kernel {
                 socket(SocketType::SEQPACKET, SocketFlags::NONBLOCK),
             ),
             ("a datagram pair", pair(SocketType::DGRAM)),
+            // The kernel makes a Unix `SOCK_RAW` socket a datagram one.
+            ("a raw pair", pair(SocketType::RAW)),
         ];
         for (what, result) in refused {
             let expected = if filtered { Err(Errno::ACCESS) } else { Ok(()) };
             assert_eq!(result, expected, "{what}");
+        }
+        if !filtered {
+            let (end, _) = rustix::net::socketpair(
+                AddressFamily::UNIX,
+                SocketType::RAW,
+                SocketFlags::CLOEXEC,
+                None,
+            )
+            .expect("a raw pair");
+            assert_eq!(
+                rustix::net::sockopt::socket_type(&end),
+                Ok(SocketType::DGRAM),
+                "a raw pair is a datagram pair"
+            );
         }
         pair(SocketType::STREAM).expect("a stream pair");
         pair(SocketType::SEQPACKET).expect("a seqpacket pair");

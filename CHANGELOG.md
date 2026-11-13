@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Below Linux 7.1, a confined worker could still send datagrams, and descriptors with them, to any Unix datagram socket it could name by path, or by abstract name before Linux 6.12, which [RFC 0009](docs/rfcs/0009-worker-unix-sockets.md) says it cannot. Its seccomp filter refused a Unix socket pair only for `SOCK_DGRAM`, and the kernel makes a Unix `SOCK_RAW` socket a datagram one. The filter now refuses every Unix socket pair but a stream or seqpacket one. Stream sockets, and so D-Bus, were never reachable this way.
+
 ## 0.4.0 (2026-11-12)
 
 [`fsgate` 0.4.0](https://crates.io/crates/fsgate/0.4.0), built from the signed tag [`v0.4.0`](https://github.com/farming-labs/fsgate/tree/v0.4.0) on `101a598`. Not independently reviewed. Upgrade from 0.3.0 or earlier for the fixes listed under Fixed, among them a relative `--direct` path that let a confined worker read the whole filesystem, and a `--socket` path another user could replace. A confined worker no longer reaches Unix sockets before Linux 7.1 or leaves programs running after it exits, as listed under Changed; a worker that needs either must run with `--unconfined`. Those changes to `fsgate-broker`'s defaults are why this is a minor release. Everything behind the `experimental-intercept` feature is not part of this release: it builds only from the repository, and the published crate refuses the feature with a compile error.
