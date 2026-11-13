@@ -480,10 +480,11 @@ fn add_rule(
 ///
 /// - `socket(AF_UNIX, ...)` with `EACCES`. With no new Unix socket there is
 ///   nothing to connect, by path or by abstract name.
-/// - `socketpair(AF_UNIX, SOCK_DGRAM, ...)` with `EACCES`. A datagram socket
-///   can send to any address and connect to another, even as half of a
-///   pair. Stream and seqpacket pairs stay connected to each other, so they
-///   are allowed.
+/// - `socketpair(AF_UNIX, ...)` with `EACCES`, unless the type is
+///   `SOCK_STREAM` or `SOCK_SEQPACKET`. Those pairs stay connected to each
+///   other, so they are allowed. A datagram socket can send to any address
+///   and connect to another, even as half of a pair, and the kernel makes
+///   a Unix `SOCK_RAW` socket a datagram one.
 /// - `io_uring_setup`, `io_uring_enter`, and `io_uring_register` with
 ///   `ENOSYS`, as a kernel without `io_uring` does. Its operations create
 ///   and connect sockets without the calls above.
@@ -542,8 +543,8 @@ mod unix_socket_filter {
         use libc::{
             AF_UNIX, BPF_ABS, BPF_ALU, BPF_AND, BPF_JEQ, BPF_JGE, BPF_JMP, BPF_K, BPF_LD, BPF_RET,
             BPF_W, EACCES, ENOSYS, SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS,
-            SOCK_DGRAM, SYS_io_uring_enter, SYS_io_uring_register, SYS_io_uring_setup, SYS_socket,
-            SYS_socketpair, sock_filter,
+            SOCK_SEQPACKET, SOCK_STREAM, SYS_io_uring_enter, SYS_io_uring_register,
+            SYS_io_uring_setup, SYS_socket, SYS_socketpair, sock_filter,
         };
 
         /// `AUDIT_ARCH_X86_64`, which `libc` does not define.
@@ -571,15 +572,15 @@ mod unix_socket_filter {
 
         // Where the steps that several jumps lead to start.
         const SOCKETPAIR: usize = 9;
-        const SOCKET: usize = 12;
-        const ALLOW: usize = 14;
-        const REFUSE: usize = 15;
-        const MISSING: usize = 16;
-        const KILL: usize = 17;
+        const SOCKET: usize = 13;
+        const ALLOW: usize = 15;
+        const REFUSE: usize = 16;
+        const MISSING: usize = 17;
+        const KILL: usize = 18;
 
         /// Each jump names its own index first, then where it goes on when
         /// its comparison holds and when it does not.
-        pub(super) const PROGRAM: [sock_filter; 18] = [
+        pub(super) const PROGRAM: [sock_filter; 19] = [
             load(ARCH),
             jeq(1, AUDIT_ARCH, 2, KILL),
             load(NR),
@@ -589,13 +590,15 @@ mod unix_socket_filter {
             jeq(6, number(SYS_io_uring_setup), MISSING, 7),
             jeq(7, number(SYS_io_uring_enter), MISSING, 8),
             jeq(8, number(SYS_io_uring_register), MISSING, ALLOW),
-            // SOCKETPAIR: only a datagram pair goes on to the domain.
+            // SOCKETPAIR: every type but stream and seqpacket goes on to the
+            // domain.
             load(ARG1),
             statement(BPF_ALU | BPF_AND | BPF_K, SOCK_TYPE_MASK),
-            jeq(11, SOCK_DGRAM as u32, SOCKET, ALLOW),
+            jeq(11, SOCK_STREAM as u32, ALLOW, 12),
+            jeq(12, SOCK_SEQPACKET as u32, ALLOW, SOCKET),
             // SOCKET
             load(ARG0),
-            jeq(13, AF_UNIX as u32, REFUSE, ALLOW),
+            jeq(14, AF_UNIX as u32, REFUSE, ALLOW),
             answer(SECCOMP_RET_ALLOW),
             answer(SECCOMP_RET_ERRNO | EACCES as u32),
             answer(SECCOMP_RET_ERRNO | ENOSYS as u32),
@@ -660,7 +663,6 @@ mod unix_socket_filter {
         mod tests {
             use super::*;
             use libc::{AF_INET, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_RAW, SOCK_RDM};
-            use libc::{SOCK_SEQPACKET, SOCK_STREAM};
 
             const REFUSED: u32 = SECCOMP_RET_ERRNO | EACCES as u32;
 

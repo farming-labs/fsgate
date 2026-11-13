@@ -59,7 +59,7 @@ The filter answers:
 | Call | Answer |
 |---|---|
 | `socket` with domain `AF_UNIX` | `EACCES` |
-| `socketpair` with domain `AF_UNIX` and type `SOCK_DGRAM` | `EACCES` |
+| `socketpair` with domain `AF_UNIX` and any type but `SOCK_STREAM` and `SOCK_SEQPACKET` | `EACCES` |
 | `io_uring_setup`, `io_uring_enter`, `io_uring_register` | `ENOSYS` |
 | a call from another architecture, or an x32 call | kills the process |
 | anything else | allowed |
@@ -70,9 +70,10 @@ The filter answers:
 - **Stream and seqpacket pairs stay allowed.** `socketpair` with
   `SOCK_STREAM` or `SOCK_SEQPACKET` makes two ends that stay connected to
   each other and reach nothing else, and programs use them for their own
-  pipes. A `SOCK_DGRAM` pair is refused: either end can send to any
-  datagram socket by address, and connect to another. The filter compares
-  the type without `SOCK_CLOEXEC` and `SOCK_NONBLOCK`.
+  pipes. Every other pair is refused. Either end of a `SOCK_DGRAM` pair
+  can send to any datagram socket by address, and connect to another, and
+  the kernel makes a Unix `SOCK_RAW` socket a datagram one. The filter
+  compares the type without `SOCK_CLOEXEC` and `SOCK_NONBLOCK`.
 - **`io_uring`.** `IORING_OP_SOCKET` and `IORING_OP_CONNECT` create and
   connect sockets without the system calls a filter sees. `ENOSYS` is
   what a kernel without `io_uring` answers, and libraries fall back to
@@ -134,7 +135,7 @@ assert the refusal and the absence of the side effect:
 - On Linux 6.6, `socket(AF_UNIX)` itself fails with `EACCES`, and so does
   binding an abstract name. On 7.3, creating one succeeds.
 - A datagram to a pathname socket outside the grants, from a socket of
-  the worker's own and from half of a datagram pair, reaches nothing on
+  the worker's own and from half of a datagram or raw pair, reaches nothing on
   either kernel, and does with `--unconfined`.
 - On Linux 6.6, a datagram pair fails with `EACCES`, and stream and
   seqpacket pairs and a TCP socket still work. `io_uring_setup`,
@@ -203,3 +204,17 @@ open questions answered:
    an x32 build, and aarch64 means little-endian with 64-bit pointers.
    Below Linux 7.1, a confined worker on any other target does not start,
    and the error names `--unconfined`.
+
+## Changes after release
+
+1. **Only stream and seqpacket pairs are allowed.** 0.4.0 refused a
+   `socketpair(AF_UNIX)` only when its type was `SOCK_DGRAM`. The kernel
+   makes a Unix `SOCK_RAW` socket a datagram one (`unix_create` in
+   `net/unix/af_unix.c`), so below Linux 7.1 a confined worker could
+   still make a datagram pair by asking for `SOCK_RAW` and send from it to
+   any datagram socket it could name. The filter now allows a Unix pair
+   only for `SOCK_STREAM` and `SOCK_SEQPACKET`, the two types that stay
+   connected to each other, and refuses every other type, including types
+   a later kernel might add. `a_confined_worker_cannot_reach_a_unix_socket`
+   sends a datagram from half of a raw pair, and unit tests run the
+   filter's instructions on each call it answers.
