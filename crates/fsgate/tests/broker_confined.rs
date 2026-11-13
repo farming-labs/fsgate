@@ -468,7 +468,9 @@ mod kernel {
     /// A confined worker can read OpenSSL's configuration where the system
     /// has it, because Node.js does not start without it (RFC 0008). The
     /// rules name only those files: `/etc/passwd` and a listing of
-    /// `/etc/ssl` stay refused.
+    /// `/etc/ssl` stay refused where they are in `/etc`. In the `nixos/nix`
+    /// image `/etc/passwd` links into `/nix/store`, which the worker may
+    /// read.
     #[test]
     fn a_confined_worker_can_read_openssl_configuration() {
         let present: Vec<&str> = OPENSSL_CONFIGURATION
@@ -498,13 +500,14 @@ mod kernel {
                 panic!("reading `{path}` failed: {err}");
             }
         }
-        if Path::new("/etc/passwd").exists() {
+        let in_etc = |path: &str| fs::canonicalize(path).is_ok_and(|real| real.starts_with("/etc"));
+        if in_etc("/etc/passwd") {
             assert_eq!(
                 fs::read("/etc/passwd").unwrap_err().kind(),
                 ErrorKind::PermissionDenied
             );
         }
-        if Path::new("/etc/ssl").is_dir() {
+        if in_etc("/etc/ssl") && Path::new("/etc/ssl").is_dir() {
             assert_eq!(
                 fs::read_dir("/etc/ssl").unwrap_err().kind(),
                 ErrorKind::PermissionDenied

@@ -388,6 +388,11 @@ Since [#99](https://github.com/farming-labs/fsgate/pull/99), OpenSSL's configura
 start. Like `/etc/ld.so.cache`, it holds no data, so a grant that
 contains it is not refused. The other files above stay opt-in.
 
+A file in `/etc` that links into a runtime directory is readable through
+that directory's rule. In the `nixos/nix` image, `/etc/passwd` links into
+`/nix/store`, so a confined worker there can read it, as it can anything in
+the store since [#83](https://github.com/farming-labs/fsgate/pull/83).
+
 Not measured: a full NixOS system, Guix's `/gnu/store`, Arch on arm64,
 architectures other than x86_64 and arm64, and the programs above on Nix
 and on arm64.
