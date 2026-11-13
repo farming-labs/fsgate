@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- When the broker got `SIGQUIT`, from `Ctrl-\` for example, it died without killing its confined worker's process group, so programs the worker started kept running, confined, after both had exited. The broker now handles `SIGQUIT` like `SIGINT`, `SIGTERM`, and `SIGHUP`: it kills the group, then dies by the signal ([RFC 0010](docs/rfcs/0010-worker-process-group.md#changes-after-release)).
+
 ### Changed
 
 - A confined worker may read OpenSSL's configuration, `/etc/ssl/openssl.cnf` and Fedora's `/etc/pki/tls/openssl3.cnf`, where they exist ([RFC 0008](docs/rfcs/0008-confine-broker-worker.md#programs-that-read-files-in-etc)). Without it, Node.js did not start as a confined worker on Ubuntu, Debian, Fedora, Arch, or Alpine: it exited 13 with `OpenSSL configuration error` unless given `--direct` for the file. Like `/etc/ld.so.cache`, these are single files that hold no data, so a grant that contains one is not refused, and reading them is not audited.

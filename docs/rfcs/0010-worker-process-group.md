@@ -122,7 +122,8 @@ under Changed. A worker that needs that runs with `--unconfined`.
   confined, and keeps the network, its `--direct` paths, and any terminal
   it holds.
 - Anything after `SIGKILL` to the broker, beyond the worker's own death
-  signal.
+  signal. The same holds for another signal that kills the broker without
+  being handled, such as `SIGUSR1` sent with `kill`.
 
 ## Testing
 
@@ -183,3 +184,14 @@ open questions answered:
 1. The broker waits for signals with `sigwait` in the `sys` module of
    `confine.rs`, and adds no dependency.
 2. A broker stopped by a signal dies by that signal.
+
+## Changes after release
+
+1. **`SIGQUIT` too.** 0.4.0 and 0.4.1 handle `SIGINT`, `SIGTERM`, and `SIGHUP`. `Ctrl-\`
+   sends `SIGQUIT`, which reaches only the broker because the worker leads
+   its own session, so the broker died by it without killing the group,
+   and the worker's programs outlived both. The broker now handles
+   `SIGQUIT` the same way, and dies by it as it would have.
+   `stopping_the_broker_ends_a_confined_worker_and_its_programs` sends it
+   too. A signal that only `kill` sends, such as `SIGUSR1`, stays with
+   `SIGKILL` under what this does not stop.

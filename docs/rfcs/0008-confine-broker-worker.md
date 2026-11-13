@@ -151,8 +151,9 @@ Each step closes a specific hole:
   that keeps it: the worker can clear its own death signal, and a program
   the worker starts never has one. [RFC 0010](0010-worker-process-group.md)
   kills the worker's process group when the worker exits or the broker
-  gets `SIGINT`, `SIGTERM`, or `SIGHUP`, which covers those programs
-  unless the broker gets `SIGKILL`.
+  gets `SIGINT`, `SIGTERM`, `SIGHUP`, or `SIGQUIT`, which covers those
+  programs unless the broker gets `SIGKILL` or another signal it does not
+  handle.
 - **Step 5.** Landlock says
   [files opened before the sandboxing are not subject to its restrictions](https://docs.kernel.org/userspace-api/landlock.html),
   so a leaked descriptor is a way out. `close_range` is not wrapped by
