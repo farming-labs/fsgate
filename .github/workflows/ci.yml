@@ -262,13 +262,24 @@ jobs:
   # RFC 0008's default rules for a confined worker, on systems besides the
   # runner's Ubuntu and on the runner's kernel. Each container builds the
   # tests with the system's own toolchain, so they load the way its programs
-  # do, and runs them as the runner's user (.github/distros/).
+  # do, and runs them as the runner's user (.github/distros/). Each system
+  # runs on x86_64 and on arm64, where its loader, libraries, and the socket
+  # filter's syscall numbers differ.
   distros:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
+        runner: [ubuntu-latest, ubuntu-26.04-arm]
+        system: [debian, fedora, arch, alpine, nix]
+        exclude:
+          # The archlinux image is x86_64 only; Arch Linux ARM is a separate
+          # project with no official image.
+          - runner: ubuntu-26.04-arm
+            system: arch
+        # Each pin is a multi-platform index, so the runner pulls its own
+        # architecture's image.
         include:
           - system: debian
             image: debian:13-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2

@@ -23,7 +23,7 @@ else
     # The nixos/nix image has none.
     echo "system: no /etc/os-release"
 fi
-uname -r
+uname -m -r
 rustc --version
 cargo --version
 
