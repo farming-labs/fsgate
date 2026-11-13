@@ -335,6 +335,42 @@ default rules, then with `--direct` for the files it was refused, and with
 `/proc/self/maps`, `/proc/mounts`, `/etc/host.conf`, and a Unix socket,
 which RFC 0009's filter refused.
 
+#### On other systems
+
+A [third run](https://github.com/farming-labs/fsgate/actions/runs/43495976575), from
+`aa45c21` with only the probe added, repeated this as an unprivileged user
+in the Debian 13, Fedora 45, Arch, and Alpine 3.24 containers of the
+`distros` job, with each system's own Node.js, git, curl, and Python, and on
+the runner again. A program that failed ran again with `--direct` for every
+file under `/etc` it was refused, round by round, until it passed. Every
+program passed that way on all five systems, and every unconfined control
+passed. The files a round added are enough but not a minimum, since a round
+adds every refusal, including ones that changed nothing.
+
+Node.js did not start on any of them until its OpenSSL configuration was
+named, and needed nothing else to start:
+
+| System | Node.js | Its OpenSSL configuration |
+|---|---|---|
+| Ubuntu 26.04, the runner image's build | 24.22.2 | `/etc/ssl/openssl.cnf` |
+| Debian 13 | 20.19.2 | `/usr/lib/ssl/openssl.cnf`, a link to `/etc/ssl/openssl.cnf` |
+| Fedora 45 | 22.23.1 | `/etc/pki/tls/openssl3.cnf` |
+| Arch | 26.13.1 | `/etc/ssl/openssl.cnf` |
+| Alpine 3.24 | 24.22.3 | `/etc/ssl/openssl.cnf` |
+
+`getent hosts` added `/etc/resolv.conf`, `/etc/hosts`, and
+`/etc/nsswitch.conf` with glibc, plus `/etc/host.conf`, which the Ubuntu
+runs above showed it does not need, and only `/etc/resolv.conf` and
+`/etc/hosts` with Alpine's musl. curl on Alpine, which resolves names
+through c-ares, also needed `/etc/nsswitch.conf`. Once names resolved,
+curl (now exit 77) and `git ls-remote` still failed on every system until
+the system's CA certificates were named:
+`/etc/ssl/certs/ca-certificates.crt`, or on Fedora
+`/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`. Node's `fetch` needed
+no CA file with the runner's build or Arch's package, and needed one on
+Fedora. The containers have no `/etc/gitconfig`, so `git` failed there only
+on names and certificates.
+
 So the default rules load a program and its libraries, but a program that
 reads its configuration, names, users, or certificates in `/etc` needs
 those files named with `--direct`, and Node.js does not start without one.
@@ -343,5 +379,5 @@ those files named with `--direct`, and Node.js does not start without one.
 broker, because `--direct` gives no write. The defaults are unchanged.
 
 Not measured: a full NixOS system, Guix's `/gnu/store`, Arch on arm64,
-architectures other than x86_64 and arm64, and the programs above on
-systems other than Ubuntu 26.04.
+architectures other than x86_64 and arm64, and the programs above on Nix
+and on arm64.
