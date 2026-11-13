@@ -53,7 +53,10 @@ a second Landlock domain on top.
 - Strict `lock()` keeps working on every kernel where it works today.
 - Callers learn exactly which restrictions took effect, and can require
   any of them.
-- A failed `lock()` changes nothing: not the gate, not the process.
+- A failed `lock()` changes nothing: not the gate, not the process. The one
+  exception: the `landlock` crate sets `no_new_privs` before its last call,
+  `landlock_restrict_self`, so a lock that fails at that call leaves it set.
+  That only stops `exec` from granting privileges.
 
 ## Non-goals
 
