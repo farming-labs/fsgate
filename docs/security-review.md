@@ -14,7 +14,7 @@ fsgate scopes a process's filesystem authority to directories granted up front. 
 
 ## Scope
 
-Review one named commit of `main` and record its full SHA. Use `101a598` or later. That is the latest release, `v0.4.0`, and it has all four of the broker's designs: the worker confinement of [RFC 0008](rfcs/0008-confine-broker-worker.md), the worker's Unix socket filter before Linux 7.1 ([RFC 0009](rfcs/0009-worker-unix-sockets.md)), its process group ([RFC 0010](rfcs/0010-worker-process-group.md)), and the audit of what the broker refuses ([RFC 0011](rfcs/0011-audit-broker-refusals.md)). 0.3.0 has only the first. Read the threat model from the commit under review.
+Review one named commit of `main` and record its full SHA. Use `b5cb02d` or later. That is the latest release, `v0.4.1`, and it has all four of the broker's designs: the worker confinement of [RFC 0008](rfcs/0008-confine-broker-worker.md), the worker's Unix socket filter before Linux 7.1 ([RFC 0009](rfcs/0009-worker-unix-sockets.md)), its process group ([RFC 0010](rfcs/0010-worker-process-group.md)), and the audit of what the broker refuses ([RFC 0011](rfcs/0011-audit-broker-refusals.md)). 0.3.0 has only the first. 0.4.0 has all four, but its socket filter let a raw Unix socket pair through, which 0.4.1 fixes ([#93](https://github.com/farming-labs/fsgate/pull/93)). Read the threat model from the commit under review.
 
 | Area | Code in `crates/fsgate/src/` | Claims |
 |---|---|---|
