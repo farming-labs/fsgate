@@ -87,8 +87,8 @@ broker did not accept. Like
 `AuditEvent::peer_uid: Option<u32>`.
 
 ```json
-{"v":1,"ts":"2026-11-10T12:00:00.000Z","op":"connect","path":null,"grant":null,"rights":null,"restrictions":null,"decision":"deny","reason":"peer_refused","errno":null,"syscall":null,"notification":null,"peer_uid":1001}
-{"v":1,"ts":"2026-11-10T12:00:01.000Z","op":"request","path":null,"grant":null,"rights":null,"restrictions":null,"decision":"deny","reason":"malformed_frame","errno":null,"syscall":null,"notification":null,"peer_uid":1000}
+{"v":1,"ts":"2026-11-10T12:00:00.000Z","op":"connect","path":null,"grant":null,"rights":null,"restrictions":null,"status":null,"decision":"deny","reason":"peer_refused","errno":null,"syscall":null,"notification":null,"peer_uid":1001}
+{"v":1,"ts":"2026-11-10T12:00:01.000Z","op":"request","path":null,"grant":null,"rights":null,"restrictions":null,"status":null,"decision":"deny","reason":"malformed_frame","errno":null,"syscall":null,"notification":null,"peer_uid":1000}
 ```
 
 ### In Rust

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- The `lock` audit event now records what the kernel enforced for the filesystem rules, in a new `status` key (`fully_enforced`, `partially_enforced`, or `library_only`) and the `AuditEvent::status` field. Before, a best-effort lock that the kernel did not enforce was logged `allow` and `ok` with the same fields as an enforced one ([RFC 0002](docs/rfcs/0002-audit-events.md)).
+
 ### Changed
 
 - A confined worker may read OpenSSL's configuration, `/etc/ssl/openssl.cnf` and Fedora's `/etc/pki/tls/openssl3.cnf`, where they exist ([RFC 0008](docs/rfcs/0008-confine-broker-worker.md#programs-that-read-files-in-etc)). Without it, Node.js did not start as a confined worker on Ubuntu, Debian, Fedora, Arch, or Alpine: it exited 13 with `OpenSSL configuration error` unless given `--direct` for the file. Like `/etc/ld.so.cache`, these are single files that hold no data, so a grant that contains one is not refused, and reading them is not audited.
