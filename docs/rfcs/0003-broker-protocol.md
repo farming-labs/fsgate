@@ -42,8 +42,9 @@ Requests carry no descriptors: the first one that arrives fails the
 connection closed, before the rest of the frame is read. Each receive has room for as many descriptors as one message
 can carry (253 on Linux, 254 on macOS), because macOS installs the ones
 that do not fit without reporting them, where nothing could close them.
-A message the kernel reports truncated anyway fails the connection
-closed.
+A message whose descriptors do not fit in the broker's descriptor table
+fails the connection closed, whether the kernel reports it truncated
+(Linux) or fails `recvmsg` with `EMFILE` or `EMSGSIZE` (macOS).
 The client is strictly lockstep: one request, then its response. A client
 that loses a response can no longer match later ones to requests, so it
 fails every later request closed.

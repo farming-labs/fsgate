@@ -817,14 +817,30 @@ fn read_frame(
             rustix::cmsg_space!(ScmRights(MAX_FDS_PER_MESSAGE))
         ];
         let mut ancillary = rustix::net::RecvAncillaryBuffer::new(&mut space);
-        let received = rustix::io::retry_on_intr(|| {
+        let received = match rustix::io::retry_on_intr(|| {
             rustix::net::recvmsg(
                 &*stream,
                 &mut [IoSliceMut::new(&mut buf)],
                 &mut ancillary,
                 RECV_FLAGS,
             )
-        })?;
+        }) {
+            Ok(received) => received,
+            // Where Linux sets `MSG_CTRUNC` (below), macOS fails the call
+            // when the descriptors a message carries do not fit in this
+            // process's table: `EMFILE` when no slot is free, `EMSGSIZE`
+            // when some are. Only attached descriptors cause either, and a
+            // request carries none.
+            Err(rustix::io::Errno::MFILE | rustix::io::Errno::MSGSIZE)
+                if descriptors == Descriptors::Refuse =>
+            {
+                return Err(framing_error(
+                    AuditReason::MalformedFrame,
+                    "peer attached more descriptors than could be received",
+                ));
+            }
+            Err(err) => return Err(err.into()),
+        };
         for message in ancillary.drain() {
             if let rustix::net::RecvAncillaryMessage::ScmRights(received_fds) = message {
                 for fd in received_fds {

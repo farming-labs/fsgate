@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- On macOS, a request that attached more descriptors than the broker's descriptor table could hold ended the connection with no audit event, because macOS fails `recvmsg` where Linux reports the message truncated. The broker now refuses it as it does on Linux, audited as `request` with `malformed_frame` ([RFC 0011](docs/rfcs/0011-audit-broker-refusals.md)).
+
 ### Changed
 
 - A confined worker may read OpenSSL's configuration, `/etc/ssl/openssl.cnf` and Fedora's `/etc/pki/tls/openssl3.cnf`, where they exist ([RFC 0008](docs/rfcs/0008-confine-broker-worker.md#programs-that-read-files-in-etc)). Without it, Node.js did not start as a confined worker on Ubuntu, Debian, Fedora, Arch, or Alpine: it exited 13 with `OpenSSL configuration error` unless given `--direct` for the file. Like `/etc/ld.so.cache`, these are single files that hold no data, so a grant that contains one is not refused, and reading them is not audited.
