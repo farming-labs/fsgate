@@ -655,6 +655,115 @@ mod unix_socket_filter {
                 k,
             }
         }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use libc::{AF_INET, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_RAW, SOCK_RDM};
+            use libc::{SOCK_SEQPACKET, SOCK_STREAM};
+
+            const REFUSED: u32 = SECCOMP_RET_ERRNO | EACCES as u32;
+
+            /// What the filter answers for a call, found by running it on
+            /// `struct seccomp_data` as the kernel does. Only the
+            /// instructions the filter is built from are known here.
+            fn answer_for(arch: u32, nr: u32, args: [u64; 2]) -> u32 {
+                let mut data = [0u8; 64];
+                data[..4].copy_from_slice(&nr.to_le_bytes());
+                data[4..8].copy_from_slice(&arch.to_le_bytes());
+                data[16..24].copy_from_slice(&args[0].to_le_bytes());
+                data[24..32].copy_from_slice(&args[1].to_le_bytes());
+                let (mut loaded, mut at) = (0u32, 0);
+                loop {
+                    let step = PROGRAM[at];
+                    at += 1;
+                    match u32::from(step.code) {
+                        code if code == BPF_LD | BPF_W | BPF_ABS => {
+                            let offset = step.k as usize;
+                            let word = data[offset..offset + 4].try_into().unwrap();
+                            loaded = u32::from_le_bytes(word);
+                        }
+                        code if code == BPF_ALU | BPF_AND | BPF_K => loaded &= step.k,
+                        code if code == BPF_JMP | BPF_JEQ | BPF_K
+                            || code == BPF_JMP | BPF_JGE | BPF_K =>
+                        {
+                            let holds = if code & 0xf0 == BPF_JEQ {
+                                loaded == step.k
+                            } else {
+                                loaded >= step.k
+                            };
+                            at += usize::from(if holds { step.jt } else { step.jf });
+                        }
+                        code if code == BPF_RET | BPF_K => return step.k,
+                        code => panic!(
+                            "step {} has code {code:#x}, which this does not run",
+                            at - 1
+                        ),
+                    }
+                }
+            }
+
+            fn call(nr: libc::c_long, domain: libc::c_int, kind: libc::c_int) -> u32 {
+                answer_for(AUDIT_ARCH, number(nr), [domain as u64, kind as u64])
+            }
+
+            #[test]
+            fn refuses_every_unix_socket_but_a_stream_or_seqpacket_pair() {
+                let flags = SOCK_CLOEXEC | SOCK_NONBLOCK;
+                for kind in [SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET, SOCK_RAW, SOCK_RDM] {
+                    assert_eq!(
+                        call(SYS_socket, AF_UNIX, kind | flags),
+                        REFUSED,
+                        "socket {kind}"
+                    );
+                }
+                for (kind, answer) in [
+                    (SOCK_STREAM, SECCOMP_RET_ALLOW),
+                    (SOCK_SEQPACKET, SECCOMP_RET_ALLOW),
+                    (SOCK_DGRAM, REFUSED),
+                    // The kernel makes a Unix `SOCK_RAW` socket a datagram one.
+                    (SOCK_RAW, REFUSED),
+                    (SOCK_RDM, REFUSED),
+                ] {
+                    assert_eq!(
+                        call(SYS_socketpair, AF_UNIX, kind | flags),
+                        answer,
+                        "pair {kind}"
+                    );
+                }
+                // The kernel reads these arguments as `int`, as the filter does.
+                let high = 1u64 << 32;
+                let pair = |domain: u64, kind: u64| {
+                    answer_for(AUDIT_ARCH, number(SYS_socketpair), [domain, kind])
+                };
+                assert_eq!(pair(high | AF_UNIX as u64, SOCK_DGRAM as u64), REFUSED);
+                assert_eq!(pair(AF_UNIX as u64, high | SOCK_RAW as u64), REFUSED);
+            }
+
+            #[test]
+            fn allows_other_calls_and_kills_foreign_ones() {
+                assert_eq!(call(SYS_socket, AF_INET, SOCK_STREAM), SECCOMP_RET_ALLOW);
+                assert_eq!(call(SYS_socket, AF_INET, SOCK_RAW), SECCOMP_RET_ALLOW);
+                assert_eq!(call(libc::SYS_openat, 0, 0), SECCOMP_RET_ALLOW);
+                for nr in [
+                    SYS_io_uring_setup,
+                    SYS_io_uring_enter,
+                    SYS_io_uring_register,
+                ] {
+                    assert_eq!(call(nr, 0, 0), SECCOMP_RET_ERRNO | ENOSYS as u32, "{nr}");
+                }
+                let socket = number(SYS_socket);
+                assert_eq!(
+                    answer_for(AUDIT_ARCH, X32_SYSCALL_BIT | socket, [0, 0]),
+                    SECCOMP_RET_KILL_PROCESS
+                );
+                // `AUDIT_ARCH_I386`, a 32-bit call on either architecture.
+                assert_eq!(
+                    answer_for(0x4000_0003, socket, [0, 0]),
+                    SECCOMP_RET_KILL_PROCESS
+                );
+            }
+        }
     }
 }
 
