@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.4.1 (unreleased)
+## 0.4.1 (2026-11-13)
 
-Not independently reviewed. Upgrade from 0.4.0 for the fix below: before Linux 7.1, a confined worker could still send datagrams to Unix sockets outside its confinement. Nothing else changes, so this is a patch release. Everything behind the `experimental-intercept` feature is not part of this release: it builds only from the repository, and the published crate refuses the feature with a compile error.
+[`fsgate` 0.4.1](https://crates.io/crates/fsgate/0.4.1), built from the signed tag [`v0.4.1`](https://github.com/farming-labs/fsgate/tree/v0.4.1) on `b5cb02d`. Not independently reviewed. Upgrade from 0.4.0 for the fix below: before Linux 7.1, a confined worker could still send datagrams to Unix sockets outside its confinement. Nothing else changes, so this is a patch release. Everything behind the `experimental-intercept` feature is not part of this release: it builds only from the repository, and the published crate refuses the feature with a compile error.
 
 ### Fixed
 
