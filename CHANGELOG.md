@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.4.1 (unreleased)
+
+Not independently reviewed. Upgrade from 0.4.0 for the fix below: before Linux 7.1, a confined worker could still send datagrams to Unix sockets outside its confinement. Nothing else changes, so this is a patch release. Everything behind the `experimental-intercept` feature is not part of this release: it builds only from the repository, and the published crate refuses the feature with a compile error.
 
 ### Fixed
 

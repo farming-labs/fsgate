@@ -35,7 +35,7 @@ These are not vulnerabilities on their own:
 
 | Version | Security fixes |
 |---|---|
-| The latest minor release on crates.io (0.2.x) | Yes |
+| The latest minor release on crates.io (0.4.x) | Yes |
 | Older releases | No. Upgrade to the latest release. |
 | Builds with `experimental-intercept` | No. The feature is experimental, unreviewed, and in no release. |
 
