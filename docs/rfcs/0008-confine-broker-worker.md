@@ -308,6 +308,40 @@ one in `/nix/store` on Nix, so the default directories cover them. Each
 system passed 46 tests, the x86_64 set less the x32 call, which exists
 only on x86_64.
 
+### Programs that read files in `/etc`
+
+Two probe runs ([first](https://github.com/farming-labs/fsgate/actions/runs/43361464148),
+[second](https://github.com/farming-labs/fsgate/actions/runs/43470752361)) started
+common programs as a confined worker on CI's Ubuntu 26.04 (Linux 7.0),
+from `834b4b7` with only the probe added. Each ran under `strace` with the
+default rules, then with `--direct` for the files it was refused, and with
+`--unconfined` as a control, which passed every time:
+
+| Program | Default rules | Passes with `--direct` |
+|---|---|---|
+| `sh -c`, `date` | pass | |
+| Node.js 24.22 (`node -e`) | does not start, exit 13: its OpenSSL cannot read `/etc/ssl/openssl.cnf` | `/etc/ssl/openssl.cnf:r` |
+| Node's `fetch` over HTTPS | does not start, as above | `/etc/ssl/openssl.cnf:r`, `/etc/resolv.conf:r`, `/etc/hosts:r`, `/etc/nsswitch.conf:r` |
+| `getent hosts` | exit 2, no address | `/etc/resolv.conf:r`, `/etc/hosts:r`, `/etc/nsswitch.conf:r` |
+| curl and Python's `urllib` over HTTPS | curl: exit 6, cannot resolve the name; Python: exit 1 | the same three, and `/etc/ssl:rl` |
+| `git --version` | passes, warning that `/etc/gitconfig` is unreadable | |
+| `git ls-remote` over HTTPS | exit 128: `/etc/gitconfig` cannot be read | `/etc/gitconfig:r`, the three name files, and `/etc/ssl:rl` |
+| `id -un` | exit 1, no name for the user ID | `/etc/passwd:r`, `/etc/group:r`, `/etc/nsswitch.conf:r` |
+| `mktemp` and Python's `tempfile` | exit 1, no directory to create a file in | none |
+| `grep -c . /proc/self/status` | exit 2 | `/proc:r` |
+
+`/etc/localtime` links into `/usr/share/zoneinfo`, which `/usr` covers, so
+`date` keeps its time zone. Some refusals changed nothing:
+`/proc/self/maps`, `/proc/mounts`, `/etc/host.conf`, and a Unix socket,
+which RFC 0009's filter refused.
+
+So the default rules load a program and its libraries, but a program that
+reads its configuration, names, users, or certificates in `/etc` needs
+those files named with `--direct`, and Node.js does not start without one.
+`--direct` opens are not audited, so name single files rather than all of
+`/etc`. A program that needs a temporary file must create it through the
+broker, because `--direct` gives no write. The defaults are unchanged.
+
 Not measured: a full NixOS system, Guix's `/gnu/store`, Arch on arm64,
-architectures other than x86_64 and arm64, and programs that need files
-outside these directories to start, such as locale or timezone data.
+architectures other than x86_64 and arm64, and the programs above on
+systems other than Ubuntu 26.04.
