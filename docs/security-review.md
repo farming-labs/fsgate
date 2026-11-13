@@ -14,14 +14,14 @@ fsgate scopes a process's filesystem authority to directories granted up front. 
 
 ## Scope
 
-Review one named commit of `main` and record its full SHA. Use `6070452` or later, which has the final broker, including the worker confinement of [RFC 0008](rfcs/0008-confine-broker-worker.md). The latest release, `v0.2.0` on `aee17a7`, does not have that confinement. Read the threat model from the commit under review.
+Review one named commit of `main` and record its full SHA. Use `101a598` or later. That is the latest release, `v0.4.0`, and it has all four of the broker's designs: the worker confinement of [RFC 0008](rfcs/0008-confine-broker-worker.md), the worker's Unix socket filter before Linux 7.1 ([RFC 0009](rfcs/0009-worker-unix-sockets.md)), its process group ([RFC 0010](rfcs/0010-worker-process-group.md)), and the audit of what the broker refuses ([RFC 0011](rfcs/0011-audit-broker-refusals.md)). 0.3.0 has only the first. Read the threat model from the commit under review.
 
 | Area | Code in `crates/fsgate/src/` | Claims |
 |---|---|---|
 | Handle layer | `lib.rs` | [Threat model 1](threat-model.md#1-the-gate-before-lock), [RFC 0001](rfcs/0001-core-design.md) |
 | Containment, including the M8 restrictions | `containment.rs` | [Threat model 2](threat-model.md#2-the-locked-process-linux), [RFC 0006](rfcs/0006-lock-restrictions.md) |
-| Broker, including its confined worker | `broker.rs`, `broker_sys.rs`, `bin/fsgate-broker.rs`, `bin/fsgate-broker/args.rs`, `bin/fsgate-broker/confine.rs` | [Threat model 3](threat-model.md#3-the-broker-and-its-worker), [RFC 0003](rfcs/0003-broker-protocol.md), [RFC 0007](rfcs/0007-broker-peers.md), [RFC 0008](rfcs/0008-confine-broker-worker.md) |
-| Audit sink | `audit.rs` | [Threat model, audit](threat-model.md#audit-is-observation-not-a-boundary), [RFC 0002](rfcs/0002-audit-events.md) |
+| Broker, including its confined worker | `broker.rs`, `broker_sys.rs`, `bin/fsgate-broker.rs`, `bin/fsgate-broker/args.rs`, `bin/fsgate-broker/confine.rs` | [Threat model 3](threat-model.md#3-the-broker-and-its-worker), [RFC 0003](rfcs/0003-broker-protocol.md), [RFC 0007](rfcs/0007-broker-peers.md), [RFC 0008](rfcs/0008-confine-broker-worker.md), [RFC 0009](rfcs/0009-worker-unix-sockets.md), [RFC 0010](rfcs/0010-worker-process-group.md) |
+| Audit sink | `audit.rs` | [Threat model, audit](threat-model.md#audit-is-observation-not-a-boundary), [RFC 0002](rfcs/0002-audit-events.md), [RFC 0011](rfcs/0011-audit-broker-refusals.md) |
 
 Out of scope:
 
@@ -36,7 +36,7 @@ The project's own tests and fuzzing cover the attacks the threat model lists. Th
 - **The gate and the kernel disagreeing.** `containment.rs` builds Landlock rules from the held descriptors. Landlock allows an access when any rule allows it, so the kernel does not enforce a nested grant's lesser rights. Look for other places the two differ.
 - **What `lock()` reports.** `Gate::restrictions`, `LockStatus`, and the `lock` audit event have to match what the kernel applied, including on kernels that lack a restriction.
 - **Descriptors crossing the broker.** `read_frame` handles `SCM_RIGHTS` from a hostile worker. macOS and Linux treat descriptors that do not fit differently, and macOS sets close-on-exec only after `recvmsg`.
-- **The confined worker.** `confine.rs` takes authority away in a fresh process before `exec`, so the order of steps and the failure paths matter. No path should reach `exec` without the ruleset, and the grants should never become worker rules. Two of its tests are indirect, and its default paths have been measured only on Ubuntu 26.04; M9 records both.
+- **The confined worker.** `confine.rs` takes authority away in a fresh process before `exec`, so the order of steps and the failure paths matter. No path should reach `exec` without the ruleset, and the grants should never become worker rules. Before Linux 7.1, a seccomp filter written as raw BPF in its `unix_socket_filter` module stands in for Landlock's Unix socket rules ([RFC 0009](rfcs/0009-worker-unix-sockets.md)): no call on x86_64 or aarch64 should give the worker a Unix socket it can point at a new peer, and a call through another architecture's table should kill it. The broker kills the worker's process group while the worker is still an unreaped zombie, so that no new process can take the group's ID first ([RFC 0010](rfcs/0010-worker-process-group.md)). Two of its tests are indirect, as M9 records. Its default paths have been tested on Ubuntu 26.04 and, since M10, in Debian, Fedora, Arch, Alpine (musl), and Nix containers on Linux 7.0, on x86_64 and, except Arch, on arm64.
 - **The `unsafe`.** A release build has it in two places: `broker_sys.rs` and the `sys` module of `confine.rs`. Each states its safety contract. The descriptor number `broker_sys.rs` adopts comes from `FSGATE_BROKER_FD`.
 - **Who reaches the broker.** The peer check and connection limit in `Broker::serve_with`, the order of steps in `bind_owner_only`, and `BrokerGate::from_inherited`.
 - **Audit completeness.** Every decision through a gate or a broker should emit exactly one event. Look for a path that emits none, or two.
