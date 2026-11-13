@@ -1,6 +1,6 @@
 # RFC 0008: confine the worker `fsgate-broker` starts
 
-- Status: accepted and implemented in [#51](https://github.com/farming-labs/fsgate/pull/51); the open question was answered, and `/nix/store` added, in [#83](https://github.com/farming-labs/fsgate/pull/83)
+- Status: accepted and implemented in [#51](https://github.com/farming-labs/fsgate/pull/51); the open question was answered, and `/nix/store` added, in [#83](https://github.com/farming-labs/fsgate/pull/83); OpenSSL's configuration added in [#99](https://github.com/farming-labs/fsgate/pull/99)
 - Date: 2026-11-09
 - Roadmap: [M9](../../ROADMAP.md#m9--review-readiness-and-020)
 - Builds on: [RFC 0003](0003-broker-protocol.md) (broker protocol), [RFC 0004](0004-filesystem-interception.md) (the launcher's worker profile), [RFC 0006](0006-lock-restrictions.md) (restrictions at `lock()`), [RFC 0007](0007-broker-peers.md) (the inherited connection), the [threat model](../threat-model.md#3-the-broker-and-its-worker)
@@ -82,7 +82,7 @@ handles and allows only:
 | Path | Allowed |
 |---|---|
 | `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/nix/store` | read, list, execute |
-| `/etc/ld.so.cache` | read |
+| `/etc/ld.so.cache`, `/etc/ssl/openssl.cnf`, `/etc/pki/tls/openssl3.cnf` | read |
 | `/dev/null` | read, write |
 | `/dev/urandom` | read |
 | the command's own image | read, execute |
@@ -268,6 +268,11 @@ Accepted by the maintainer, with these answers:
    states what is true there.
 3. `/nix/store` is a runtime directory, which answers the
    [open question](#open-question) below.
+4. OpenSSL's configuration, `/etc/ssl/openssl.cnf` and Fedora's
+   `/etc/pki/tls/openssl3.cnf`, is a runtime file the worker may read,
+   because Node.js does not start without it
+   ([below](#programs-that-read-files-in-etc)). Other files in `/etc` stay
+   opt-in with `--direct`.
 
 ## Open question
 
@@ -376,7 +381,17 @@ reads its configuration, names, users, or certificates in `/etc` needs
 those files named with `--direct`, and Node.js does not start without one.
 `--direct` opens are not audited, so name single files rather than all of
 `/etc`. A program that needs a temporary file must create it through the
-broker, because `--direct` gives no write. The defaults are unchanged.
+broker, because `--direct` gives no write.
+
+Since [#99](https://github.com/farming-labs/fsgate/pull/99), OpenSSL's configuration is a default runtime file
+([decision 4](#decisions)): the one file each Node.js above needed to
+start. Like `/etc/ld.so.cache`, it holds no data, so a grant that
+contains it is not refused. The other files above stay opt-in.
+
+A file in `/etc` that links into a runtime directory is readable through
+that directory's rule. In the `nixos/nix` image, `/etc/passwd` links into
+`/nix/store`, so a confined worker there can read it, as it can anything in
+the store since [#83](https://github.com/farming-labs/fsgate/pull/83).
 
 Not measured: a full NixOS system, Guix's `/gnu/store`, Arch on arm64,
 architectures other than x86_64 and arm64, and the programs above on Nix

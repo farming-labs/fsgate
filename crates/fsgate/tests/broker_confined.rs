@@ -252,7 +252,7 @@ mod kernel {
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::net::{SocketAddr, UnixDatagram, UnixListener, UnixStream};
     use std::os::unix::process::parent_id;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::{Child, ChildStderr, Command, Stdio};
     use std::sync::mpsc;
     use std::time::Duration;
@@ -459,6 +459,60 @@ mod kernel {
                 .kind(),
             ErrorKind::PermissionDenied
         );
+    }
+
+    /// OpenSSL's configuration on Debian and its derivatives, Arch, and
+    /// Alpine, and on Fedora.
+    const OPENSSL_CONFIGURATION: [&str; 2] = ["/etc/ssl/openssl.cnf", "/etc/pki/tls/openssl3.cnf"];
+
+    /// A confined worker can read OpenSSL's configuration where the system
+    /// has it, because Node.js does not start without it (RFC 0008). The
+    /// rules name only those files: `/etc/passwd` and a listing of
+    /// `/etc/ssl` stay refused where they are in `/etc`. In the `nixos/nix`
+    /// image `/etc/passwd` links into `/nix/store`, which the worker may
+    /// read.
+    #[test]
+    fn a_confined_worker_can_read_openssl_configuration() {
+        let present: Vec<&str> = OPENSSL_CONFIGURATION
+            .into_iter()
+            .filter(|path| Path::new(path).exists())
+            .collect();
+        let fixture = fixture();
+        let output = broker(
+            &fixture,
+            &confined(&["FSGATE_PRESENT"]),
+            "kernel::openssl_scenario",
+        )
+        .env("FSGATE_PRESENT", present.join(":"))
+        .output()
+        .expect("run fsgate-broker");
+        assert_ran(&output);
+    }
+
+    #[test]
+    fn openssl_scenario() {
+        if !in_child("kernel::openssl_scenario") {
+            return;
+        }
+        let present = env::var("FSGATE_PRESENT").unwrap();
+        for path in present.split(':').filter(|path| !path.is_empty()) {
+            if let Err(err) = fs::read(path) {
+                panic!("reading `{path}` failed: {err}");
+            }
+        }
+        let in_etc = |path: &str| fs::canonicalize(path).is_ok_and(|real| real.starts_with("/etc"));
+        if in_etc("/etc/passwd") {
+            assert_eq!(
+                fs::read("/etc/passwd").unwrap_err().kind(),
+                ErrorKind::PermissionDenied
+            );
+        }
+        if in_etc("/etc/ssl") && Path::new("/etc/ssl").is_dir() {
+            assert_eq!(
+                fs::read_dir("/etc/ssl").unwrap_err().kind(),
+                ErrorKind::PermissionDenied
+            );
+        }
     }
 
     /// A descriptor the broker's parent left open would outlive the sandbox,

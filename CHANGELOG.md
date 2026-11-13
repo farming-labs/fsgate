@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- A confined worker may read OpenSSL's configuration, `/etc/ssl/openssl.cnf` and Fedora's `/etc/pki/tls/openssl3.cnf`, where they exist ([RFC 0008](docs/rfcs/0008-confine-broker-worker.md#programs-that-read-files-in-etc)). Without it, Node.js did not start as a confined worker on Ubuntu, Debian, Fedora, Arch, or Alpine: it exited 13 with `OpenSSL configuration error` unless given `--direct` for the file. Like `/etc/ld.so.cache`, these are single files that hold no data, so a grant that contains one is not refused, and reading them is not audited.
+
 ## 0.4.1 (2026-11-13)
 
 [`fsgate` 0.4.1](https://crates.io/crates/fsgate/0.4.1), built from the signed tag [`v0.4.1`](https://github.com/farming-labs/fsgate/tree/v0.4.1) on `b5cb02d`. Not independently reviewed. Upgrade from 0.4.0 for the fix below: before Linux 7.1, a confined worker could still send datagrams to Unix sockets outside its confinement. Nothing else changes, so this is a patch release. Everything behind the `experimental-intercept` feature is not part of this release: it builds only from the repository, and the published crate refuses the feature with a compile error.
