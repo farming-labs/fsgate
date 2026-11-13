@@ -37,6 +37,17 @@ pub(super) const ENTRY: &str = "--confined-exec";
 /// `/nix/store`.
 const RUNTIME_DIRS: [&str; 6] = ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/nix/store"];
 
+/// Files an ordinary program reads as it starts, which hold no data and the
+/// worker may only read: the dynamic loader's cache, and OpenSSL's
+/// configuration, without which Node.js does not start. Debian and its
+/// derivatives, Arch, and Alpine keep that in `/etc/ssl`, and Fedora in
+/// `/etc/pki/tls`. One that does not exist is skipped.
+const RUNTIME_FILES: [&str; 3] = [
+    "/etc/ld.so.cache",
+    "/etc/ssl/openssl.cnf",
+    "/etc/pki/tls/openssl3.cnf",
+];
+
 /// Signals that stop the broker. Before it dies of one, the broker ends its
 /// confined worker's process group (RFC 0010).
 const STOP_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
@@ -366,11 +377,9 @@ fn restrict(image: &Path, direct: &[String]) -> Result<LandlockStatus, String> {
     for dir in RUNTIME_DIRS {
         ruleset = allow_if_present(ruleset, Path::new(dir), runtime)?;
     }
-    ruleset = allow_if_present(
-        ruleset,
-        Path::new("/etc/ld.so.cache"),
-        AccessFs::ReadFile.into(),
-    )?;
+    for file in RUNTIME_FILES {
+        ruleset = allow_if_present(ruleset, Path::new(file), AccessFs::ReadFile.into())?;
+    }
     ruleset = allow_if_present(
         ruleset,
         Path::new("/dev/null"),
