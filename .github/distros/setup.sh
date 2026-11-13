@@ -26,7 +26,7 @@ arch)
     ;;
 alpine)
     # Alpine's own rustc links against musl dynamically, through
-    # /lib/ld-musl-x86_64.so.1. The musl target from rustup links statically
+    # /lib/ld-musl-<arch>.so.1. The musl target from rustup links statically
     # instead, which would not test the loader.
     apk add --no-cache cargo gcc musl-dev rust
     ;;

@@ -283,6 +283,7 @@ Started. Today each attack in the threat model has a test written for it, and on
   - Debian 13 (rustc 1.85.1), Fedora 45 (1.99.1), Arch (1.99.1), and Alpine 3.24 with musl (1.96.1) passed all 47 under the old defaults ([CI](https://github.com/farming-labs/fsgate/actions/runs/43162403028) on `112acfe`). Their loaders are `/lib64/ld-linux-x86-64.so.2`, or `/lib/ld-musl-x86_64.so.1` on Alpine.
   - The `nixos/nix` image (nixpkgs `nixos-26.05`, rustc 1.95.0) has NixOS's layout, with every program, loader, and library in `/nix/store`. In the same run, 18 tests failed: the worker could not start, with `EACCES`.
   - [RFC 0008](docs/rfcs/0008-confine-broker-worker.md#answer) now lists `/nix/store` as a runtime directory, and all five pass 47 ([CI](https://github.com/farming-labs/fsgate/actions/runs/43162855571) on `5eb744b`). The README, the threat model, and the changelog list it too.
+  - On arm64, Debian, Fedora, Alpine, and Nix pass 46 tests, the x86_64 set less the x32 call, which exists only on x86_64 ([CI](https://github.com/farming-labs/fsgate/actions/runs/43351148004) on `e1f4a4e`, [#92](https://github.com/farming-labs/fsgate/pull/92)). Their loaders are `/lib/ld-linux-aarch64.so.1`, `/lib/ld-musl-aarch64.so.1` on Alpine, and one in `/nix/store` on Nix, so the default rules needed no change. Arch publishes no arm64 image.
 
   Not run: a full NixOS system, Guix, and arm64 containers. Arch packages are not pinned, so its toolchain is whatever is current when the job runs.
 

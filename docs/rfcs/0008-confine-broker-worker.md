@@ -223,7 +223,7 @@ the denial and the absence of the side effect:
 - The test binaries are dynamically linked, so passing shows the default
   list is enough on the CI systems. CI's `distros` job runs these tests in
   Debian, Fedora, Arch, Alpine, and Nix containers too, each built with
-  the system's own toolchain.
+  the system's own toolchain, on x86_64 and, except Arch, on arm64.
 - On macOS and on the kernel booted with `lsm=capability`, the broker
   exits 1 without `--unconfined` and the worker's marker is absent.
 - A descriptor left open by the parent is closed in the worker.
@@ -300,6 +300,14 @@ Nix user must know to pass. It holds build outputs, which every local user
 can already read, and a grant that overlaps it is refused like one that
 overlaps `/usr`.
 
-Not measured: a full NixOS system, Guix's `/gnu/store`, architectures
-other than x86_64, and programs that need files outside these directories
-to start, such as locale or timezone data.
+[#92](https://github.com/farming-labs/fsgate/pull/92) ran the same tests
+on arm64, in the Debian, Fedora, Alpine, and Nix containers on Linux 7.0.
+Arch publishes no arm64 image. The loaders are
+`/lib/ld-linux-aarch64.so.1`, `/lib/ld-musl-aarch64.so.1` on Alpine, and
+one in `/nix/store` on Nix, so the default directories cover them. Each
+system passed 46 tests, the x86_64 set less the x32 call, which exists
+only on x86_64.
+
+Not measured: a full NixOS system, Guix's `/gnu/store`, Arch on arm64,
+architectures other than x86_64 and arm64, and programs that need files
+outside these directories to start, such as locale or timezone data.
