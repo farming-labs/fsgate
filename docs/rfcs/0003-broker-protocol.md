@@ -44,7 +44,8 @@ can carry (253 on Linux, 254 on macOS), because macOS installs the ones
 that do not fit without reporting them, where nothing could close them.
 A message whose descriptors do not fit in the broker's descriptor table
 fails the connection closed, whether the kernel reports it truncated
-(Linux) or fails `recvmsg` with `EMFILE` or `EMSGSIZE` (macOS).
+(Linux), fails `recvmsg` with `EMFILE` or `EMSGSIZE`, or delivers only
+the descriptors that fit (both seen on macOS).
 The client is strictly lockstep: one request, then its response. A client
 that loses a response can no longer match later ones to requests, so it
 fails every later request closed.

@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- On macOS, a request that attached more descriptors than the broker's descriptor table could hold ended the connection with no audit event, because macOS fails `recvmsg` where Linux reports the message truncated. The broker now refuses it as it does on Linux, audited as `request` with `malformed_frame` ([RFC 0011](docs/rfcs/0011-audit-broker-refusals.md)).
+- On macOS, a request that attached more descriptors than the broker's descriptor table could hold ended the connection with no audit event, because macOS can fail `recvmsg` with `EMFILE` or `EMSGSIZE` where Linux reports the message truncated. The broker now refuses it as it does on Linux, audited as `request` with `malformed_frame` ([RFC 0011](docs/rfcs/0011-audit-broker-refusals.md)).
 
 ### Changed
 

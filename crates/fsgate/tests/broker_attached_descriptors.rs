@@ -141,10 +141,11 @@ fn the_first_descriptor_ends_a_request_split_across_messages() {
 
 /// With its descriptor table full, or too full for every descriptor a
 /// request carries, the broker cannot receive them. Linux reports the
-/// message truncated; macOS fails `recvmsg`, with `EMFILE` when no slot is
-/// free and `EMSGSIZE` when some are. Either way the broker fails the
-/// connection closed instead of serving a message it could not fully
-/// receive, and audits that once (RFC 0011).
+/// message truncated. macOS fails `recvmsg` with `EMFILE` or `EMSGSIZE`,
+/// or delivers only the descriptors that fit, which the broker refuses
+/// like any other. Either way it fails the connection closed instead of
+/// serving the request, audits that once (RFC 0011), and leaves none of
+/// the descriptors open.
 #[test]
 fn a_request_whose_descriptors_cannot_be_received_fails_the_connection_closed() {
     use fsgate::{AuditDecision, AuditEvent, AuditOp, AuditReason, AuditSink};
@@ -200,8 +201,9 @@ fn a_request_whose_descriptors_cannot_be_received_fails_the_connection_closed() 
 
         let err = result.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData, "room {room}: {err}");
+        let message = err.to_string();
         assert!(
-            err.to_string().contains("could be received"),
+            message.contains("could be received") || message.contains("requests carry none"),
             "room {room}: {err}"
         );
         let events = sink.0.lock().unwrap().clone();

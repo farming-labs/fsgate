@@ -826,11 +826,10 @@ fn read_frame(
             )
         }) {
             Ok(received) => received,
-            // Where Linux sets `MSG_CTRUNC` (below), macOS fails the call
-            // when the descriptors a message carries do not fit in this
-            // process's table: `EMFILE` when no slot is free, `EMSGSIZE`
-            // when some are. Only attached descriptors cause either, and a
-            // request carries none.
+            // Where Linux sets `MSG_CTRUNC` (below), macOS can fail the call
+            // with `EMFILE` or `EMSGSIZE` when the descriptors a message
+            // carries do not fit in this process's table. Only attached
+            // descriptors cause either, and a request carries none.
             Err(rustix::io::Errno::MFILE | rustix::io::Errno::MSGSIZE)
                 if descriptors == Descriptors::Refuse =>
             {
