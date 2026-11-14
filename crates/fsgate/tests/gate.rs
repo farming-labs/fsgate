@@ -4,8 +4,8 @@
 //! against the real filesystem.
 
 use std::fs;
-use std::io::Read;
-use std::path::PathBuf;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 
 use fsgate::{Gate, GateError, Rights};
 use tempfile::TempDir;
@@ -342,6 +342,214 @@ fn longest_grant_wins_routing() {
     ));
 }
 
+/// Asserts that `err` refuses a grant for `inner_path` holding `inner`
+/// within one for `outer_path` holding `outer`.
+fn assert_nested(
+    err: GateError,
+    inner_path: &Path,
+    inner: Rights,
+    outer_path: &Path,
+    outer: Rights,
+) {
+    match err {
+        GateError::NestedGrant {
+            inner_path: got_inner_path,
+            inner: got_inner,
+            outer_path: got_outer_path,
+            outer: got_outer,
+        } => {
+            assert_eq!(
+                (got_inner_path.as_path(), got_inner),
+                (inner_path, inner),
+                "inner grant"
+            );
+            assert_eq!(
+                (got_outer_path.as_path(), got_outer),
+                (outer_path, outer),
+                "outer grant"
+            );
+        }
+        other => panic!("expected NestedGrant, got {other:?}"),
+    }
+}
+
+/// The policy "the project read-write, `.git` read-only" cannot be held: a
+/// symlink in the project into `.git`, or `.GIT` on a case-insensitive
+/// filesystem, routes to the project's grant and lands in `.git` with its
+/// rights. So the read-only grant is refused (RFC 0012), and the project's
+/// grant still answers for `.git`, as it would through those routes.
+#[test]
+fn a_nested_grant_with_fewer_rights_is_refused() {
+    let (_root, granted, _) = setup();
+    let git = granted.join(".git");
+    fs::create_dir(&git).unwrap();
+    let all = Rights::READ | Rights::WRITE | Rights::CREATE | Rights::LIST;
+    let mut gate = Gate::new();
+    gate.grant(&granted, all).unwrap();
+
+    let err = gate.grant(&git, Rights::READ).unwrap_err();
+    assert_nested(err, &git, Rights::READ, &granted, all);
+    // A nested grant lacking only one of the outer grant's rights is refused
+    // too.
+    let err = gate
+        .grant(&git, Rights::READ | Rights::WRITE | Rights::CREATE)
+        .unwrap_err();
+    assert_nested(
+        err,
+        &git,
+        Rights::READ | Rights::WRITE | Rights::CREATE,
+        &granted,
+        all,
+    );
+
+    // No grant was added: a create in `.git` routes to the outer grant.
+    gate.create(git.join("hook")).unwrap();
+    assert!(git.join("hook").exists());
+}
+
+/// The same pair granted the other way round: the outer grant comes second.
+#[test]
+fn a_grant_around_a_grant_with_fewer_rights_is_refused() {
+    let (_root, granted, _) = setup();
+    let sub = granted.join("sub");
+    fs::create_dir(&sub).unwrap();
+    let mut gate = Gate::new();
+    gate.grant(&sub, Rights::READ).unwrap();
+
+    let err = gate
+        .grant(&granted, Rights::READ | Rights::WRITE | Rights::CREATE)
+        .unwrap_err();
+    assert_nested(
+        err,
+        &sub,
+        Rights::READ,
+        &granted,
+        Rights::READ | Rights::WRITE | Rights::CREATE,
+    );
+
+    // No grant covers `granted` itself, and nothing was created in `sub`.
+    assert!(matches!(
+        gate.create(granted.join("new.txt")),
+        Err(GateError::NoGrant { .. })
+    ));
+    assert!(matches!(
+        gate.create(sub.join("new.txt")),
+        Err(GateError::RightsExceeded { .. })
+    ));
+    assert!(!granted.join("new.txt").exists());
+    assert!(!sub.join("new.txt").exists());
+}
+
+/// Nesting is read from the directories, not their names: a grant named
+/// through a symlink to a subdirectory of another grant is nested in it.
+#[test]
+fn a_nested_grant_named_through_a_symlink_is_refused() {
+    let (root, granted, _) = setup();
+    let git = granted.join(".git");
+    fs::create_dir(&git).unwrap();
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink(&git, &alias).unwrap();
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::READ | Rights::WRITE).unwrap();
+
+    let err = gate.grant(&alias, Rights::READ).unwrap_err();
+    assert_nested(
+        err,
+        &alias,
+        Rights::READ,
+        &granted,
+        Rights::READ | Rights::WRITE,
+    );
+}
+
+/// On a case-insensitive filesystem, as macOS uses by default, another case
+/// names the same directory, and the grant is refused. On a case-sensitive
+/// one the name does not exist.
+#[test]
+fn a_nested_grant_spelled_in_another_case_is_refused_or_missing() {
+    let (root, _, _) = setup();
+    let project = root.path().join("project");
+    fs::create_dir_all(project.join("sub")).unwrap();
+    let respelled = root.path().join("PROJECT").join("sub");
+    let mut gate = Gate::new();
+    gate.grant(&project, Rights::READ | Rights::WRITE).unwrap();
+
+    let err = gate.grant(&respelled, Rights::READ).unwrap_err();
+    if fs::metadata(&respelled).is_ok() {
+        assert_nested(
+            err,
+            &respelled,
+            Rights::READ,
+            &project,
+            Rights::READ | Rights::WRITE,
+        );
+    } else {
+        assert!(
+            matches!(&err, GateError::Io { source, .. } if source.kind() == io::ErrorKind::NotFound),
+            "got {err:?}"
+        );
+    }
+}
+
+/// A second grant on the same directory, under any name, must hold the same
+/// rights, since either name reaches every file in it.
+#[test]
+fn a_second_grant_on_the_same_directory_needs_the_same_rights() {
+    let (root, granted, _) = setup();
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink(&granted, &alias).unwrap();
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::READ).unwrap();
+
+    gate.grant(&alias, Rights::READ).unwrap();
+    let err = gate
+        .grant(&alias, Rights::READ | Rights::WRITE)
+        .unwrap_err();
+    assert_nested(
+        err,
+        &granted,
+        Rights::READ,
+        &alias,
+        Rights::READ | Rights::WRITE,
+    );
+    let err = gate.grant(&granted, Rights::LIST).unwrap_err();
+    assert_nested(err, &granted, Rights::LIST, &granted, Rights::READ);
+}
+
+/// Revoking the outer grant ends the nesting, so the inner grant can then
+/// be made.
+#[test]
+fn a_nested_grant_with_fewer_rights_is_allowed_once_the_outer_is_revoked() {
+    let (_root, granted, _) = setup();
+    let sub = granted.join("sub");
+    fs::create_dir(&sub).unwrap();
+    let mut gate = Gate::new();
+    let outer = gate.grant(&granted, Rights::READ | Rights::WRITE).unwrap();
+    assert!(gate.grant(&sub, Rights::READ).is_err());
+
+    gate.revoke(outer).unwrap();
+    gate.grant(&sub, Rights::READ).unwrap();
+}
+
+/// Each grant records where its directory is when it is made, so a
+/// directory moved into another grant afterwards is not rechecked: the
+/// outer grant's rights reach it by its new path (RFC 0012's limits).
+#[test]
+fn a_directory_moved_into_another_grant_later_is_not_rechecked() {
+    let (root, granted, _) = setup();
+    let apart = root.path().join("apart");
+    fs::create_dir(&apart).unwrap();
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::READ | Rights::WRITE | Rights::CREATE)
+        .unwrap();
+    gate.grant(&apart, Rights::READ).unwrap();
+
+    fs::rename(&apart, granted.join("moved")).unwrap();
+
+    gate.create(granted.join("moved/new.txt")).unwrap();
+    assert!(granted.join("moved/new.txt").exists());
+}
+
 #[test]
 fn relative_paths_are_rejected() {
     let (_root, granted, _) = setup();
@@ -457,16 +665,40 @@ fn narrow_keeps_the_held_directory_instead_of_reopening_the_path() {
 #[test]
 fn narrowing_to_no_rights_keeps_routing_to_the_grant() {
     let (_root, granted, _) = setup();
+    fs::write(granted.join("a.txt"), b"a").unwrap();
+    let mut gate = Gate::new();
+    let grant = gate.grant(&granted, Rights::READ).unwrap();
+
+    gate.narrow(grant, Rights::from_bits_truncate(0)).unwrap();
+
+    // Unlike `revoke`, the path still has a grant, one without the right.
+    assert!(matches!(
+        gate.open(granted.join("a.txt")),
+        Err(GateError::RightsExceeded { .. })
+    ));
+}
+
+/// Narrowing a nested grant below the grant around it would leave a right
+/// the outer grant gives through other routes (RFC 0012), so it is refused
+/// and the grant keeps its rights. Narrowing the outer grant is allowed.
+#[test]
+fn narrowing_a_nested_grant_below_the_grant_around_it_is_refused() {
+    let (_root, granted, _) = setup();
     let sub = granted.join("sub");
     fs::create_dir(&sub).unwrap();
     fs::write(sub.join("a.txt"), b"sub").unwrap();
     let mut gate = Gate::new();
-    gate.grant(&granted, Rights::READ).unwrap();
-    let inner = gate.grant(&sub, Rights::READ).unwrap();
+    let outer = gate.grant(&granted, Rights::READ).unwrap();
+    let inner = gate.grant(&sub, Rights::READ | Rights::LIST).unwrap();
 
-    gate.narrow(inner, Rights::from_bits_truncate(0)).unwrap();
+    let err = gate.narrow(inner, Rights::LIST).unwrap_err();
+    assert_nested(err, &sub, Rights::LIST, &granted, Rights::READ);
+    // The inner grant, which `sub` routes to, still reads.
+    let file = gate.open(sub.join("a.txt")).unwrap();
+    assert_eq!(read_to_string(file), "sub");
 
-    // Unlike `revoke`, the outer grant does not take over the subdirectory.
+    gate.narrow(outer, Rights::from_bits_truncate(0)).unwrap();
+    gate.narrow(inner, Rights::LIST).unwrap();
     assert!(matches!(
         gate.open(sub.join("a.txt")),
         Err(GateError::RightsExceeded { .. })
