@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- When the broker got `SIGQUIT`, from `Ctrl-\` for example, it died without killing its confined worker's process group, so programs the worker started kept running, confined, after both had exited. The broker now handles `SIGQUIT` like `SIGINT`, `SIGTERM`, and `SIGHUP`: it kills the group, then dies by the signal ([RFC 0010](docs/rfcs/0010-worker-process-group.md#changes-after-release)).
 - The `lock` audit event now records what the kernel enforced for the filesystem rules, in a new `status` key (`fully_enforced`, `partially_enforced`, or `library_only`) and the `AuditEvent::status` field. Before, a best-effort lock that the kernel did not enforce was logged `allow` and `ok` with the same fields as an enforced one ([RFC 0002](docs/rfcs/0002-audit-events.md)).
 
 ### Changed
