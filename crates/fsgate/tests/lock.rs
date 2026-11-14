@@ -958,9 +958,11 @@ mod kernel {
         let mut gate = Gate::new();
         gate.grant(std::env::var("FSGATE_GRANTED").unwrap(), Rights::READ)
             .unwrap();
-        gate.grant(&outside, Rights::from_bits_truncate(0)).unwrap();
+        // Narrowed first: a second grant on the same directory must hold the
+        // same rights (RFC 0012).
         let narrowed = gate.grant(&outside, Rights::READ).unwrap();
         gate.narrow(narrowed, none).unwrap();
+        gate.grant(&outside, Rights::from_bits_truncate(0)).unwrap();
 
         // The raw read of the secret beneath the empty grants is refused.
         let (granted, secret) = lock_and_prove(&mut gate);
