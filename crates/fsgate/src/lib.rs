@@ -185,6 +185,29 @@ pub enum GateError {
         /// The requested rights the grant does not hold.
         extra: Rights,
     },
+    /// A grant would hold fewer rights than another live grant on the same
+    /// directory or on one above it ([RFC 0012]). Neither the gate nor the
+    /// kernel could hold it to the smaller set: a symlink or another
+    /// spelling of a path reaches the inner directory through the outer
+    /// grant, and Landlock allows what any rule allows. No grant changes.
+    ///
+    /// [RFC 0012]: https://github.com/farming-labs/fsgate/blob/main/docs/rfcs/0012-nested-grants.md
+    #[error(
+        "grant for `{inner_path}` would hold {inner:?} within the grant for `{outer_path}`, \
+         which holds {outer:?}; a grant within another must hold every right the other \
+         holds, so give the inner grant more rights or the outer grant fewer"
+    )]
+    NestedGrant {
+        /// The path of the inner grant: the same directory as the outer
+        /// grant's, or one beneath it.
+        inner_path: PathBuf,
+        /// The rights the inner grant holds, or would hold.
+        inner: Rights,
+        /// The path of the outer grant.
+        outer_path: PathBuf,
+        /// The rights the outer grant holds, or would hold.
+        outer: Rights,
+    },
     /// The [`Grant`] was already revoked or belongs to another gate.
     #[error("grant was already revoked or does not belong to this gate")]
     UnknownGrant,
@@ -496,7 +519,13 @@ struct GrantEntry {
     path: PathBuf,
     dir: Dir,
     rights: Rights,
+    /// The granted directory and each directory above it, nearest first,
+    /// when the grant was made.
+    ancestry: Vec<DirId>,
 }
+
+/// A directory's device and inode numbers.
+type DirId = (u64, u64);
 
 /// Source of gate ids. Wrapping needs 2^64 gates, so ids never repeat in
 /// practice.
@@ -536,6 +565,17 @@ impl Gate {
     /// The directory is opened now and held; later renames of `path` do not
     /// change what the grant reaches (protection is by the descriptor's
     /// identity, not the name).
+    ///
+    /// Fails with [`GateError::NestedGrant`] when the directory is the same
+    /// as a live grant's, or beneath or above one, and the inner of the two
+    /// would hold fewer rights than the outer ([RFC 0012]). Nesting is
+    /// decided from the directories themselves, read upward through `..`
+    /// from the held descriptors, so a symlink or another spelling of the
+    /// path does not hide it. Each grant's place is recorded when it is
+    /// made: a directory moved into another grant later, or reached through
+    /// a bind mount, is not caught.
+    ///
+    /// [RFC 0012]: https://github.com/farming-labs/fsgate/blob/main/docs/rfcs/0012-nested-grants.md
     pub fn grant(&mut self, path: impl AsRef<Path>, rights: Rights) -> Result<Grant, GateError> {
         let requested = path.as_ref();
         if self.locked {
@@ -578,7 +618,38 @@ impl Gate {
                 return Err(GateError::Io { path, source });
             }
         };
-        self.grants.push(Some(GrantEntry { path, dir, rights }));
+        let ancestry = match ancestry(&dir) {
+            Ok(ancestry) => ancestry,
+            Err(source) => {
+                let source = io::Error::from(source);
+                self.emit(
+                    AuditOp::Grant,
+                    Some(&path),
+                    None,
+                    AuditDecision::Allow,
+                    AuditReason::Ok,
+                    source.raw_os_error(),
+                );
+                return Err(GateError::Io { path, source });
+            }
+        };
+        if let Some(err) = self.nested(&path, rights, &ancestry, None) {
+            self.emit(
+                AuditOp::Grant,
+                Some(&path),
+                None,
+                AuditDecision::Deny,
+                AuditReason::NestedGrant,
+                None,
+            );
+            return Err(err);
+        }
+        self.grants.push(Some(GrantEntry {
+            path,
+            dir,
+            rights,
+            ancestry,
+        }));
         let index = self.grants.len() - 1;
         self.emit_rights(
             AuditOp::Grant,
@@ -720,11 +791,16 @@ impl Gate {
     /// [`revoke`](Gate::revoke).
     ///
     /// Fails with [`GateError::WouldWiden`] if `rights` names a right the
-    /// grant does not hold, and with [`GateError::UnknownGrant`] if the grant
-    /// was revoked or belongs to another gate. Either way no grant changes.
+    /// grant does not hold, with [`GateError::NestedGrant`] if it would
+    /// leave the grant with fewer rights than a live grant on the same
+    /// directory or above it ([RFC 0012]), and with
+    /// [`GateError::UnknownGrant`] if the grant was revoked or belongs to
+    /// another gate. In each case no grant changes.
+    ///
+    /// [RFC 0012]: https://github.com/farming-labs/fsgate/blob/main/docs/rfcs/0012-nested-grants.md
     pub fn narrow(&mut self, grant: Grant, rights: Rights) -> Result<(), GateError> {
         let index = self.index_of(grant);
-        let Some(Some(entry)) = index.and_then(|index| self.grants.get_mut(index)) else {
+        let Some(Some(entry)) = index.and_then(|index| self.grants.get(index)) else {
             self.emit(
                 AuditOp::Narrow,
                 None,
@@ -752,7 +828,20 @@ impl Gate {
                 extra: rights.missing_from(held),
             });
         }
-        entry.rights = rights;
+        if let Some(err) = self.nested(&path, rights, &entry.ancestry, index) {
+            self.emit_rights(
+                AuditOp::Narrow,
+                Some(&path),
+                index,
+                held,
+                AuditDecision::Deny,
+                AuditReason::NestedGrant,
+            );
+            return Err(err);
+        }
+        if let Some(Some(entry)) = index.and_then(|index| self.grants.get_mut(index)) {
+            entry.rights = rights;
+        }
         self.emit_rights(
             AuditOp::Narrow,
             Some(&path),
@@ -762,6 +851,47 @@ impl Gate {
             AuditReason::Ok,
         );
         Ok(())
+    }
+
+    /// The first live grant, other than `skip`, that would nest with a grant
+    /// of `rights` on the directory `ancestry` starts with, where the inner
+    /// of the two would lack a right the outer holds ([RFC 0012]).
+    ///
+    /// [RFC 0012]: https://github.com/farming-labs/fsgate/blob/main/docs/rfcs/0012-nested-grants.md
+    fn nested(
+        &self,
+        path: &Path,
+        rights: Rights,
+        ancestry: &[DirId],
+        skip: Option<usize>,
+    ) -> Option<GateError> {
+        let live = self
+            .grants
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| Some(*index) != skip)
+            .filter_map(|(_, slot)| slot.as_ref());
+        for entry in live {
+            // `entry` is on the same directory, or on one above it.
+            if ancestry.contains(&entry.ancestry[0]) && !rights.contains(entry.rights) {
+                return Some(GateError::NestedGrant {
+                    inner_path: path.to_path_buf(),
+                    inner: rights,
+                    outer_path: entry.path.clone(),
+                    outer: entry.rights,
+                });
+            }
+            // `entry` is on the same directory, or on one beneath it.
+            if entry.ancestry.contains(&ancestry[0]) && !entry.rights.contains(rights) {
+                return Some(GateError::NestedGrant {
+                    inner_path: entry.path.clone(),
+                    inner: entry.rights,
+                    outer_path: path.to_path_buf(),
+                    outer: rights,
+                });
+            }
+        }
+        None
     }
 
     /// The grant's slot in this gate's table, or `None` for a grant created
@@ -986,7 +1116,10 @@ impl Gate {
     ///
     /// This match is routing, not the security boundary: the subsequent
     /// cap-std call opens beneath the grant's held descriptor, and the
-    /// kernel rejects anything (symlinks, races) that would leave it.
+    /// kernel rejects anything (symlinks, races) that would leave it. A path
+    /// that reaches a nested grant's directory through a shorter grant gets
+    /// the shorter grant's rights, which [`grant`](Gate::grant) and
+    /// [`narrow`](Gate::narrow) keep to a subset of the nested grant's.
     fn resolve(&self, path: &Path) -> Result<(usize, &GrantEntry, PathBuf, PathBuf), GateError> {
         let full = normalize(path)?;
         let (index, entry) = self
@@ -1184,6 +1317,31 @@ fn with_escape_errno(err: io::Error) -> io::Error {
     } else {
         err
     }
+}
+
+/// The identities of `dir` and of each directory above it, nearest first,
+/// read through `..` from the held descriptor. Every spelling of a
+/// directory's path, through symlinks or in another case, gives the same
+/// chain. A walk deeper than the platform's path limit fails with
+/// `ENAMETOOLONG`, so the grant fails.
+fn ancestry(dir: &Dir) -> rustix::io::Result<Vec<DirId>> {
+    let mut ancestry = vec![dir_id(&rustix::fs::fstat(dir)?)];
+    let mut up = PathBuf::from("..");
+    loop {
+        let parent = dir_id(&rustix::fs::statat(dir, &up, rustix::fs::AtFlags::empty())?);
+        // The root is its own `..`.
+        if ancestry.last() == Some(&parent) {
+            return Ok(ancestry);
+        }
+        ancestry.push(parent);
+        up.push("..");
+    }
+}
+
+// `st_dev` is an `i32` on macOS and a `u64` on Linux.
+#[allow(clippy::unnecessary_cast)]
+fn dir_id(stat: &rustix::fs::Stat) -> DirId {
+    (stat.st_dev as u64, stat.st_ino as u64)
 }
 
 /// Normalizes an absolute path lexically: resolves `.` and `..` without

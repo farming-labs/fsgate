@@ -113,6 +113,12 @@ pub enum AuditReason {
     Unsupported,
     /// The revoked or narrowed grant did not exist.
     UnknownGrant,
+    /// A `grant` or `narrow` would leave a grant with fewer rights than
+    /// another live grant on the same directory or on one above it
+    /// ([RFC 0012]).
+    ///
+    /// [RFC 0012]: https://github.com/farming-labs/fsgate/blob/main/docs/rfcs/0012-nested-grants.md
+    NestedGrant,
     /// An intercepted request (RFC 0004) asked for something the
     /// interception profile does not support: a path that is relative,
     /// non-canonical, or not UTF-8, a write or other unsupported flag, or an
@@ -151,6 +157,7 @@ impl AuditReason {
             AuditReason::Locked => "locked",
             AuditReason::Unsupported => "unsupported",
             AuditReason::UnknownGrant => "unknown_grant",
+            AuditReason::NestedGrant => "nested_grant",
             AuditReason::UnsupportedInput => "unsupported_input",
             AuditReason::InvalidMemory => "invalid_memory",
             AuditReason::PeerRefused => "peer_refused",

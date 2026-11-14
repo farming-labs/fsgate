@@ -958,9 +958,11 @@ mod kernel {
         let mut gate = Gate::new();
         gate.grant(std::env::var("FSGATE_GRANTED").unwrap(), Rights::READ)
             .unwrap();
-        gate.grant(&outside, Rights::from_bits_truncate(0)).unwrap();
+        // Narrowed first: a second grant on the same directory must hold the
+        // same rights (RFC 0012).
         let narrowed = gate.grant(&outside, Rights::READ).unwrap();
         gate.narrow(narrowed, none).unwrap();
+        gate.grant(&outside, Rights::from_bits_truncate(0)).unwrap();
 
         // The raw read of the secret beneath the empty grants is refused.
         let (granted, secret) = lock_and_prove(&mut gate);
@@ -1111,44 +1113,6 @@ mod kernel {
 
         assert_eq!(fs::metadata(&secret).unwrap().len(), b"secret".len() as u64);
         fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
-    }
-
-    /// Landlock allows an access when any rule allows it, so the parent's
-    /// rule also covers the nested directory. Only the gate honors the
-    /// nested grant's lesser rights.
-    #[test]
-    fn a_nested_grant_with_fewer_rights_binds_only_the_gate() {
-        let (_root, granted, outside) = dirs();
-        let nested = granted.join("nested");
-        fs::create_dir(&nested).unwrap();
-
-        run_locked("nested_grant_child", &granted, &outside);
-
-        assert!(!nested.join("through_gate.txt").exists());
-        assert!(nested.join("raw.txt").exists(), "the raw write was refused");
-    }
-
-    #[test]
-    fn nested_grant_child() {
-        if child_mode("nested_grant_child").is_none() {
-            return;
-        }
-        let parent = std::env::var("FSGATE_GRANTED").unwrap();
-        let nested = format!("{parent}/nested");
-        let mut gate = Gate::new();
-        gate.grant(&parent, Rights::READ | Rights::WRITE | Rights::CREATE)
-            .unwrap();
-        gate.grant(&nested, Rights::READ).unwrap();
-        lock_and_prove(&mut gate);
-
-        let err = gate
-            .create(format!("{nested}/through_gate.txt"))
-            .unwrap_err();
-        assert!(
-            matches!(err, GateError::RightsExceeded { .. }),
-            "got {err:?}"
-        );
-        fs::write(format!("{nested}/raw.txt"), b"x").unwrap();
     }
 
     /// The installed ruleset never changes, so only operations through the
