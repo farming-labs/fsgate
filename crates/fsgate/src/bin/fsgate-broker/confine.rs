@@ -48,9 +48,10 @@ const RUNTIME_FILES: [&str; 3] = [
     "/etc/pki/tls/openssl3.cnf",
 ];
 
-/// Signals that stop the broker. Before it dies of one, the broker ends its
-/// confined worker's process group (RFC 0010).
-const STOP_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+/// Signals that stop the broker: Ctrl-C, `kill`, a closed terminal, and
+/// `Ctrl-\`. Before it dies of one, the broker ends its confined worker's
+/// process group (RFC 0010).
+const STOP_SIGNALS: [libc::c_int; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
 
 /// The command that confines the process and then becomes `worker`, and the
 /// [`Supervisor`] that ends the worker's process group with it.

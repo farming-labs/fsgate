@@ -655,7 +655,7 @@ impl Gate {
         };
         self.locked = true;
         self.restrictions = Some(applied.restrictions);
-        self.emit_lock(applied.restrictions);
+        self.emit_lock(applied.restrictions, applied.status);
         Ok(applied.status)
     }
 
@@ -1023,6 +1023,7 @@ impl Gate {
                 grant,
                 rights: None,
                 restrictions: None,
+                status: None,
                 decision,
                 reason,
                 errno,
@@ -1052,6 +1053,7 @@ impl Gate {
                 grant,
                 rights: Some(rights),
                 restrictions: None,
+                status: None,
                 decision,
                 reason,
                 errno: None,
@@ -1080,6 +1082,7 @@ impl Gate {
                 grant: None,
                 rights: None,
                 restrictions: None,
+                status: None,
                 decision,
                 reason,
                 errno: None,
@@ -1091,8 +1094,9 @@ impl Gate {
     }
 
     /// [`emit`](Gate::emit) for a successful `lock`, recording the
-    /// restrictions that took effect.
-    fn emit_lock(&self, restrictions: Restrictions) {
+    /// restrictions that took effect and what the kernel enforced for the
+    /// filesystem rules.
+    fn emit_lock(&self, restrictions: Restrictions, status: LockStatus) {
         if let Some(sink) = &self.audit {
             sink.event(&AuditEvent {
                 ts: SystemTime::now(),
@@ -1101,6 +1105,7 @@ impl Gate {
                 grant: None,
                 rights: None,
                 restrictions: Some(restrictions),
+                status: Some(status),
                 decision: AuditDecision::Allow,
                 reason: AuditReason::Ok,
                 errno: None,
