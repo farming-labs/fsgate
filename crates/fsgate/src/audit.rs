@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{Restrictions, Rights};
+use crate::{LockStatus, Restrictions, Rights};
 
 /// Receives every allow/deny decision a [`Gate`](crate::Gate) makes.
 ///
@@ -187,6 +187,10 @@ pub struct AuditEvent {
     /// For a successful `lock`, the [`Restrictions`] that took effect;
     /// `None` for a refused lock and every other operation.
     pub restrictions: Option<Restrictions>,
+    /// For a successful `lock`, what the kernel enforced for the filesystem
+    /// rules built from the grants, as [`Gate::lock`](crate::Gate::lock)
+    /// returned it; `None` for a refused lock and every other operation.
+    pub status: Option<LockStatus>,
     /// Allow or deny.
     pub decision: AuditDecision,
     /// Why.
@@ -221,6 +225,7 @@ impl AuditEvent {
             "grant": self.grant,
             "rights": self.rights.map(right_names),
             "restrictions": self.restrictions.map(restriction_names),
+            "status": self.status.map(status_name),
             "decision": self.decision.as_str(),
             "reason": self.reason.as_str(),
             "errno": self.errno,
@@ -301,6 +306,15 @@ fn restriction_names(restrictions: Restrictions) -> Vec<String> {
         .collect()
 }
 
+/// The RFC 0002 wire name of a [`LockStatus`] for the `status` key.
+fn status_name(status: LockStatus) -> &'static str {
+    match status {
+        LockStatus::FullyEnforced => "fully_enforced",
+        LockStatus::PartiallyEnforced => "partially_enforced",
+        LockStatus::LibraryOnly => "library_only",
+    }
+}
+
 fn right_names(rights: Rights) -> Vec<&'static str> {
     [
         (Rights::READ, "read"),
@@ -356,6 +370,13 @@ mod tests {
     }
 
     fn lock_event(restrictions: Option<Restrictions>) -> serde_json::Value {
+        lock_event_with(restrictions, None)
+    }
+
+    fn lock_event_with(
+        restrictions: Option<Restrictions>,
+        status: Option<LockStatus>,
+    ) -> serde_json::Value {
         let event = AuditEvent {
             ts: UNIX_EPOCH,
             op: AuditOp::Lock,
@@ -363,6 +384,7 @@ mod tests {
             grant: None,
             rights: None,
             restrictions,
+            status,
             decision: AuditDecision::Allow,
             reason: AuditReason::Ok,
             errno: None,
@@ -396,5 +418,18 @@ mod tests {
         assert_eq!(none["restrictions"], serde_json::json!([]));
         let refused = lock_event(None);
         assert!(refused["restrictions"].is_null());
+    }
+
+    #[test]
+    fn status_key_names_what_the_kernel_enforced() {
+        for (status, name) in [
+            (LockStatus::FullyEnforced, "fully_enforced"),
+            (LockStatus::PartiallyEnforced, "partially_enforced"),
+            (LockStatus::LibraryOnly, "library_only"),
+        ] {
+            let event = lock_event_with(Some(Restrictions::empty()), Some(status));
+            assert_eq!(event["status"], serde_json::json!(name));
+        }
+        assert!(lock_event(None)["status"].is_null());
     }
 }

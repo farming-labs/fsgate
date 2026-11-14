@@ -246,7 +246,7 @@ fn lifecycle_events_cover_grant_revoke_and_lock() {
     // out ALL_THREADS confines it to this test's thread.
     let options = fsgate::LockOptions::new(fsgate::LockPolicy::BestEffort)
         .restrict(fsgate::Restrictions::all() - fsgate::Restrictions::ALL_THREADS);
-    gate.lock_with(options).unwrap();
+    let status = gate.lock_with(options).unwrap();
     let _ = gate.grant(granted.join("sub/.."), Rights::READ); // denied: locked
     let _ = gate.lock(); // denied: already locked
 
@@ -276,6 +276,25 @@ fn lifecycle_events_cover_grant_revoke_and_lock() {
     assert_eq!(events[2].restrictions, Some(applied));
     for (index, event) in events.iter().enumerate().filter(|(index, _)| *index != 2) {
         assert!(event.restrictions.is_none(), "event {index}: {event:?}");
+    }
+
+    // The successful lock also records what the kernel enforced for the
+    // filesystem rules, so a best-effort lock that enforced nothing does
+    // not read like a full one. Every other event has `null` there.
+    assert_eq!(events[2].status, Some(status));
+    let expected = match status {
+        fsgate::LockStatus::FullyEnforced => "fully_enforced",
+        fsgate::LockStatus::PartiallyEnforced => "partially_enforced",
+        fsgate::LockStatus::LibraryOnly => "library_only",
+    };
+    for (index, event) in events.iter().enumerate() {
+        let value: serde_json::Value = serde_json::from_str(&event.to_json_line()).unwrap();
+        let want = if index == 2 {
+            serde_json::json!(expected)
+        } else {
+            serde_json::Value::Null
+        };
+        assert_eq!(value["status"], want, "event {index}: {value}");
     }
 }
 
