@@ -139,55 +139,95 @@ fn the_first_descriptor_ends_a_request_split_across_messages() {
     drop(client);
 }
 
-/// With its descriptor table full, the broker cannot receive what a
-/// request carries, and the kernel reports the message truncated. The
-/// broker fails the connection closed instead of serving a message it
-/// could not fully receive.
-#[cfg(target_os = "linux")]
+/// With its descriptor table full, or too full for every descriptor a
+/// request carries, the broker cannot receive them. Linux reports the
+/// message truncated. macOS fails `recvmsg` with `EMFILE` or `EMSGSIZE`,
+/// or delivers only the descriptors that fit, which the broker refuses
+/// like any other. Either way it fails the connection closed instead of
+/// serving the request, audits that once (RFC 0011), and leaves none of
+/// the descriptors open.
 #[test]
 fn a_request_whose_descriptors_cannot_be_received_fails_the_connection_closed() {
+    use fsgate::{AuditDecision, AuditEvent, AuditOp, AuditReason, AuditSink};
     use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct Capture(Mutex<Vec<AuditEvent>>);
+    impl AuditSink for Capture {
+        fn event(&self, event: &AuditEvent) {
+            self.0.lock().unwrap().push(event.clone());
+        }
+    }
 
     let _serial = serial();
-    let (held, probe) = UnixStream::pair().unwrap();
-    let (mut client, server) = UnixStream::pair().unwrap();
-    let request = serde_json::json!({ "op": "metadata", "path": "/" });
-    send_last_request(&client, &frame(&request), &[held.as_fd(); MOST_PER_MESSAGE]);
-    drop(held);
-
-    // No descriptor numbers above the highest open one, so `recvmsg` can
-    // install only the few that fit in gaps below it.
-    let highest = fs::read_dir("/proc/self/fd")
-        .unwrap()
-        .map(|entry| {
-            entry
-                .unwrap()
-                .file_name()
-                .to_str()
-                .unwrap()
-                .parse::<u64>()
-                .unwrap()
-        })
-        .max()
-        .unwrap();
-    let saved = getrlimit(Resource::Nofile);
-    let limited = Rlimit {
-        current: Some(highest + 1),
-        maximum: saved.maximum,
+    let open = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
     };
-    setrlimit(Resource::Nofile, limited).unwrap();
-    let result = Broker::new(Gate::new()).serve_conn(server);
-    setrlimit(Resource::Nofile, saved).unwrap();
+    // How many descriptor numbers stay free above the highest open one.
+    for room in [0, MOST_PER_MESSAGE as u64 / 2] {
+        let (held, probe) = UnixStream::pair().unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let request = serde_json::json!({ "op": "metadata", "path": "/" });
+        send_last_request(&client, &frame(&request), &[held.as_fd(); MOST_PER_MESSAGE]);
+        drop(held);
+        let sink = Arc::new(Capture::default());
+        let mut gate = Gate::new();
+        gate.set_audit_sink(sink.clone());
 
-    let err = result.unwrap_err();
-    assert_eq!(err.kind(), ErrorKind::InvalidData, "{err}");
-    assert!(err.to_string().contains("could be received"), "{err}");
-    let mut response = Vec::new();
-    client.read_to_end(&mut response).unwrap();
-    assert!(
-        response.is_empty(),
-        "the broker served a request it could not fully receive"
-    );
-    // The kernel closed what it could not install; the broker closed the rest.
-    assert_peer_closed(&probe);
+        let highest = fs::read_dir(open)
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_str()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+            })
+            .max()
+            .unwrap();
+        let saved = getrlimit(Resource::Nofile);
+        let limited = Rlimit {
+            current: Some(highest + 1 + room),
+            maximum: saved.maximum,
+        };
+        setrlimit(Resource::Nofile, limited).unwrap();
+        let result = Broker::new(gate).serve_conn(server);
+        setrlimit(Resource::Nofile, saved).unwrap();
+
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData, "room {room}: {err}");
+        let message = err.to_string();
+        assert!(
+            message.contains("could be received") || message.contains("requests carry none"),
+            "room {room}: {err}"
+        );
+        let events = sink.0.lock().unwrap().clone();
+        let audited: Vec<_> = events
+            .iter()
+            .map(|event| (event.op, event.decision, event.reason))
+            .collect();
+        assert_eq!(
+            audited,
+            [(
+                AuditOp::Request,
+                AuditDecision::Deny,
+                AuditReason::MalformedFrame
+            )],
+            "room {room}: {events:?}"
+        );
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        assert!(
+            response.is_empty(),
+            "room {room}: the broker served a request it could not fully receive"
+        );
+        // The kernel closed what it could not install; the broker closed
+        // the rest.
+        assert_peer_closed(&probe);
+    }
 }
