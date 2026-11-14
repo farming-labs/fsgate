@@ -58,11 +58,10 @@ impl Gate {
   gate keeps what the ruleset allowed until the process exits. This is
   the same contract as `revoke` after a lock.
 - **Nested grants.** Landlock allows an access when any rule on the path
-  allows it. Narrowing a grant nested under a broader grant restricts
-  gate operations routed to the nested grant, but the kernel still
-  allows what the parent grant's rule allows. A nested grant created
-  with fewer rights behaves the same way today; narrowing does not
-  change that.
+  allows it, so the kernel would allow beneath a nested grant what the
+  grant around it allows. Since [RFC 0012](0012-nested-grants.md),
+  narrowing a nested grant below the grant around it, or creating one
+  with fewer rights, fails with `GateError::NestedGrant`.
 
 ### Broker
 
@@ -79,6 +78,7 @@ op `narrow`:
 |---|---|---|---|---|---|
 | Narrowed | the grant's path | its id | the narrowed set | `allow` | `ok` |
 | Set names a right the grant lacks | the grant's path | its id | the unchanged set | `deny` | `rights_exceeded` |
+| Set lacks a right of a grant around it ([RFC 0012](0012-nested-grants.md)) | the grant's path | its id | the unchanged set | `deny` | `nested_grant` |
 | Grant already revoked | `null` | the requested id | `null` | `deny` | `unknown_grant` |
 | Grant from another gate | `null` | `null` | `null` | `deny` | `unknown_grant` |
 

@@ -50,7 +50,7 @@ Naming follows fixed verb jobs: `grant` confers authority, `lock` applies contai
 3. Check the operation against the grant's `Rights`. Insufficient → `GateError::RightsExceeded`.
 4. Open the remainder relative to the grant's descriptor with `openat2(2)` and `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS` (via cap-std). The kernel, not the prefix match in step 2, is what prevents escapes: a symlink or `..` that leaves the grant fails at the syscall.
 
-Step 2 is routing, not security. If it routes to the wrong grant, the worst outcome is an operation under a directory that was still deliberately granted.
+Step 2 is routing, not security. If it routes to the wrong grant, the worst outcome is an operation under a directory that was still deliberately granted. A path can reach a nested grant's directory through a shorter grant, by a symlink or another spelling, and get the shorter grant's rights, so a nested grant must hold every right of the grants around it. `grant` and `narrow` refuse anything else ([RFC 0012](0012-nested-grants.md)).
 
 ### Containment (`lock()`)
 

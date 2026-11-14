@@ -497,6 +497,7 @@ fn error_response(err: GateError) -> Response {
         }
         GateError::UnknownGrant
         | GateError::WouldWiden { .. }
+        | GateError::NestedGrant { .. }
         | GateError::Locked
         | GateError::LockUnsupported { .. }
         | GateError::LockFailed { .. }

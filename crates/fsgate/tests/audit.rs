@@ -33,6 +33,15 @@ fn setup() -> (TempDir, PathBuf, PathBuf) {
     (root, granted, outside)
 }
 
+/// A directory beside `granted` for a first grant that no request routes
+/// to, so that the grant under test is grant 1. A second grant on `granted`
+/// itself would need the same rights (RFC 0012).
+fn elsewhere(root: &TempDir) -> PathBuf {
+    let path = root.path().join("elsewhere");
+    fs::create_dir(&path).unwrap();
+    path
+}
+
 fn audited_gate(granted: &PathBuf, rights: Rights) -> (Gate, Arc<Capture>) {
     let sink = Arc::new(Capture::default());
     let mut gate = Gate::new();
@@ -111,8 +120,11 @@ fn a_denial_with_no_grant_records_the_normalized_path() {
 
 #[test]
 fn rights_exceeded_names_the_matched_grant() {
-    let (_root, granted, _) = setup();
-    let (mut gate, sink) = audited_gate(&granted, Rights::READ | Rights::WRITE | Rights::CREATE);
+    let (root, granted, _) = setup();
+    let (mut gate, sink) = audited_gate(
+        &elsewhere(&root),
+        Rights::READ | Rights::WRITE | Rights::CREATE,
+    );
     gate.grant(&granted, Rights::READ).unwrap();
 
     for name in ["new.txt", "a.txt"] {
@@ -136,14 +148,12 @@ fn rights_exceeded_names_the_matched_grant() {
 #[test]
 fn rights_denials_follow_routing_and_revocation_for_every_operation() {
     let (_root, granted, _) = setup();
-    let (mut gate, sink) = audited_gate(
-        &granted,
-        Rights::READ | Rights::WRITE | Rights::CREATE | Rights::LIST,
-    );
+    let none = Rights::from_bits_truncate(0);
+    let (mut gate, sink) = audited_gate(&granted, none);
     let sub = granted.join("sub");
     fs::create_dir(&sub).unwrap();
     fs::write(sub.join("a.txt"), b"inside").unwrap();
-    let restricted = gate.grant(&sub, Rights::from_bits_truncate(0)).unwrap();
+    let restricted = gate.grant(&sub, none).unwrap();
     let path = sub.join("a.txt");
 
     let results = [
@@ -171,11 +181,16 @@ fn rights_denials_follow_routing_and_revocation_for_every_operation() {
     }
     assert_eq!(fs::read(&path).unwrap(), b"inside");
 
+    // Revoked, `sub` routes to the outer grant, and the denial names it.
     gate.revoke(restricted).unwrap();
-    gate.open(&path).unwrap();
+    assert!(matches!(
+        gate.open(&path),
+        Err(GateError::RightsExceeded { .. })
+    ));
     let last = sink.events().pop().unwrap();
     assert_eq!(last.grant, Some(0));
-    assert_eq!(last.decision, AuditDecision::Allow);
+    assert_eq!(last.decision, AuditDecision::Deny);
+    assert_eq!(last.reason, AuditReason::RightsExceeded);
 }
 
 #[test]
@@ -300,8 +315,8 @@ fn lifecycle_events_cover_grant_revoke_and_lock() {
 
 #[test]
 fn narrow_emits_one_event_per_decision() {
-    let (_root, granted, _) = setup();
-    let (mut gate, sink) = audited_gate(&granted, Rights::READ | Rights::WRITE);
+    let (root, granted, _) = setup();
+    let (mut gate, sink) = audited_gate(&elsewhere(&root), Rights::READ | Rights::WRITE);
     // Narrow a second grant so the events must name grant 1, not grant 0.
     let grant = gate.grant(&granted, Rights::READ | Rights::WRITE).unwrap();
 
@@ -375,8 +390,11 @@ fn broker_decisions_are_audited_server_side() {
 
     use fsgate::{Broker, BrokerGate};
 
-    let (_root, granted, outside) = setup();
-    let (mut gate, sink) = audited_gate(&granted, Rights::READ | Rights::WRITE | Rights::CREATE);
+    let (root, granted, outside) = setup();
+    let (mut gate, sink) = audited_gate(
+        &elsewhere(&root),
+        Rights::READ | Rights::WRITE | Rights::CREATE,
+    );
     gate.grant(&granted, Rights::READ).unwrap();
 
     let (client, server) = UnixStream::pair().unwrap();
@@ -440,8 +458,8 @@ fn a_grant_from_another_gate_is_denied_without_naming_a_grant_here() {
 
 #[test]
 fn grant_and_narrow_events_record_the_rights_the_grant_holds_after() {
-    let (_root, granted, _) = setup();
-    let (mut gate, sink) = audited_gate(&granted, Rights::READ);
+    let (root, granted, _) = setup();
+    let (mut gate, sink) = audited_gate(&elsewhere(&root), Rights::READ);
     let none = Rights::from_bits_truncate(0);
 
     let grant = gate.grant(&granted, Rights::READ | Rights::WRITE).unwrap();
@@ -482,4 +500,42 @@ fn grant_and_narrow_events_record_the_rights_the_grant_holds_after() {
     assert_eq!(rights_json(1), serde_json::json!(["read", "write"]));
     assert_eq!(rights_json(4), serde_json::json!([]));
     assert!(rights_json(5).is_null());
+}
+
+/// A refused nested grant (RFC 0012) is one `deny` with `nested_grant`.
+/// No grant was created, so the event names none and records no rights. A
+/// refused narrow names its grant and the rights it keeps.
+#[test]
+fn a_refused_nested_grant_or_narrow_is_one_deny_event() {
+    let (_root, granted, _) = setup();
+    let sub = granted.join("sub");
+    fs::create_dir(&sub).unwrap();
+    let (mut gate, sink) = audited_gate(&granted, Rights::READ);
+
+    let err = gate.grant(sub.join("."), Rights::LIST).unwrap_err();
+    assert!(matches!(err, GateError::NestedGrant { .. }), "{err:?}");
+    let inner = gate.grant(&sub, Rights::READ | Rights::LIST).unwrap();
+    let err = gate.narrow(inner, Rights::LIST).unwrap_err();
+    assert!(matches!(err, GateError::NestedGrant { .. }), "{err:?}");
+
+    let events = sink.events();
+    assert_eq!(events.len(), 4);
+    let (grant, narrow) = (&events[1], &events[3]);
+    assert_eq!(grant.op, AuditOp::Grant);
+    assert_eq!(grant.decision, AuditDecision::Deny);
+    assert_eq!(grant.reason, AuditReason::NestedGrant);
+    assert_eq!(grant.path.as_deref(), Some(sub.as_path()));
+    assert_eq!(grant.grant, None);
+    assert_eq!(grant.rights, None);
+    assert_eq!(narrow.op, AuditOp::Narrow);
+    assert_eq!(narrow.decision, AuditDecision::Deny);
+    assert_eq!(narrow.reason, AuditReason::NestedGrant);
+    assert_eq!(narrow.path.as_deref(), Some(sub.as_path()));
+    assert_eq!(narrow.grant, Some(1));
+    assert_eq!(narrow.rights, Some(Rights::READ | Rights::LIST));
+    for event in [grant, narrow] {
+        assert_eq!(event.errno, None);
+        let value: serde_json::Value = serde_json::from_str(&event.to_json_line()).unwrap();
+        assert_eq!(value["reason"], "nested_grant");
+    }
 }

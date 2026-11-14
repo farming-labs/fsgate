@@ -10,6 +10,7 @@
 
 ### Changed
 
+- **Breaking.** `Gate::grant` and `Gate::narrow` refuse a grant on the same directory as another live grant, or beneath or above one, when the inner of the two would hold fewer rights than the outer, with the new `GateError::NestedGrant` and audit reason `nested_grant` ([RFC 0012](docs/rfcs/0012-nested-grants.md)). Such a policy could not be held. With `/proj` read-write and `/proj/.git` read-only, a symlink in `/proj` pointing into `.git`, or `/proj/.GIT` on a case-insensitive filesystem, routed to `/proj` and wrote into `.git`, through the gate and through a `Broker`, and after `lock()` the kernel allowed the same. Nesting is read from the directories' device and inode numbers, so a symlink or another case in a granted path does not hide it. `fsgate-broker` refuses such `--grant` flags at startup. To keep part of a granted directory read-only, grant the parent read-only and the writable parts beneath it.
 - A confined worker may read OpenSSL's configuration, `/etc/ssl/openssl.cnf` and Fedora's `/etc/pki/tls/openssl3.cnf`, where they exist ([RFC 0008](docs/rfcs/0008-confine-broker-worker.md#programs-that-read-files-in-etc)). Without it, Node.js did not start as a confined worker on Ubuntu, Debian, Fedora, Arch, or Alpine: it exited 13 with `OpenSSL configuration error` unless given `--direct` for the file. Like `/etc/ld.so.cache`, these are single files that hold no data, so a grant that contains one is not refused, and reading them is not audited.
 
 ## 0.4.1 (2026-11-13)
