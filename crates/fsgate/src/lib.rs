@@ -197,7 +197,10 @@ pub enum GateError {
         /// Why enforcement is unavailable, and what to do instead.
         reason: String,
     },
-    /// Building or applying the kernel ruleset failed.
+    /// Building or applying the kernel ruleset failed. The gate stays
+    /// unlocked. A failure at the last step, `landlock_restrict_self`,
+    /// leaves the process with `no_new_privs` set, which the kernel needs
+    /// before it applies a ruleset.
     #[error("applying kernel containment failed: {source}")]
     LockFailed {
         /// The underlying error.
