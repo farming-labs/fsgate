@@ -599,6 +599,9 @@ struct Coverage {
     create_escape_refused: usize,
     unknown_grant: usize,
     would_widen: usize,
+    /// Grants and narrows refused for nesting (RFC 0012).
+    nested_grant: usize,
+    nested_narrow: usize,
     narrowed: usize,
     revoked: usize,
 }
@@ -613,6 +616,8 @@ impl Coverage {
             ("RightsExceeded", self.rights_exceeded),
             ("UnknownGrant", self.unknown_grant),
             ("WouldWiden", self.would_widen),
+            ("NestedGrant on a grant", self.nested_grant),
+            ("NestedGrant on a narrow", self.nested_narrow),
             ("narrow", self.narrowed),
             ("revoke", self.revoked),
             (
@@ -722,13 +727,28 @@ impl Run<'_> {
             &self.tree.world,
             &self.tree.dirs[pick % self.tree.dirs.len()],
         );
+        let full = normalize(&path).expect("tree paths are absolute");
         let rights = Rights::from_bits_truncate(bits);
         let context = format!("step {step}: grant `{}` {rights:?}", path.display());
-        let handle = self
-            .gate
-            .grant(&path, rights)
-            .map_err(|err| format!("{context}: {err}"))?;
+        let result = self.gate.grant(&path, rights);
         let event = one_event(&context, self.events.take())?;
+        if let Some(nested) = nested(&self.grants, &full, rights, None) {
+            expect_nested(&context, &result, &nested)?;
+            expect_event(
+                &context,
+                &event,
+                AuditOp::Grant,
+                AuditDecision::Deny,
+                AuditReason::NestedGrant,
+                None,
+            )?;
+            ensure(event.rights.is_none(), || {
+                format!("{context}: no grant was made, got {event:?}")
+            })?;
+            self.cover(|coverage| coverage.nested_grant += 1);
+            return Ok(());
+        }
+        let handle = result.map_err(|err| format!("{context}: {err}"))?;
         let index = self.grants.len();
         expect_event(
             &context,
@@ -738,10 +758,7 @@ impl Run<'_> {
             AuditReason::Ok,
             Some(index),
         )?;
-        self.grants.push(Some(ModelGrant {
-            path: normalize(&path).expect("tree paths are absolute"),
-            rights,
-        }));
+        self.grants.push(Some(ModelGrant { path: full, rights }));
         self.handles.push(handle);
         Ok(())
     }
@@ -756,6 +773,10 @@ impl Run<'_> {
             event.op == AuditOp::Narrow && event.grant == Some(index),
             || format!("{context}: got {event:?}"),
         )?;
+        let refusal = self.grants[index]
+            .as_ref()
+            .filter(|grant| grant.rights.contains(rights))
+            .and_then(|grant| nested(&self.grants, &grant.path, rights, Some(index)));
         match &mut self.grants[index] {
             None => {
                 ensure(matches!(result, Err(GateError::UnknownGrant)), || {
@@ -790,6 +811,25 @@ impl Run<'_> {
                     Some(index),
                 )?;
                 self.cover(|coverage| coverage.would_widen += 1);
+            }
+            Some(grant) if refusal.is_some() => {
+                let nested = refusal.expect("checked by the guard");
+                expect_nested(&context, &result, &nested)?;
+                expect_event(
+                    &context,
+                    &event,
+                    AuditOp::Narrow,
+                    AuditDecision::Deny,
+                    AuditReason::NestedGrant,
+                    Some(index),
+                )?;
+                ensure(event.rights == Some(grant.rights), || {
+                    format!(
+                        "{context}: the grant keeps {:?}, got {event:?}",
+                        grant.rights
+                    )
+                })?;
+                self.cover(|coverage| coverage.nested_narrow += 1);
             }
             Some(grant) => {
                 ensure(result.is_ok(), || format!("{context}: got {result:?}"))?;
@@ -1085,6 +1125,67 @@ impl Run<'_> {
     }
 }
 
+/// A refusal RFC 0012 predicts: the inner grant's path and rights, then the
+/// outer grant's.
+type Nested = (PathBuf, Rights, PathBuf, Rights);
+
+/// The refusal RFC 0012 predicts for a grant holding `rights` on `full`,
+/// checked against the live grants other than `skip` in the gate's order. A
+/// grant on the same directory or above it must hold no right `rights`
+/// lacks, and a grant on the same directory or beneath it must hold every
+/// right in `rights`. The tree's directories have no symlink on the way to
+/// them, so the model reads nesting from the paths.
+fn nested(
+    grants: &[Option<ModelGrant>],
+    full: &Path,
+    rights: Rights,
+    skip: Option<usize>,
+) -> Option<Nested> {
+    for (index, grant) in grants.iter().enumerate() {
+        let Some(grant) = grant else { continue };
+        if Some(index) == skip {
+            continue;
+        }
+        if full.starts_with(&grant.path) && !rights.contains(grant.rights) {
+            return Some((full.to_path_buf(), rights, grant.path.clone(), grant.rights));
+        }
+        if grant.path.starts_with(full) && !grant.rights.contains(rights) {
+            return Some((grant.path.clone(), grant.rights, full.to_path_buf(), rights));
+        }
+    }
+    None
+}
+
+fn expect_nested<T>(
+    context: &str,
+    result: &Result<T, GateError>,
+    expected: &Nested,
+) -> Result<(), String> {
+    let (inner_path, inner, outer_path, outer) = expected;
+    ensure(
+        matches!(
+            result,
+            Err(GateError::NestedGrant {
+                inner_path: got_inner_path,
+                inner: got_inner,
+                outer_path: got_outer_path,
+                outer: got_outer,
+            }) if got_inner_path == inner_path
+                && got_inner == inner
+                && got_outer_path == outer_path
+                && got_outer == outer
+        ),
+        || {
+            format!(
+                "{context}: expected NestedGrant for `{}` {inner:?} within `{}` {outer:?}, got {}",
+                inner_path.display(),
+                outer_path.display(),
+                result_text(result)
+            )
+        },
+    )
+}
+
 /// The live grant RFC 0001 routes `full` to: the longest covering path,
 /// and of equal ones, the later grant, as `Iterator::max_by_key` picks.
 fn route(grants: &[Option<ModelGrant>], full: &Path) -> Option<usize> {
@@ -1369,8 +1470,12 @@ mod kernel {
         /// The installed rules never change, so a narrow or revoke after the
         /// lock binds only the gate.
         ChangedAfterLock,
-        /// Landlock allows an access when any rule allows it, so an enclosing
-        /// grant's rights apply beneath a nested grant with fewer.
+        /// Landlock allows an access when any rule allows it. A path the gate
+        /// routes to one grant can reach, through a symlink that stays in
+        /// it, an object beneath a nested grant that holds a right the routed
+        /// grant lacks. The kernel allows it and the gate refuses. A nested
+        /// grant never holds fewer rights than the grant around it (RFC
+        /// 0012), so the difference only ever refuses in the gate.
         NestedGrant,
         /// Landlock checks the object a path resolves to, so it allows a path
         /// through a symlink or `..` to an object a rule covers. The gate
@@ -1902,46 +2007,68 @@ mod kernel {
         child.finish()
     }
 
-    /// The kernel test. Like the model test, it requires that the run met
-    /// every gap and both answers of each operation.
-    #[test]
-    fn raw_calls_differ_from_the_gate_only_where_documented() {
-        let coverage = Mutex::new(KernelCoverage::default());
-        let mut runner = TestRunner::new(config());
-        if let Err(err) = runner.run(&case(), |case| {
-            replay(&case, &coverage).map_err(TestCaseError::fail)
-        }) {
-            panic!("{err}");
-        }
-        let coverage = coverage.into_inner().unwrap();
-        let mut missing = Vec::new();
-        for gap in [
-            Gap::Metadata,
-            Gap::ChangedAfterLock,
-            Gap::NestedGrant,
-            Gap::Route,
-            Gap::CreateWithoutWrite,
-        ] {
-            if !coverage.gaps.contains_key(&gap) {
-                missing.push(format!("{gap:?}"));
-            }
-        }
-        for op in ["open", "create", "metadata", "read_dir"] {
-            for outcome in ["reached", "refused"] {
-                let key = format!("{op} {outcome}");
-                if !coverage.agreed.contains_key(&key) {
-                    missing.push(format!("agreement on {key}"));
+    impl KernelCoverage {
+        /// The gaps and answers this run has not reached yet.
+        fn missing(&self) -> Vec<String> {
+            let mut missing = Vec::new();
+            for gap in [
+                Gap::Metadata,
+                Gap::ChangedAfterLock,
+                Gap::NestedGrant,
+                Gap::Route,
+                Gap::CreateWithoutWrite,
+            ] {
+                if !self.gaps.contains_key(&gap) {
+                    missing.push(format!("{gap:?}"));
                 }
             }
+            for op in ["open", "create", "metadata", "read_dir"] {
+                for outcome in ["reached", "refused"] {
+                    let key = format!("{op} {outcome}");
+                    if !self.agreed.contains_key(&key) {
+                        missing.push(format!("agreement on {key}"));
+                    }
+                }
+            }
+            for op in ["open", "create", "read_dir"] {
+                if !self.denied.contains_key(op) {
+                    missing.push(format!("EACCES on a raw {op}"));
+                }
+            }
+            missing
         }
-        for op in ["open", "create", "read_dir"] {
-            if !coverage.denied.contains_key(op) {
-                missing.push(format!("EACCES on a raw {op}"));
+    }
+
+    /// The kernel test. Like the model test, it requires that the run met
+    /// every gap and both answers of each operation, and a run that misses
+    /// one goes on with another 512 cases, up to `RUNS` in all.
+    /// [`Gap::NestedGrant`] needs a symlink into a nested grant that holds
+    /// more rights, which the model predicts in about 7 of 512 cases, so one
+    /// run in a thousand would miss it.
+    #[test]
+    fn raw_calls_differ_from_the_gate_only_where_documented() {
+        const RUNS: usize = 3;
+        let coverage = Mutex::new(KernelCoverage::default());
+        let mut first = TestRunner::new(config());
+        let mut missing = Vec::new();
+        for _ in 0..RUNS {
+            // As in the model test, each run takes a new runner whose
+            // generator comes from the first runner's.
+            let mut runner = TestRunner::new_with_rng(config(), first.new_rng());
+            if let Err(err) = runner.run(&case(), |case| {
+                replay(&case, &coverage).map_err(TestCaseError::fail)
+            }) {
+                panic!("{err}");
+            }
+            missing = coverage.lock().unwrap().missing();
+            if missing.is_empty() {
+                break;
             }
         }
+        let coverage = coverage.into_inner().unwrap();
         assert!(
             missing.is_empty(),
-            "the run never reached: {missing:?}\n{coverage:?}"
+            "{RUNS} runs never reached: {missing:?}\n{coverage:?}"
         );
         eprintln!("{coverage:?}");
     }
@@ -1973,13 +2100,17 @@ mod kernel {
                     ops: vec![Op::Revoke(0), Op::Fs(FsOp::Open, path(Some(1), vec![]))],
                 },
             ),
-            // An open beneath a nested grant that holds only LIST.
+            // A listing through a symlink into a nested grant that holds
+            // LIST, from a grant that holds only READ.
             (
                 Some(Gap::NestedGrant),
                 Case {
-                    tree: vec![(0, 0, NodeSpec::Dir), (1, 1, NodeSpec::File)],
-                    grants: vec![(0, all), (1, 0b1000)],
-                    ops: vec![Op::Fs(FsOp::Open, path(Some(2), vec![]))],
+                    tree: vec![
+                        (0, 0, NodeSpec::Dir),
+                        (0, 1, NodeSpec::Link(LinkSpec::To(1))),
+                    ],
+                    grants: vec![(0, 0b0001), (1, all)],
+                    ops: vec![Op::Fs(FsOp::ReadDir, path(Some(2), vec![]))],
                 },
             ),
             // An absolute symlink in one grant to a file in another.

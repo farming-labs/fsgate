@@ -56,6 +56,9 @@ use std::process::{Command, ExitCode};
 
 use fsgate::{Broker, Gate, Rights};
 
+#[cfg(target_os = "macos")]
+#[path = "fsgate-broker/acl.rs"]
+mod acl;
 #[path = "fsgate-broker/args.rs"]
 mod args;
 
@@ -227,7 +230,11 @@ fn run_inherited(
 /// broker by this path, so whoever can rename an entry along it can put
 /// their own socket there. Every directory the path passes through, before
 /// and after resolving symlinks, must belong to this user or root, and
-/// must not be writable by others unless it is sticky, as `/tmp` is.
+/// must not be writable by others unless it is sticky, as `/tmp` is. On
+/// macOS its access list must not allow anyone to add, delete, or rename
+/// entries, or to change the list, mode, or owner, since the mode bits do
+/// not show that list. On Linux an access list's mask is the group bits,
+/// which the mode check reads.
 fn check_socket_path(socket: &Path) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
 
@@ -270,6 +277,20 @@ fn check_socket_path(socket: &Path) -> Result<(), String> {
             }
             if meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0 {
                 return Err(refuse(dir, "is writable by other users and not sticky"));
+            }
+            #[cfg(target_os = "macos")]
+            if acl::lets_anyone_change_entries(dir).map_err(|err| {
+                format!(
+                    "`--socket {}`: reading the access list of `{}` failed: {err}",
+                    socket.display(),
+                    dir.display()
+                )
+            })? {
+                return Err(refuse(
+                    dir,
+                    "has an access list that lets others change its entries (`chmod -N` removes \
+                     it)",
+                ));
             }
             checked.push(dir.to_path_buf());
         }

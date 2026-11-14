@@ -98,11 +98,13 @@ const LINKS: [(&str, &str); 19] = [
 ];
 
 /// Grants, relative to [`TREE`]. The other two are nested in the first,
-/// so a symlink out of either reaches files the first one covers.
+/// so a symlink out of either reaches files the first one covers. Each
+/// holds every right of the first, as RFC 0012 requires, and `nested` lacks
+/// the rest.
 fn grants() -> [(&'static str, Rights); 3] {
     [
         ("granted", Rights::READ | Rights::LIST),
-        ("granted/nested", Rights::READ),
+        ("granted/nested", Rights::READ | Rights::LIST),
         (
             "granted/w",
             Rights::READ | Rights::WRITE | Rights::CREATE | Rights::LIST,

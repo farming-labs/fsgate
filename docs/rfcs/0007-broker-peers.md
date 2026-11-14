@@ -99,7 +99,9 @@ enough: whoever can rename an entry along the path can put their own
 socket in its place. Before binding, the broker checks every directory
 the path passes through, before and after resolving symlinks. Each must
 belong to the broker's user or root, and must not be writable by others
-unless it is sticky, as `/tmp` is. Otherwise it exits 1 before binding.
+unless it is sticky, as `/tmp` is. On macOS, its access list must not
+allow anyone to change its entries either ([changes after
+release](#changes-after-release)). Otherwise it exits 1 before binding.
 
 ### A peer check in `Broker::serve`
 
@@ -197,3 +199,21 @@ open questions answered:
    [RFC 0011](0011-audit-broker-refusals.md): a refused peer, a
    connection past the limit, and a request that breaks the protocol are
    each one event.
+
+## Changes after release
+
+1. **macOS access lists.** Through 0.4.1, the directory check read only
+   the mode bits. macOS keeps an access list beside them, so a `0700`
+   directory with an entry such as `everyone allow add_file,delete_child`
+   passed, and another user could replace the socket in it. The broker now
+   also refuses a directory whose list allows anyone, whoever the entry
+   names, to add or delete entries, delete or rename the directory, or
+   change its list, mode, or owner (`add_file`, `add_subdirectory`,
+   `delete_child`, `delete`, `writesecurity`, `chown`). Entries that only
+   deny, as on every home directory, are fine. Reading the list needs
+   `acl_get_link_np`, which no dependency wraps, so it is `unsafe` in its
+   own module, `fsgate-broker/acl.rs`, with a safety contract. Linux needs
+   no change: an access list's mask is the group bits, which the check
+   already reads (`acl(5)`). Found in an internal review at `ea159a6`.
+   `a_socket_path_whose_access_list_lets_others_change_it_is_refused`
+   tests it on macOS.

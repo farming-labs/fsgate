@@ -721,6 +721,76 @@ fn a_socket_path_others_could_replace_is_refused() {
     assert!(marker.exists(), "the broker did not start its command");
 }
 
+/// macOS keeps an access list beside a file's mode bits, and an entry in
+/// it can let others add and delete entries in a directory whose mode lets
+/// no one else in. The broker refuses a socket path through one. Entries
+/// that only deny, as on every home directory, or only let others list and
+/// search, are fine.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_socket_path_whose_access_list_lets_others_change_it_is_refused() {
+    let (root, granted, outside) = setup();
+    let base = root.path().canonicalize().unwrap();
+    let marker = outside.join("ran");
+    let run = |socket: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_fsgate-broker"))
+            .arg("--unconfined")
+            .args(["--grant", &format!("{}:r", granted.display())])
+            .arg("--socket")
+            .arg(socket)
+            .arg("--")
+            .arg("touch")
+            .arg(&marker)
+            .output()
+            .expect("run fsgate-broker")
+    };
+    let dir = |name: &str, entries: &[&str]| {
+        let path = base.join(name);
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        for entry in entries {
+            let status = Command::new("chmod")
+                .args(["+a", entry])
+                .arg(&path)
+                .status()
+                .expect("run chmod");
+            assert!(status.success(), "chmod +a {entry:?} failed");
+        }
+        path
+    };
+
+    for (name, entry) in [
+        ("adds", "everyone allow add_file"),
+        ("deletes", "everyone allow delete_child"),
+        ("owns", "everyone allow chown"),
+        ("secures", "everyone allow writesecurity"),
+    ] {
+        let open = dir(name, &[entry]);
+        let socket = open.join("broker.sock");
+        let output = run(&socket);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{entry}: {stderr}");
+        assert!(
+            stderr.contains(&format!("`{}` has an access list", open.display())),
+            "{entry}: {stderr}"
+        );
+        assert!(!socket.exists(), "{entry}: the broker bound the socket");
+        assert!(!marker.exists(), "{entry}: the broker started its command");
+    }
+
+    let closed = dir(
+        "closed",
+        &["everyone deny delete", "everyone allow list,search"],
+    );
+    let output = run(&closed.join("broker.sock"));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(marker.exists(), "the broker did not start its command");
+}
+
 fn broker_usage(args: &[&str]) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_fsgate-broker"))
         .args(args)
