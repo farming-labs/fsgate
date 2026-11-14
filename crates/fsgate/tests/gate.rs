@@ -193,6 +193,40 @@ fn list_requires_the_list_right() {
     assert!(gate.read_dir(&granted).is_ok());
 }
 
+/// A listing is names and types, read when `read_dir` returns, without `.`
+/// and `..`. A symlink is listed as a symlink, not as what it points to.
+#[cfg(unix)]
+#[test]
+fn read_dir_returns_each_entry_name_and_type() {
+    let (_root, granted, _) = setup();
+    fs::write(granted.join("a.txt"), b"a").unwrap();
+    fs::create_dir(granted.join("sub")).unwrap();
+    std::os::unix::fs::symlink("sub", granted.join("link")).unwrap();
+    let mut gate = Gate::new();
+    gate.grant(&granted, Rights::LIST).unwrap();
+
+    let entries = gate.read_dir(&granted).unwrap();
+    fs::remove_file(granted.join("a.txt")).unwrap();
+
+    let mut listed: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            let kind = entry.file_type();
+            let name = entry.file_name().to_str().unwrap().to_owned();
+            (name, kind.is_file(), kind.is_dir(), kind.is_symlink())
+        })
+        .collect();
+    listed.sort();
+    assert_eq!(
+        listed,
+        [
+            ("a.txt".to_owned(), true, false, false),
+            ("link".to_owned(), false, false, true),
+            ("sub".to_owned(), false, true, false),
+        ]
+    );
+}
+
 #[test]
 fn dotdot_cannot_reroute_to_an_ungranted_directory() {
     let (_root, granted, outside) = setup();

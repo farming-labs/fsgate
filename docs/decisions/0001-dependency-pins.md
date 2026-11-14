@@ -17,3 +17,5 @@ M2 crates are decided here but added to `Cargo.toml` only when M2 starts; no dep
 ## Consequences
 
 `cap-std` types appear in the public API (`Metadata`, `ReadDir` re-exports), so a cap-std major bump is a breaking change for fsgate. Accepted: wrapping them would add a conversion layer with no security value.
+
+*Amended by [RFC 0013](../rfcs/0013-read-dir-entries.md):* wrapping `ReadDir` did have security value. Its entries held the listed directory's descriptor and could open and remove files without the gate, so `read_dir` now returns fsgate's own `DirEntry`. The re-exports are `Metadata` and `FileType`, values that hold no descriptor.

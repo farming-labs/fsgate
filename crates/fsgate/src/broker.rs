@@ -412,7 +412,7 @@ impl Broker {
                 Err(err) => (error_response(err), None),
             },
             Request::ReadDir { path } => match self.gate.read_dir(&path) {
-                Ok(entries) => match collect_entry_names(entries) {
+                Ok(entries) => match entry_names(entries) {
                     Ok(entries) => (Response::Entries { entries }, None),
                     Err(err) => (error_response(err), None),
                 },
@@ -422,19 +422,17 @@ impl Broker {
     }
 }
 
-fn collect_entry_names(entries: crate::ReadDir) -> Result<Vec<String>, GateError> {
-    let mut names = Vec::new();
+fn entry_names(entries: Vec<crate::DirEntry>) -> Result<Vec<String>, GateError> {
+    let mut names = Vec::with_capacity(entries.len());
     for entry in entries {
-        let entry = entry.map_err(|source| GateError::Broker {
-            message: format!("reading a directory entry failed: {source}"),
-        })?;
-        match entry.file_name().into_string() {
-            Ok(name) => names.push(name),
-            Err(name) => {
+        match entry.file_name().to_str() {
+            Some(name) => names.push(name.to_owned()),
+            None => {
                 return Err(GateError::Broker {
                     message: format!(
-                        "directory entry {name:?} is not valid UTF-8; \
-                         the broker protocol requires UTF-8 names"
+                        "directory entry {:?} is not valid UTF-8; \
+                         the broker protocol requires UTF-8 names",
+                        entry.file_name()
                     ),
                 });
             }

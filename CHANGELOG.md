@@ -10,6 +10,7 @@
 
 ### Changed
 
+- **Breaking.** `Gate::read_dir` returns `Vec<DirEntry>`, fsgate's own entry with a name and a `FileType`, instead of cap-std's `ReadDir` ([RFC 0013](docs/rfcs/0013-read-dir-entries.md)). Each entry of a `ReadDir` held the listed directory's descriptor and could open, create, truncate, stat, and remove what it named, or open a subdirectory as a `Dir`, without the gate, so `LIST` alone gave every right beneath the directory, unaudited, and the entries kept working after `revoke` and `narrow`. A `Broker`'s worker was not affected, and after `lock()` the kernel refused what the rules did not give. The directory is read before `read_dir` returns, so an error partway fails the call and is audited. Replace `entry.open()` with `gate.open(dir.join(entry.file_name()))`. `fsgate::ReadDir` is removed, and `fsgate::FileType` is new.
 - A confined worker may read OpenSSL's configuration, `/etc/ssl/openssl.cnf` and Fedora's `/etc/pki/tls/openssl3.cnf`, where they exist ([RFC 0008](docs/rfcs/0008-confine-broker-worker.md#programs-that-read-files-in-etc)). Without it, Node.js did not start as a confined worker on Ubuntu, Debian, Fedora, Arch, or Alpine: it exited 13 with `OpenSSL configuration error` unless given `--direct` for the file. Like `/etc/ld.so.cache`, these are single files that hold no data, so a grant that contains one is not refused, and reading them is not audited.
 
 ## 0.4.1 (2026-11-13)
