@@ -1,7 +1,7 @@
-//! Descriptors a worker attaches to a request. A test binary of its own:
-//! these tests watch which descriptors stay open, and the Linux one lowers
-//! the process's descriptor limit, so nothing else may start programs or
-//! open files meanwhile. macOS marks received descriptors close-on-exec
+//! Descriptors a worker attaches to a request, and one a client cannot
+//! receive. A test binary of its own: these tests watch which descriptors
+//! stay open, and two lower the process's descriptor limit, so nothing else
+//! may start programs or open files meanwhile. macOS marks received descriptors close-on-exec
 //! only after `recvmsg` returns, so a program started then would inherit
 //! one. The tests take `SERIAL` so they do not overlap each other either.
 
@@ -229,5 +229,87 @@ fn a_request_whose_descriptors_cannot_be_received_fails_the_connection_closed() 
         // The kernel closed what it could not install; the broker closed
         // the rest.
         assert_peer_closed(&probe);
+    }
+}
+
+/// A client whose descriptor table is full cannot receive the descriptor
+/// an `open` response carries. It fails that request and every later one,
+/// and the error names the client's own limit rather than blaming the
+/// broker: macOS fails `recvmsg` with `EMFILE`, which the client passes on.
+/// Linux reports the message truncated instead, which the client cannot
+/// tell apart from a broker that attached too many.
+#[test]
+fn a_client_with_a_full_descriptor_table_fails_closed_naming_its_limit() {
+    use fsgate::{BrokerGate, GateError};
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
+    let _serial = serial();
+    let (client, broker) = UnixStream::pair().unwrap();
+    let carried = File::open("/dev/null").unwrap();
+    // The response is queued before the request, as a broker answers in
+    // lockstep and the client reads nothing else first.
+    send_with_descriptors(
+        &broker,
+        &frame(&serde_json::json!({ "result": "fd" })),
+        &[carried.as_fd()],
+    );
+    let mut client = BrokerGate::from_stream(client);
+
+    let saved = getrlimit(Resource::Nofile);
+    let open = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    };
+    let highest = fs::read_dir(open)
+        .unwrap()
+        .map(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        })
+        .max()
+        .unwrap();
+    setrlimit(
+        Resource::Nofile,
+        Rlimit {
+            current: Some(highest + 1),
+            maximum: saved.maximum,
+        },
+    )
+    .unwrap();
+    // Take every number left below the limit.
+    let mut filler = Vec::new();
+    let full = loop {
+        match rustix::io::dup(&carried) {
+            Ok(fd) => filler.push(fd),
+            Err(err) => break err,
+        }
+    };
+    let result = client.open("/granted/file");
+    drop(filler);
+    setrlimit(Resource::Nofile, saved).unwrap();
+    assert_eq!(full, rustix::io::Errno::MFILE, "the table did not fill");
+
+    let message = match result {
+        Err(GateError::Broker { message }) => message,
+        other => panic!("expected a broker error, got {other:?}"),
+    };
+    if cfg!(target_os = "linux") {
+        assert!(message.contains("could be received"), "{message}");
+    } else {
+        let limit = std::io::Error::from_raw_os_error(rustix::io::Errno::MFILE.raw_os_error());
+        assert!(message.contains(&limit.to_string()), "{message}");
+        assert!(!message.contains("could be received"), "{message}");
+    }
+    match client.metadata("/") {
+        Err(GateError::Broker { message }) => {
+            assert!(message.contains("open a new connection"), "{message}")
+        }
+        other => panic!("a later request should fail closed, got {other:?}"),
     }
 }
