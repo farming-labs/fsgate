@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.5.0 (unreleased)
+## 0.5.0 (2026-11-15)
 
-Not independently reviewed. Upgrade from 0.4.1 or earlier for the fixes from an internal review at `ea159a6`, listed under Fixed and Changed. Among them: a symlink or another spelling of a path reached a nested grant with fewer rights using the outer grant's rights, through the gate and through a `Broker`; a listing from `read_dir` could open, write, and remove files with only `LIST`, after `revoke` too; and on macOS another user could replace a `--socket` path through the directory's access list. Two of the changes break callers, which is why this is a minor release: a policy that nests a grant with fewer rights than the grant around it now fails to build, and `read_dir` returns `Vec<DirEntry>`. Their entries under Changed say what to use instead. Everything behind the `experimental-intercept` feature is not part of this release: it builds only from the repository, and the published crate refuses the feature with a compile error.
+[`fsgate` 0.5.0](https://crates.io/crates/fsgate/0.5.0), built from the signed tag [`v0.5.0`](https://github.com/farming-labs/fsgate/tree/v0.5.0) on `af142c4`. Not independently reviewed. Upgrade from 0.4.1 or earlier for the fixes from an internal review at `ea159a6`, listed under Fixed and Changed. Among them: a symlink or another spelling of a path reached a nested grant with fewer rights using the outer grant's rights, through the gate and through a `Broker`; a listing from `read_dir` could open, write, and remove files with only `LIST`, after `revoke` too; and on macOS another user could replace a `--socket` path through the directory's access list. Two of the changes break callers, which is why this is a minor release: a policy that nests a grant with fewer rights than the grant around it now fails to build, and `read_dir` returns `Vec<DirEntry>`. Their entries under Changed say what to use instead. Everything behind the `experimental-intercept` feature is not part of this release: it builds only from the repository, and the published crate refuses the feature with a compile error.
 
 ### Fixed
 
