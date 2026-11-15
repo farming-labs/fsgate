@@ -662,6 +662,224 @@ mod kernel {
         }
     }
 
+    /// Runs the unlocked observer `scenario` in `mode`, started with
+    /// `signal` blocked in every thread, so a signal the kernel sends it
+    /// stays pending until the observer looks.
+    fn run_observer(
+        scenario: &str,
+        mode: &str,
+        signal: i32,
+        granted: &std::path::Path,
+        outside: &std::path::Path,
+    ) {
+        let mut command = child_command(scenario, mode);
+        command
+            .env("FSGATE_GRANTED", granted)
+            .env("FSGATE_OUTSIDE", outside);
+        raw_signals::block_in_child(&mut command, signal);
+        let status = command.status().expect("spawn the observer");
+        assert!(status.success(), "{scenario} ({mode}) failed: {status}");
+    }
+
+    /// The kernel sends `SIGCHLD` when a process exits, and the signal scope
+    /// does not stop it (RFC 0006): the parent of a locked process still
+    /// learns that it exited. The same child fails to signal that parent
+    /// itself, so the scope was on.
+    #[test]
+    fn a_locked_process_still_signals_its_exit_to_its_parent() {
+        for mode in modes(6) {
+            let (_root, granted, outside) = dirs();
+            run_observer(
+                "exit_signal_observer",
+                mode,
+                libc::SIGCHLD,
+                &granted,
+                &outside,
+            );
+        }
+    }
+
+    #[test]
+    fn exit_signal_observer() {
+        let Some(mode) = child_mode("exit_signal_observer") else {
+            return;
+        };
+        // This process is not locked, so it is outside the child's domain.
+        let mut child = child_command("exit_signal_child", &mode)
+            .spawn()
+            .expect("spawn the locked child");
+        let pid = i32::try_from(child.id()).unwrap();
+        let status = child.wait().unwrap();
+        assert!(
+            status.success(),
+            "exit_signal_child ({mode}) failed: {status}"
+        );
+        // The kernel queues `SIGCHLD` before the wait returns.
+        assert_eq!(
+            raw_signals::take(libc::SIGCHLD),
+            Some(pid),
+            "mode {mode}: no exit signal from the locked child"
+        );
+    }
+
+    #[test]
+    fn exit_signal_child() {
+        let Some(mode) = child_mode("exit_signal_child") else {
+            return;
+        };
+        let mut gate = granted_gate();
+        lock_for(&mut gate, Restrictions::SIGNAL, &mode);
+
+        // Signal 0 checks the permission and sends nothing.
+        let parent = rustix::process::getppid().expect("a parent");
+        let probe = rustix::process::test_kill_process(parent);
+        if mode == "restricted" {
+            assert_eq!(probe, Err(Errno::PERM));
+        } else {
+            probe.expect("may signal the parent without the scope");
+        }
+    }
+
+    /// The signal scope covers `SIGIO` that a locked process asks for with
+    /// `F_SETOWN` (RFC 0006): when its socket becomes readable, the kernel
+    /// does not signal an owner outside its domain. Setting that owner is
+    /// not refused. Without the scope, the same owner gets the signal.
+    #[test]
+    fn kernel_scopes_io_signals_a_locked_process_asks_for() {
+        for mode in modes(6) {
+            let (_root, granted, outside) = dirs();
+            run_observer("io_signal_observer", mode, libc::SIGIO, &granted, &outside);
+        }
+    }
+
+    #[test]
+    fn io_signal_observer() {
+        let Some(mode) = child_mode("io_signal_observer") else {
+            return;
+        };
+        // This process is not locked, so it is outside the child's domain.
+        let status = child_command("io_signal_child", &mode)
+            .env("FSGATE_OWNER", std::process::id().to_string())
+            .status()
+            .expect("spawn the locked child");
+        assert!(
+            status.success(),
+            "io_signal_child ({mode}) failed: {status}"
+        );
+        // The kernel sends `SIGIO` during the child's write, before it exits.
+        let arrived = raw_signals::take(libc::SIGIO).is_some();
+        assert_eq!(
+            arrived,
+            mode != "restricted",
+            "mode {mode}: SIGIO arrived: {arrived}"
+        );
+    }
+
+    #[test]
+    fn io_signal_child() {
+        let Some(mode) = child_mode("io_signal_child") else {
+            return;
+        };
+        let mut gate = granted_gate();
+        lock_for(&mut gate, Restrictions::SIGNAL, &mode);
+
+        let owner: i32 = std::env::var("FSGATE_OWNER").unwrap().parse().unwrap();
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        raw_signals::signal_owner_on_input(&reader, owner).expect("F_SETOWN and O_ASYNC");
+        writer.write_all(b"x").unwrap();
+    }
+
+    /// Signal masks, pending signals, and `F_SETOWN`, which neither std nor
+    /// this crate's `rustix` features wrap.
+    ///
+    /// Safety contract: each call passes only values initialized before it,
+    /// or a descriptor borrowed for the call, and the code that runs between
+    /// fork and exec calls only an async-signal-safe function.
+    #[allow(unsafe_code)]
+    mod raw_signals {
+        use std::io;
+        use std::mem::MaybeUninit;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        /// A set that holds only `signal`.
+        fn only(signal: i32) -> libc::sigset_t {
+            let mut set = MaybeUninit::<libc::sigset_t>::uninit();
+            // SAFETY: `sigemptyset` initializes the set, and `sigaddset`
+            // then adds a valid signal number to it.
+            unsafe {
+                libc::sigemptyset(set.as_mut_ptr());
+                libc::sigaddset(set.as_mut_ptr(), signal);
+                set.assume_init()
+            }
+        }
+
+        /// Starts `command` with `signal` blocked. A process keeps its mask
+        /// across exec, and a thread starts with the mask of the thread that
+        /// starts it, so no thread of the child acts on the signal.
+        pub(super) fn block_in_child(command: &mut Command, signal: i32) {
+            let set = only(signal);
+            // SAFETY: the closure runs in the child between fork and exec.
+            // It calls only `pthread_sigmask`, which is async-signal-safe,
+            // with a set built before the fork, and allocates nothing.
+            unsafe {
+                command.pre_exec(move || {
+                    match libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) {
+                        0 => Ok(()),
+                        err => Err(io::Error::from_raw_os_error(err)),
+                    }
+                });
+            }
+        }
+
+        /// Takes `signal` if it is pending for this thread or its process,
+        /// and returns the sender's process ID, which is 0 for the kernel.
+        /// The signal must be blocked. Returns `None` at once if it is not
+        /// pending.
+        pub(super) fn take(signal: i32) -> Option<i32> {
+            let set = only(signal);
+            let mut info = MaybeUninit::<libc::siginfo_t>::uninit();
+            let now = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: `set` and `now` are initialized and outlive the call,
+            // and `info` has room for the `siginfo_t` the kernel writes.
+            let got = unsafe { libc::sigtimedwait(&set, info.as_mut_ptr(), &now) };
+            if got == -1 {
+                let err = io::Error::last_os_error();
+                assert_eq!(err.raw_os_error(), Some(libc::EAGAIN), "{err}");
+                return None;
+            }
+            assert_eq!(got, signal);
+            // SAFETY: `sigtimedwait` returned the signal, so the kernel
+            // filled `info`.
+            Some(unsafe { info.assume_init().si_pid() })
+        }
+
+        /// Makes the kernel send `SIGIO` to the process `owner` when
+        /// `socket` becomes readable: `F_SETOWN`, then `O_ASYNC`.
+        pub(super) fn signal_owner_on_input(socket: &impl AsRawFd, owner: i32) -> io::Result<()> {
+            let fd = socket.as_raw_fd();
+            // SAFETY: `fd` stays open while `socket` is borrowed, and
+            // `F_SETOWN` takes a process ID.
+            if unsafe { libc::fcntl(fd, libc::F_SETOWN, owner) } == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: as above, and `F_GETFL` takes no argument.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: as above, and `F_SETFL` takes the status flags.
+            if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_ASYNC) } == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+    }
+
     #[test]
     fn kernel_restricts_device_ioctls() {
         let mut modes = modes(5);
