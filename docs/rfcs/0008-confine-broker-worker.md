@@ -390,10 +390,44 @@ start. Like `/etc/ld.so.cache`, it holds no data, so a grant that
 contains it is not refused. The other files above stay opt-in.
 
 A file in `/etc` that links into a runtime directory is readable through
-that directory's rule. In the `nixos/nix` image, `/etc/passwd` links into
-`/nix/store`, so a confined worker there can read it, as it can anything in
-the store since [#83](https://github.com/farming-labs/fsgate/pull/83).
+that directory's rule. In the `nixos/nix` image, `/etc/passwd`,
+`/etc/group`, and `/etc/shadow` link into `/nix/store`, so a confined
+worker there can read them if its user can, as it can anything in the
+store since [#83](https://github.com/farming-labs/fsgate/pull/83).
 
-Not measured: a full NixOS system, Guix's `/gnu/store`, Arch on arm64,
-architectures other than x86_64 and arm64, and the programs above on Nix
-and on arm64.
+#### On arm64 and Nix
+
+A [fourth run](https://github.com/farming-labs/fsgate/actions/runs/43768890757),
+from `3f96600`, 0.5.0's code, with only the probe added, ran the same
+programs on both runners, x86_64 and arm64, and in the `distros` job's
+containers on each: Debian 13, Fedora 45, Alpine 3.24, and the `nixos/nix`
+image, plus Arch on x86_64. Node.js started under the default rules in all
+eleven, with no `--direct`. On arm64, each program needed the same files
+as on x86_64 for the same system.
+
+In the `nixos/nix` image the probe ran as the image's `nobody`, because a
+new user cannot be added to an `/etc/passwd` in the store. On both
+architectures, `id -un` passed under the default rules too, and the CA
+bundle in `/etc/ssl/certs` also links into the store. getent, curl,
+`git ls-remote`, Python, and Node's `fetch` each passed once given only
+`/etc/hosts` and `/etc/resolv.conf`; the image has no
+`/etc/nsswitch.conf`. Docker writes those two files into every container,
+so the run does not show what a NixOS system needs for names.
+
+On Fedora, `/etc/pki/tls/openssl3.cnf` includes `/etc/pki/tls/openssl.d`,
+which the default rules refuse, and the system's crypto policy,
+`/etc/crypto-policies/back-ends/opensslcnf.config`, a link into
+`/usr/share/crypto-policies`, which `/usr` covers. A
+[fifth run](https://github.com/farming-labs/fsgate/actions/runs/43770028917)
+compared Python's default TLS context, Node's TLS ciphers, and
+`openssl ciphers -s` unconfined, confined under the default rules, and
+confined with `--direct` for `/etc/pki/tls/openssl.d` and
+`/etc/crypto-policies`, on both architectures. Each reported the same in
+every case: 61 ciphers, TLS 1.2 at least, and security level 2 for Python,
+62 ciphers for Node.js, and 35 for `openssl`. The policy's file was not
+refused, and no program reported the refused directory. It is empty in the
+image, so a file added there would not reach a confined worker without
+`--direct`.
+
+Not measured: a full NixOS system, Guix's `/gnu/store`, Arch on arm64, and
+architectures other than x86_64 and arm64.
