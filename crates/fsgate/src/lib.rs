@@ -52,6 +52,7 @@ pub use audit::{AuditDecision, AuditEvent, AuditOp, AuditReason, AuditSink};
 #[cfg(unix)]
 pub use broker::{Broker, BrokerGate, FileStat, ServeOptions};
 
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
 use std::io;
@@ -64,7 +65,37 @@ use std::time::SystemTime;
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 
-pub use cap_std::fs::{Metadata, ReadDir};
+pub use cap_std::fs::{FileType, Metadata};
+
+/// One entry of a directory [`Gate::read_dir`] listed: its name and type,
+/// read when the directory was listed.
+///
+/// Unlike [`std::fs::DirEntry`], it holds no handle, so it cannot open,
+/// stat, or remove what it names. Everything beyond the listing goes
+/// through the gate, with the rights that needs.
+///
+/// ```compile_fail,E0599
+/// fn reopen(entry: &fsgate::DirEntry) {
+///     let _ = entry.open(); // no such method: an entry opens nothing
+/// }
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirEntry {
+    name: OsString,
+    file_type: FileType,
+}
+
+impl DirEntry {
+    /// The entry's name in its directory, without the directory's path.
+    pub fn file_name(&self) -> &OsStr {
+        &self.name
+    }
+
+    /// What the entry is. A symlink is reported as a symlink, not followed.
+    pub fn file_type(&self) -> FileType {
+        self.file_type
+    }
+}
 
 /// A set of rights attached to a grant.
 ///
@@ -1026,12 +1057,33 @@ impl Gate {
     }
 
     /// Lists a directory. Needs [`Rights::LIST`].
-    pub fn read_dir(&self, path: impl AsRef<Path>) -> Result<ReadDir, GateError> {
+    ///
+    /// Returns each entry's name and type, without `.` and `..`, in the
+    /// order the filesystem gives them ([RFC 0013]). The whole directory is
+    /// read before this returns, so an error partway through fails the call
+    /// and is audited with its errno. An entry holds no handle, so a listing
+    /// gives nothing beyond [`Rights::LIST`], and nothing after
+    /// [`revoke`](Gate::revoke).
+    ///
+    /// [RFC 0013]: https://github.com/farming-labs/fsgate/blob/main/docs/rfcs/0013-read-dir-entries.md
+    pub fn read_dir(&self, path: impl AsRef<Path>) -> Result<Vec<DirEntry>, GateError> {
         self.gated(
             AuditOp::ReadDir,
             path.as_ref(),
             Rights::LIST,
-            |entry, rel| entry.dir.read_dir(rel),
+            |entry, rel| {
+                entry
+                    .dir
+                    .read_dir(rel)?
+                    .map(|listed| {
+                        let listed = listed?;
+                        Ok(DirEntry {
+                            name: listed.file_name(),
+                            file_type: listed.file_type()?,
+                        })
+                    })
+                    .collect()
+            },
         )
     }
 

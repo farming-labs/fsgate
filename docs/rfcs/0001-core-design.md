@@ -35,11 +35,11 @@ impl Gate {
     pub fn open(&self, path: impl AsRef<Path>) -> Result<File, GateError>;
     pub fn create(&self, path: impl AsRef<Path>) -> Result<File, GateError>;
     pub fn metadata(&self, path: impl AsRef<Path>) -> Result<Metadata, GateError>;
-    pub fn read_dir(&self, path: impl AsRef<Path>) -> Result<ReadDir, GateError>;
+    pub fn read_dir(&self, path: impl AsRef<Path>) -> Result<Vec<DirEntry>, GateError>; // RFC 0013
 }
 ```
 
-As implemented for the planned v0.1.0: `lock` reports the achieved `LockStatus` (`FullyEnforced` / `PartiallyEnforced` / `LibraryOnly`) because a best-effort lock that enforced nothing must say so; `create` requires `CREATE | WRITE`, since the returned handle writes data. The broker client (`BrokerGate`, RFC 0003) exposes `open`, `create`, `metadata`, and `read_dir` with serializable result types where needed. Granting, locking, and revocation belong to the server's `Gate`, not the worker client.
+As implemented for the planned v0.1.0: `lock` reports the achieved `LockStatus` (`FullyEnforced` / `PartiallyEnforced` / `LibraryOnly`) because a best-effort lock that enforced nothing must say so; `create` requires `CREATE | WRITE`, since the returned handle writes data. Until 0.5.0, `read_dir` returned cap-std's `ReadDir`, whose entries could open and remove files without the gate; it now returns each entry's name and type ([RFC 0013](0013-read-dir-entries.md)). The broker client (`BrokerGate`, RFC 0003) exposes `open`, `create`, `metadata`, and `read_dir` with serializable result types where needed. Granting, locking, and revocation belong to the server's `Gate`, not the worker client.
 
 Naming follows fixed verb jobs: `grant` confers authority, `lock` applies containment, `narrow` removes rights from a live grant, `revoke` is the reverse of `grant`. Every registration has its reverse; `lock()` is the one deliberate exception and is documented as irreversible.
 

@@ -35,7 +35,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-use cap_std::fs::MetadataExt as _;
+use cap_std::fs::{FileTypeExt as CapFileTypeExt, MetadataExt as _};
 use fsgate::{Gate, GateError, Rights};
 use libfuzzer_sys::fuzz_target;
 
@@ -112,7 +112,7 @@ fn grants() -> [(&'static str, Rights); 3] {
     ]
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Kind {
     Dir,
     File,
@@ -132,14 +132,16 @@ struct Entry {
 }
 
 type Snapshot = BTreeMap<PathBuf, Entry>;
-type Listing = BTreeSet<(OsString, (u64, u64))>;
+/// A listing's names and types. An entry holds no handle to stat.
+type Listing = BTreeSet<(OsString, Kind)>;
 
 struct Covered {
     path: PathBuf,
     rights: Rights,
     /// Every object beneath the grant, its own directory included.
     ids: BTreeSet<(u64, u64)>,
-    /// What listing each directory beneath the grant gives.
+    /// What listing each directory beneath the grant gives. Every
+    /// directory in the fixture lists something different.
     listings: BTreeSet<Listing>,
 }
 
@@ -203,9 +205,25 @@ fn listing_of(dir: &Path) -> Listing {
         .expect("list the fixture")
         .map(|entry| {
             let entry = entry.expect("read a fixture entry");
-            (entry.file_name(), id_of(&entry.path()))
+            let meta = fs::symlink_metadata(entry.path()).expect("stat a fixture entry");
+            (entry.file_name(), kind_of(&meta))
         })
         .collect()
+}
+
+/// What `read_dir` says an entry is.
+fn listed_kind(kind: fsgate::FileType) -> Kind {
+    if kind.is_dir() {
+        Kind::Dir
+    } else if kind.is_file() {
+        Kind::File
+    } else if kind.is_symlink() {
+        Kind::Symlink
+    } else if CapFileTypeExt::is_fifo(&kind) {
+        Kind::Fifo
+    } else {
+        Kind::Other
+    }
 }
 
 fn covered(rel: &str, rights: Rights, snapshot: &Snapshot) -> Covered {
@@ -277,6 +295,18 @@ fn fixture() -> &'static Fixture {
     FIXTURE.get_or_init(|| {
         build();
         let snapshot = snapshot();
+        // A listing has no inode numbers, so it names its directory only if
+        // no other directory lists the same names and types.
+        let mut listings = BTreeSet::from([listing_of(Path::new(TREE))]);
+        for (rel, entry) in &snapshot {
+            if entry.kind == Kind::Dir {
+                assert!(
+                    listings.insert(listing_of(&Path::new(TREE).join(rel))),
+                    "`{}` lists what another fixture directory lists",
+                    rel.display()
+                );
+            }
+        }
         let mut gate = Gate::new();
         let grants = grants()
             .into_iter()
@@ -368,11 +398,8 @@ fn run(gate: &Gate, op: Op, path: &Path) -> Result<Reached, GateError> {
         }
         Op::ReadDir => Reached::Listing(
             gate.read_dir(path)?
-                .map(|entry| {
-                    let entry = entry.expect("read a listed entry");
-                    let meta = entry.metadata().expect("stat a listed entry");
-                    (entry.file_name(), (meta.dev(), meta.ino()))
-                })
+                .into_iter()
+                .map(|entry| (entry.file_name().to_owned(), listed_kind(entry.file_type())))
                 .collect(),
         ),
     })

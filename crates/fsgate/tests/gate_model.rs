@@ -1069,19 +1069,23 @@ impl Run<'_> {
             }
             Reached::Metadata(meta) => (CapMetadataExt::dev(&meta), CapMetadataExt::ino(&meta)),
             Reached::Dir(entries) => {
-                let mut listed = BTreeMap::new();
-                for entry in entries {
-                    let entry = entry.unwrap();
-                    let is_link = entry.file_type().unwrap().is_symlink();
-                    let meta = entry.metadata().unwrap();
-                    let id = (CapMetadataExt::dev(&meta), CapMetadataExt::ino(&meta));
-                    listed.insert(entry.file_name(), (!is_link).then_some(id));
-                }
+                // An entry holds no handle, so a listing is matched by its
+                // names and types. One that matches the target's gives the
+                // caller what listing the target gives.
+                let listed: BTreeMap<_, _> = entries
+                    .iter()
+                    .map(|entry| {
+                        let kind = entry.file_type();
+                        let kind = listed_kind(kind.is_dir(), kind.is_file(), kind.is_symlink());
+                        (entry.file_name().to_owned(), kind)
+                    })
+                    .collect();
                 let mut expected = BTreeMap::new();
                 for entry in fs::read_dir(target).unwrap() {
                     let entry = entry.unwrap();
-                    let is_link = entry.file_type().unwrap().is_symlink();
-                    expected.insert(entry.file_name(), (!is_link).then(|| id_of(&entry.path())));
+                    let kind = entry.file_type().unwrap();
+                    let kind = listed_kind(kind.is_dir(), kind.is_file(), kind.is_symlink());
+                    expected.insert(entry.file_name(), kind);
                 }
                 ensure(listed == expected, || {
                     format!("{context}: listed {listed:?}, expected {expected:?}")
@@ -1275,7 +1279,17 @@ enum Reached {
     File(fs::File),
     Created(fs::File),
     Metadata(fsgate::Metadata),
-    Dir(fsgate::ReadDir),
+    Dir(Vec<fsgate::DirEntry>),
+}
+
+/// What a listing says an entry is.
+fn listed_kind(dir: bool, file: bool, symlink: bool) -> &'static str {
+    match (dir, file, symlink) {
+        (true, _, _) => "dir",
+        (_, true, _) => "file",
+        (_, _, true) => "symlink",
+        _ => "other",
+    }
 }
 
 /// Builds a case's tree and makes its grants.
