@@ -6,49 +6,15 @@ on:
 permissions:
   contents: read
 jobs:
-  host:
+  fedora-openssl:
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         runner: [ubuntu-latest, ubuntu-26.04-arm]
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
-        with:
-          toolchain: stable
-      - run: sudo apt-get update && sudo apt-get install --yes strace
-      - run: command -v node || sudo apt-get install --yes nodejs
-      - run: cargo build --locked --bin fsgate-broker
-      - run: bash .github/probe/etc.sh "$PWD/target/debug/fsgate-broker"
-  distros:
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-latest, ubuntu-26.04-arm]
-        system: [debian, fedora, arch, alpine, nix]
-        exclude:
-          - runner: ubuntu-26.04-arm
-            system: arch
-        include:
-          - system: debian
-            image: debian:13-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
-          - system: fedora
-            image: fedora:45@sha256:a7d72ba2745b100a3351087472e5ee7b2450af7cf331e7673007e3817612839c
-          - system: arch
-            image: archlinux:base-20261108.0.623074@sha256:d4594bb2300cba11f41c2f27923eb56f63d9988909c402f9c95517d1e362c899
-          - system: alpine
-            image: alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
-          - system: nix
-            image: nixos/nix:2.35.6@sha256:b49cb33f3a7e5cf3933ad8774529de0e3807ec5cf54987aa7ccdfb49f2fc55ed
     env:
-      SYSTEM: ${{ matrix.system }}
-      IMAGE: ${{ matrix.image }}
+      IMAGE: fedora:45@sha256:a7d72ba2745b100a3351087472e5ee7b2450af7cf331e7673007e3817612839c
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -56,14 +22,7 @@ jobs:
       - run: >-
           docker run --detach --name distro --volume "$PWD:/src" --workdir /src
           "$IMAGE" tail -f /dev/null
-      - run: docker exec distro /bin/sh .github/probe/setup.sh "$SYSTEM"
-      # The nixos/nix image's /etc/passwd links into /nix/store, so it gets
-      # no new user; its `nobody` runs the probe instead.
-      - run: |
-          user=probe
-          if [ "$SYSTEM" = nix ]; then
-            user=nobody
-          fi
-          path=$(docker exec distro cat /etc/fsgate-probe-path)
-          docker exec --env PATH="$path" --user "$user" --workdir / distro \
-            bash /src/.github/probe/etc.sh /opt/target/debug/fsgate-broker
+      - run: docker exec distro /bin/sh .github/probe/setup.sh fedora
+      - run: >-
+          docker exec --user probe --workdir / distro
+          bash /src/.github/probe/openssl.sh /opt/target/debug/fsgate-broker

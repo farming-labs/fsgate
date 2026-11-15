@@ -13,7 +13,8 @@ debian)
     useradd -m -u 2000 probe
     ;;
 fedora)
-    dnf install --assumeyes cargo rust gcc strace nodejs git curl python3 shadow-utils
+    dnf install --assumeyes cargo rust gcc strace nodejs git curl python3 shadow-utils \
+        openssl
     useradd -m -u 2000 probe
     ;;
 arch)
