@@ -30,6 +30,14 @@ crates/fsgate/src/containment.rs: replace == with != in apply
 # catches it without Landlock, and the macOS run catches it too.
 crates/fsgate/src/lib.rs: replace <impl From<LockPolicy> for LockOptions>::from -> LockOptions with Default::default()
 
+# Linux reports descriptors that do not fit with `MSG_CTRUNC`, which
+# `read_frame` checks after the call, and never fails `recvmsg` with
+# `EMFILE` or `EMSGSIZE` for them, so the arm for those errors is not
+# reached. The macOS run catches all three.
+crates/fsgate/src/broker.rs: replace match guard descriptors == Descriptors::Refuse with true in read_frame
+crates/fsgate/src/broker.rs: replace match guard descriptors == Descriptors::Refuse with false in read_frame
+crates/fsgate/src/broker.rs: replace == with != in read_frame
+
 # `CAN_READ_PEER_UID` is true on Linux and macOS, so the guard is false
 # without the mutant too.
 crates/fsgate/src/broker.rs: replace match guard !CAN_READ_PEER_UID with false in ServeOptions::allowed_uids
