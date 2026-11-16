@@ -795,13 +795,14 @@ mod unix_socket_filter {
 ///   kills later system calls; it changes no memory that Rust code holds.
 /// - `sigemptyset`, `sigaddset`, `sigaction`, `pthread_sigmask`, and
 ///   `sigwait` read and write only the `sigset_t`, `sigaction`, and `c_int`
-///   values passed to them, each a local or a field of [`SignalSet`] that
-///   outlives the call. `sigaction` with a null new action only reads the
-///   current one. A mask belongs to the calling thread. None of these
-///   touch memory or descriptors that Rust code holds.
-/// - [`die_by`] restores the default action for a signal that `std` does
-///   not handle and raises it, so the process ends without returning to
-///   Rust code that could observe the change.
+///   values passed to them, each a local or a field of
+///   [`SignalSet`](sys::SignalSet) that outlives the call. `sigaction` with
+///   a null new action only reads the current one. A mask belongs to the
+///   calling thread. None of these touch memory or descriptors that Rust
+///   code holds.
+/// - [`die_by`](sys::die_by) restores the default action for a signal that
+///   `std` does not handle and raises it, so the process ends without
+///   returning to Rust code that could observe the change.
 #[allow(unsafe_code)]
 mod sys {
     use std::io;
