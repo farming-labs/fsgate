@@ -25,8 +25,8 @@ proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 tempfile = "3.27.0"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-# Safe `kill` and `tcgetattr` for the RFC 0006 locked-child tests.
-rustix = { version = "1.1.6", features = ["process", "termios"] }
+# Safe `kill`, `tcgetattr`, and `poll` for the RFC 0006 locked-child tests.
+rustix = { version = "1.1.6", features = ["event", "process", "termios"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.7"

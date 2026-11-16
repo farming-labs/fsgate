@@ -241,10 +241,11 @@ mod kernel {
     use std::os::unix::net::{SocketAddr, UnixDatagram, UnixListener, UnixStream};
     use std::os::unix::process::ExitStatusExt;
     use std::path::PathBuf;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
     use std::sync::{OnceLock, mpsc};
 
     use fsgate::{Broker, BrokerGate};
+    use rustix::event::{PollFd, PollFlags};
     use rustix::io::Errno;
     use tempfile::TempDir;
 
@@ -752,27 +753,31 @@ mod kernel {
         }
     }
 
+    /// Runs the locked `child` in `mode`, naming this process in
+    /// `FSGATE_OWNER` for the child to make the owner of a socket, and
+    /// requires `signal` to have arrived unless the scope is on. The kernel
+    /// sends it during the child's system call, before the child exits.
+    fn observe_owner_signal(child: &str, mode: &str, signal: i32) {
+        // This process is not locked, so it is outside the child's domain.
+        let status = child_command(child, mode)
+            .env("FSGATE_OWNER", std::process::id().to_string())
+            .status()
+            .expect("spawn the locked child");
+        assert!(status.success(), "{child} ({mode}) failed: {status}");
+        let arrived = raw_signals::take(signal).is_some();
+        assert_eq!(
+            arrived,
+            mode != "restricted",
+            "mode {mode}: signal {signal} arrived: {arrived}"
+        );
+    }
+
     #[test]
     fn io_signal_observer() {
         let Some(mode) = child_mode("io_signal_observer") else {
             return;
         };
-        // This process is not locked, so it is outside the child's domain.
-        let status = child_command("io_signal_child", &mode)
-            .env("FSGATE_OWNER", std::process::id().to_string())
-            .status()
-            .expect("spawn the locked child");
-        assert!(
-            status.success(),
-            "io_signal_child ({mode}) failed: {status}"
-        );
-        // The kernel sends `SIGIO` during the child's write, before it exits.
-        let arrived = raw_signals::take(libc::SIGIO).is_some();
-        assert_eq!(
-            arrived,
-            mode != "restricted",
-            "mode {mode}: SIGIO arrived: {arrived}"
-        );
+        observe_owner_signal("io_signal_child", &mode, libc::SIGIO);
     }
 
     #[test]
@@ -789,12 +794,141 @@ mod kernel {
         writer.write_all(b"x").unwrap();
     }
 
+    /// The signal scope also covers `SIGURG`, which the kernel sends the
+    /// `F_SETOWN` owner of a socket when out-of-band data arrives on it,
+    /// with or without `O_ASYNC` (RFC 0006). Without the scope, the same
+    /// owner gets it.
+    #[test]
+    fn kernel_scopes_urgent_signals_a_locked_process_asks_for() {
+        for mode in modes(6) {
+            let (_root, granted, outside) = dirs();
+            run_observer(
+                "urgent_signal_observer",
+                mode,
+                libc::SIGURG,
+                &granted,
+                &outside,
+            );
+        }
+    }
+
+    #[test]
+    fn urgent_signal_observer() {
+        let Some(mode) = child_mode("urgent_signal_observer") else {
+            return;
+        };
+        observe_owner_signal("urgent_signal_child", &mode, libc::SIGURG);
+    }
+
+    #[test]
+    fn urgent_signal_child() {
+        let Some(mode) = child_mode("urgent_signal_child") else {
+            return;
+        };
+        let mut gate = granted_gate();
+        lock_for(&mut gate, Restrictions::SIGNAL, &mode);
+
+        let owner: i32 = std::env::var("FSGATE_OWNER").unwrap().parse().unwrap();
+        let (writer, reader) = UnixStream::pair().unwrap();
+        raw_signals::set_owner(&reader, owner).expect("F_SETOWN");
+        let sent = rustix::net::send(&writer, b"x", rustix::net::SendFlags::OOB)
+            .expect("send out-of-band data on a Unix stream socket");
+        assert_eq!(sent, 1);
+    }
+
+    /// A process started before the lock is outside the locked process's
+    /// domain, so when the locked process exits, the signal scope stops
+    /// the death signal that process asked for with `PR_SET_PDEATHSIG`
+    /// (RFC 0006). Without the scope, it arrives.
+    #[test]
+    fn kernel_scopes_the_death_signal_of_a_process_started_before_the_lock() {
+        let mut modes = modes(6);
+        // Before Linux 7.0 the lock covers only the thread that calls it,
+        // and the kernel sends the death signal again as each thread of
+        // the exiting process ends, so the result would depend on which
+        // thread ends last. From 7.0 the lock covers every thread.
+        if kernel_abi() < 8 {
+            modes.retain(|mode| *mode != "restricted");
+        }
+        for mode in modes {
+            let (_root, granted, outside) = dirs();
+            // The observer inherits the parent's standard output, so this
+            // reads to its end only once both have exited.
+            let output = child_command("death_signal_parent", mode)
+                .env("FSGATE_GRANTED", &granted)
+                .env("FSGATE_OUTSIDE", &outside)
+                .output()
+                .expect("spawn the locked parent");
+            assert!(
+                output.status.success(),
+                "death_signal_parent ({mode}) failed: {output:?}"
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let arrived: bool = stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("FSGATE_DEATH_SIGNAL="))
+                .unwrap_or_else(|| panic!("mode {mode}: no report from the observer: {output:?}"))
+                .parse()
+                .expect("the observer reports true or false");
+            assert_eq!(
+                arrived,
+                mode != "restricted",
+                "mode {mode}: the death signal arrived: {arrived}"
+            );
+        }
+    }
+
+    // Never waits for the observer on purpose: it must outlive this process.
+    #[allow(clippy::zombie_processes)]
+    #[test]
+    fn death_signal_parent() {
+        let Some(mode) = child_mode("death_signal_parent") else {
+            return;
+        };
+        let mut gate = granted_gate();
+
+        // The observer gets a pidfd for this process as its standard input.
+        let this = rustix::process::pidfd_open(
+            rustix::process::getpid(),
+            rustix::process::PidfdFlags::empty(),
+        )
+        .expect("pidfd_open");
+        let mut observer = child_command("death_signal_observer", &mode);
+        observer.stdin(Stdio::from(this));
+        raw_signals::block_in_child(&mut observer, libc::SIGUSR1);
+        raw_signals::death_signal_in_child(&mut observer, rustix::process::Signal::USR1);
+        // Started before the lock, so outside this process's domain.
+        let _observer = observer.spawn().expect("spawn the observer");
+
+        lock_for(&mut gate, Restrictions::SIGNAL, &mode);
+        if mode == "restricted" {
+            let applied = gate.restrictions().expect("locked");
+            assert!(applied.contains(Restrictions::ALL_THREADS), "{applied:?}");
+        }
+    }
+
+    #[test]
+    fn death_signal_observer() {
+        if child_mode("death_signal_observer").is_none() {
+            return;
+        }
+        // The pidfd becomes readable once every thread of the parent has
+        // ended, after the kernel has sent or refused each death signal.
+        let parent = std::io::stdin();
+        let mut fds = [PollFd::new(&parent, PollFlags::IN)];
+        rustix::event::poll(&mut fds, None).expect("poll the parent's pidfd");
+        assert!(fds[0].revents().contains(PollFlags::IN));
+        let arrived = raw_signals::take(libc::SIGUSR1).is_some();
+        println!("FSGATE_DEATH_SIGNAL={arrived}");
+    }
+
     /// Signal masks, pending signals, and `F_SETOWN`, which neither std nor
-    /// this crate's `rustix` features wrap.
+    /// this crate's `rustix` features wrap, and the death signal, which a
+    /// child sets between fork and exec.
     ///
     /// Safety contract: each call passes only values initialized before it,
     /// or a descriptor borrowed for the call, and the code that runs between
-    /// fork and exec calls only an async-signal-safe function.
+    /// fork and exec makes only async-signal-safe calls.
     #[allow(unsafe_code)]
     mod raw_signals {
         use std::io;
@@ -833,6 +967,24 @@ mod kernel {
             }
         }
 
+        /// Starts `command` with `signal` as its death signal: the kernel
+        /// sends it when the thread that starts the child ends. The child
+        /// keeps the setting across exec.
+        pub(super) fn death_signal_in_child(
+            command: &mut Command,
+            signal: rustix::process::Signal,
+        ) {
+            // SAFETY: the closure runs in the child between fork and exec.
+            // It makes one `prctl` system call, which is async-signal-safe,
+            // and allocates nothing.
+            unsafe {
+                command.pre_exec(move || {
+                    rustix::process::set_parent_process_death_signal(Some(signal))
+                        .map_err(io::Error::from)
+                });
+            }
+        }
+
         /// Takes `signal` if it is pending for this thread or its process,
         /// and returns the sender's process ID, which is 0 for the kernel.
         /// The signal must be blocked. Returns `None` at once if it is not
@@ -858,16 +1010,24 @@ mod kernel {
             Some(unsafe { info.assume_init().si_pid() })
         }
 
+        /// Makes the process `owner` the one the kernel signals for
+        /// `socket`: `F_SETOWN`.
+        pub(super) fn set_owner(socket: &impl AsRawFd, owner: i32) -> io::Result<()> {
+            // SAFETY: the descriptor stays open while `socket` is borrowed,
+            // and `F_SETOWN` takes a process ID.
+            if unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_SETOWN, owner) } == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
         /// Makes the kernel send `SIGIO` to the process `owner` when
         /// `socket` becomes readable: `F_SETOWN`, then `O_ASYNC`.
         pub(super) fn signal_owner_on_input(socket: &impl AsRawFd, owner: i32) -> io::Result<()> {
+            set_owner(socket, owner)?;
             let fd = socket.as_raw_fd();
             // SAFETY: `fd` stays open while `socket` is borrowed, and
-            // `F_SETOWN` takes a process ID.
-            if unsafe { libc::fcntl(fd, libc::F_SETOWN, owner) } == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: as above, and `F_GETFL` takes no argument.
+            // `F_GETFL` takes no argument.
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
             if flags == -1 {
                 return Err(io::Error::last_os_error());
