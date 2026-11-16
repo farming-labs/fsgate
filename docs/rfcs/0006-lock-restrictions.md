@@ -292,6 +292,14 @@ The tests pin the errno each refusal returns. CI's runners boot Linux
   `HardRequirement` before `restrict_self()`?~~ Resolved: yes.
   `landlock` 0.4.7 checks the flag's compatibility when it is set, so a
   required `ALL_THREADS` fails before anything is applied.
-- Does the signal scope affect signals the kernel sends on the process's
-  behalf, such as `SIGCHLD` at exit or `F_SETOWN` I/O signals? The tests
-  record the observed behavior, and the docs state it.
+- ~~Does the signal scope affect signals the kernel sends on the
+  process's behalf, such as `SIGCHLD` at exit or `F_SETOWN` I/O
+  signals?~~ Resolved in
+  [#113](https://github.com/farming-labs/fsgate/pull/113): `SIGCHLD` still
+  reaches the parent when a locked process exits, and `SIGIO` the process
+  asks for with `F_SETOWN` does not reach an owner outside its domain,
+  though setting that owner succeeds. CI recorded both on Linux 6.12.117,
+  7.0, and 7.3.3 (`lock.rs::kernel::a_locked_process_still_signals_its_exit_to_its_parent`
+  and `lock.rs::kernel::kernel_scopes_io_signals_a_locked_process_asks_for`),
+  and `Restrictions::SIGNAL` documents them. Other signals the kernel
+  sends, such as `SIGURG` or a parent's death signal, were not tested.
