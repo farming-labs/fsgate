@@ -114,6 +114,13 @@ Design accepted in [RFC 0006](docs/rfcs/0006-lock-restrictions.md). Implemented 
   - Each control run, without the restriction, succeeds.
 
   On the runners (Linux 7.0) and Linux 6.6.162, requiring the restriction fails with `LockUnsupported` before anything is applied, and a bare `lock()` then succeeds without it. Not run on Linux 7.1 or 7.2 individually. Not independently reviewed.
+- [x] Answer [RFC 0006](docs/rfcs/0006-lock-restrictions.md#open-questions)'s last open question: does the signal scope affect signals the kernel sends on a locked process's behalf ([#113](https://github.com/farming-labs/fsgate/pull/113))? Acceptance: tests record the behavior on each kernel CI boots, and the docs state it.
+
+  Evidence comes from [CI](https://github.com/farming-labs/fsgate/actions/runs/43776138801) on `8dbfe32`. Two locked-child tests in [`tests/lock.rs`](crates/fsgate/tests/lock.rs) start an unlocked observer with the signal blocked in every thread, so whatever the kernel sends stays pending, and check it once the locked child has exited, with no timeout. On Linux 6.12.117 and 7.3.3 (the `kernels` job) and on the runners' Linux 7.0 (all three runs of `check`, both runs of `msrv`, and `arm64`):
+  - `SIGCHLD` reaches the parent when a locked process exits, in both modes. Under the scope, signal 0 from the same child to that parent fails with `EPERM`.
+  - A locked process can set an outside process as the `F_SETOWN` owner of a socket, but when the socket becomes readable the kernel does not send that owner `SIGIO`. The control run, without the scope, delivers it.
+
+  On Linux 6.6.162, which lacks the scope, both signals arrive. `Restrictions::SIGNAL` and the threat model state both. Other signals the kernel sends, such as `SIGURG` or a parent's death signal, were not tested. Not independently reviewed.
 
 ## M9 — review readiness and 0.2.0
 

@@ -332,7 +332,10 @@ impl Restrictions {
     pub const ABSTRACT_UNIX_SOCKET: Restrictions = Restrictions(1 << 1);
     /// Signalling a process outside the locked process and its later
     /// descendants fails. That includes the parent and anything spawned
-    /// before the lock. Landlock ABI v6, Linux 6.12.
+    /// before the lock, and the `SIGIO` the process asks for with
+    /// `F_SETOWN`, which the kernel then does not send to such a process.
+    /// `SIGCHLD`, which the kernel sends the parent when the process exits,
+    /// still arrives. Landlock ABI v6, Linux 6.12.
     pub const SIGNAL: Restrictions = Restrictions(1 << 2);
     /// The ruleset applies to every thread of the process in one step,
     /// not only to the thread that calls `lock` and what it spawns later.
