@@ -31,6 +31,10 @@ pub(crate) fn apply<'a>(
 
     use crate::Rights;
 
+    if !options.existing_io_uring_allowed() {
+        crate::uring_guard::check()?;
+    }
+
     let requested = options.requested();
     let required = options.required();
     // Required parts are hard requirements, so the crate rejects an

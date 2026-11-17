@@ -47,6 +47,8 @@ mod broker_sys;
 mod containment;
 #[cfg(all(feature = "experimental-intercept", target_os = "linux"))]
 pub mod intercept;
+#[cfg(target_os = "linux")]
+mod uring_guard;
 
 pub use audit::{AuditDecision, AuditEvent, AuditOp, AuditReason, AuditSink};
 #[cfg(unix)]
@@ -260,6 +262,27 @@ pub enum GateError {
         /// The underlying error.
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    /// A visible io_uring ring or SQPOLL thread existed before the lock.
+    /// No containment was applied and the gate remains unlocked.
+    #[error(
+        "io_uring resource found at `{path}`; close pre-lock rings and wait for their threads to exit, or explicitly set `LockOptions::allow_existing_io_uring(true)`"
+    )]
+    IoUringPresent {
+        /// The descriptor or thread name that caused refusal.
+        path: PathBuf,
+    },
+    /// The pre-lock io_uring inspection could not be completed.
+    /// No containment was applied and the gate remains unlocked.
+    #[error(
+        "cannot inspect io_uring resources at `{path}`: {source}; make procfs readable and keep threads and descriptors stable during `lock()`, or explicitly set `LockOptions::allow_existing_io_uring(true)`"
+    )]
+    IoUringInspection {
+        /// The procfs entry that could not be inspected.
+        path: PathBuf,
+        /// The inspection failure.
+        #[source]
+        source: io::Error,
     },
     /// The broker transport failed or refused. The connection being gone
     /// means every operation fails: closed, with no fallback.
@@ -480,6 +503,7 @@ pub struct LockOptions {
     policy: LockPolicy,
     restrict: Restrictions,
     require: Restrictions,
+    allow_existing_io_uring: bool,
 }
 
 impl LockOptions {
@@ -490,6 +514,7 @@ impl LockOptions {
             policy,
             restrict: Restrictions::all(),
             require: Restrictions::empty(),
+            allow_existing_io_uring: false,
         }
     }
 
@@ -510,6 +535,25 @@ impl LockOptions {
     pub const fn require(mut self, set: Restrictions) -> LockOptions {
         self.require = set;
         self
+    }
+
+    /// Permits io_uring resources created before the lock (Linux only).
+    ///
+    /// False by default: both lock policies refuse visible rings and fail
+    /// if procfs cannot be inspected. This precondition is not a kernel
+    /// restriction and does not appear in [`Gate::restrictions`]. Keep
+    /// threads and descriptors stable during inspection. Hidden rings are
+    /// not detected. True explicitly accepts that a pre-lock ring can open
+    /// files outside the grants using its saved credentials.
+    #[must_use]
+    pub const fn allow_existing_io_uring(mut self, allow: bool) -> LockOptions {
+        self.allow_existing_io_uring = allow;
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) const fn existing_io_uring_allowed(self) -> bool {
+        self.allow_existing_io_uring
     }
 
     pub(crate) const fn policy(self) -> LockPolicy {
@@ -706,6 +750,11 @@ impl Gate {
     /// [`LockOptions::default`]: strict about the filesystem rules, and
     /// requesting every [`Restrictions`] member.
     ///
+    /// On Linux, first refuses visible io_uring resources created before
+    /// locking and fails if procfs inspection cannot be completed. See
+    /// [`lock_with`](Gate::lock_with) for the inspection contract and
+    /// [`LockOptions::allow_existing_io_uring`] for the explicit opt-out.
+    ///
     /// Irreversible. After a successful lock, [`grant`](Gate::grant) and a
     /// second `lock` fail with [`GateError::Locked`].
     ///
@@ -737,6 +786,13 @@ impl Gate {
     /// support for it, the lock fails before anything is applied, leaving
     /// the process unrestricted and the gate unlocked. Every successful
     /// lock also applies the library-level lock (no new grants).
+    ///
+    /// On Linux, both policies first refuse visible pre-existing io_uring
+    /// rings and fail if procfs inspection cannot be completed. Keep threads
+    /// and descriptor tables stable during this call. Hidden rings and
+    /// concurrent creation are not ruled out. Explicitly opting into
+    /// [`LockOptions::allow_existing_io_uring`] skips this precondition and
+    /// accepts that saved ring credentials may bypass the filesystem rules.
     pub fn lock_with(&mut self, options: impl Into<LockOptions>) -> Result<LockStatus, GateError> {
         let options = options.into();
         if self.locked {
@@ -753,13 +809,20 @@ impl Gate {
         let applied = match containment::apply(self.grants.iter().flatten(), options) {
             Ok(applied) => applied,
             Err(err) => {
+                let (reason, errno) = match &err {
+                    GateError::IoUringPresent { .. } => (AuditReason::IoUring, None),
+                    GateError::IoUringInspection { source, .. } => {
+                        (AuditReason::IoUring, source.raw_os_error())
+                    }
+                    _ => (AuditReason::Unsupported, None),
+                };
                 self.emit(
                     AuditOp::Lock,
                     None,
                     None,
                     AuditDecision::Deny,
-                    AuditReason::Unsupported,
-                    None,
+                    reason,
+                    errno,
                 );
                 return Err(err);
             }

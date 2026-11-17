@@ -1,6 +1,6 @@
 # RFC 0014: `io_uring` rings set up before `lock()`
 
-- Status: draft, for the maintainer's decision
+- Status: accepted; implementation under verification
 - Date: 2026-11-17
 - Roadmap: [M10](../../ROADMAP.md#m10--battle-tested-tests)
 - Builds on: [RFC 0006](0006-lock-restrictions.md) (restrictions at `lock()`), [ADR 0002](../decisions/0002-landlock-not-seccomp-for-paths.md) (seccomp's job), [RFC 0009](0009-worker-unix-sockets.md) (the worker's seccomp filter), the [threat model](../threat-model.md#2-the-locked-process-linux)
@@ -47,7 +47,7 @@ From the kernel source, not run:
   credentials.
 - It fails closed, before applying anything, with an error that names
   the ring and the fix.
-- A process with no ring sees no change.
+- A process with no ring and readable procfs keeps working.
 - A caller that needs its ring after the lock keeps it by an explicit
   choice.
 
@@ -68,8 +68,8 @@ limits.
 
 ### B. Refuse to lock while a ring is visible
 
-Before `restrict_self`, `lock()` reads `/proc/self/fd` and
-`/proc/self/task`:
+Before `restrict_self`, `lock()` reads `/proc/self/task` and each
+visible thread's `fd` directory:
 
 - a descriptor whose link reads `anon_inode:[io_uring]` is a ring;
 - a thread named `iou-sqp-<pid>` is an `SQPOLL` thread, which finds a
@@ -78,7 +78,7 @@ Before `restrict_self`, `lock()` reads `/proc/self/fd` and
 If either exists, `lock()` returns a new `GateError` variant before
 anything is applied. The message names the descriptor or thread and
 the fix: close the ring before `lock()`, set it up after (where it
-holds the locked credentials), or drop the check. `GateError` is
+holds the locked credentials), or explicitly opt out of the check. `GateError` is
 `#[non_exhaustive]`, so the variant is not a breaking change by itself.
 Refusing to lock is: a caller with a ring that locks today gets an
 error.
@@ -96,7 +96,14 @@ The first two need code before the lock to put the ring there, though a
 library could do the first without its caller knowing. The third is the
 same race as a thread started during `lock()`.
 
-The check needs `/proc`. No `unsafe` code: `rustix`'s `readlinkat` and
+Thread names are not an authenticated ring identity: an unrelated thread
+with that prefix is conservatively refused, and renaming a polling thread
+can hide it. Trusted setup must not hide resources or change them during
+the check. The filesystem type of opened directories and files is checked;
+a deliberately misleading procfs mount prepared by trusted setup is not
+ruled out.
+
+The check needs `/proc`. No new runtime `unsafe` code: `rustix`'s `readlinkat` and
 directory reads do it.
 
 ### C. B, plus refuse `io_uring` after the lock
@@ -124,32 +131,53 @@ Costs:
   irreversible operation, and it already sets `no_new_privs`, which a
   filter needs.
 
-### The opt-out
+### The opt-out and inspection errors
 
-B and C both break a caller that sets up a ring before `lock()` on
-purpose and keeps using it. Two shapes:
+Use a separate `LockOptions::allow_existing_io_uring(bool)` setting,
+false by default. `Restrictions` and `Gate::restrictions()` continue to
+name kernel-enforced restrictions. A scan of visible resources is a
+precondition, not a kernel restriction, and must not be reported as one.
 
-1. **A `Restrictions` member, `IO_URING`.** A bare `lock()` requests it,
-   and `LockOptions::restrict(Restrictions::all() - Restrictions::IO_URING)`
-   drops it. Without a readable `/proc` the check cannot run, so the
-   member is skipped and left out of `Gate::restrictions()`, as an
-   unsupported kernel feature is today; `LockOptions::require` makes it
-   a hard requirement. The `Restrictions` rustdoc says each member needs
-   a Landlock ABI, which would change.
-2. **A separate `LockOptions` setting.** Clearer that it is not a
-   Landlock feature, but a second way to say what a lock restricts.
+On Linux, both `Strict` and `BestEffort` perform the check unless the
+caller explicitly opts out. Missing, inaccessible, or unreadable procfs
+fails before applying containment. `BestEffort` still governs only the
+Landlock filesystem floor. Non-Linux behavior does not change.
 
-## Recommendation
+The check inspects each visible thread's descriptors as well as its name,
+so a thread with a separate descriptor table is covered. It holds procfs
+directory descriptors while walking, verifies that opened entries belong
+to procfs, and treats an incomplete scan as a failure. Callers must keep
+threads and descriptor tables stable during `lock()`; the check is not
+atomic with concurrent ring creation or registration.
 
-B, as the `Restrictions::IO_URING` member, in the next minor release.
-It closes both routes #119 measured, for every ring the process can
-see, with no `unsafe` code, and it fails closed with the fix in the
-message. 0.6.0 already carries a breaking change
-([#117](https://github.com/farming-labs/fsgate/pull/117)), so it can
-ship there. C is the next step if the independent review wants the
-registered ring closed too.
+`GateError::IoUringPresent { path }` names the descriptor or thread that
+caused refusal. `GateError::IoUringInspection { path, source }` names an
+inspection failure and retains its I/O cause. Both errors leave the gate
+unlocked, `restrictions()` unset, and containment unapplied. Their messages
+name the remedy and the explicit opt-out. A failed check emits one denied
+`lock` audit event with reason `io_uring`; inspection failures retain an
+errno when one exists. Closing a detected ring permits a fresh attempt.
+
+## Decision
+
+On 2026-11-17 the maintainer selected B: reject detectable pre-lock queues
+and refuse to proceed when they cannot be inspected. C was not selected;
+no new seccomp filter is installed and new rings remain usable after the
+lock, subject to the locked credentials. Hidden rings remain a documented
+limit. B does not prove that the process holds no pre-lock credentials.
+
+The implementation uses the separate options setting above to preserve
+RFC 0006's distinction between kernel restrictions and preconditions.
+The old proposal to skip an unavailable procfs check is withdrawn. This is
+a breaking default and must ship in a minor release with migration notes;
+this decision does not authorize a release.
 
 ## Testing
+
+These are acceptance tests; kernel execution of the implementation is
+pending. Test helpers extend #119's isolated unsafe module and its written
+safety contract; the runtime guard uses only safe Rust.
+
 
 Kernel tests in `tests/lock.rs`, extending #119's:
 
@@ -157,16 +185,32 @@ Kernel tests in `tests/lock.rs`, extending #119's:
   whose descriptor was registered and closed: each makes `lock()` fail
   with the new error, and a raw read outside the grants still succeeds,
   so nothing was applied.
-- The control: the same with the member dropped keeps today's behavior,
+- The control: the same with `allow_existing_io_uring(true)` keeps today's behavior,
   and both routes open the file.
 - A ring set up after the lock: `lock()` succeeds and the ring's open
   fails with `EACCES`.
 - With C: `io_uring_setup` after the lock fails with `ENOSYS`, and the
   registered ring cannot submit.
 
-## Open questions
+## Acceptance and verification
 
-1. A, B, or C?
-2. A `Restrictions` member or a separate `LockOptions` setting?
-3. Without `/proc`, skip the check and report it, as proposed, or fail?
-4. The variant's name, for example `GateError::IoUringRing { what }`.
+- Test ordinary rings, registered personalities, SQPOLL rings, and SQPOLL
+  rings registered with their descriptor then closed. Verify each refusal
+  occurs before containment by reading a real file outside the grants and
+  checking that the gate still accepts grants.
+- Test inspection failure against the real filesystem, without supplying
+  a mock authorization answer, under both lock policies. Verify that a
+  failure has no partial containment or successful lock audit event.
+- Test a caller opting out, and a fresh ring created after a successful
+  lock, including its inability to open outside the grants. Keep the
+  existing pre-lock bypass test as the explicit opt-out control.
+- On Linux CI, remove the guard and require its focused regression test
+  to fail for the missing refusal, then restore the source.
+- Run format, host and Linux lint, and the full suite. Linux execution,
+  the packaged crate, MSRV, kernels, and architectures are verified by CI.
+- Update the README, threat model, audit contract, changelog, and roadmap
+  with the implementation. No independent-review claim.
+
+The original #119 evidence measures the bypass, not this detector.
+Detection, inspection failure, and post-lock ring behavior remain untested
+until the new implementation's kernel tests run.

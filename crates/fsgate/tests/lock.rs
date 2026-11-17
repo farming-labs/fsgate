@@ -7,6 +7,27 @@
 
 use fsgate::{Gate, GateError, LockOptions, LockPolicy, LockStatus, Restrictions, Rights};
 
+// Lock inspection requires stable threads and descriptors. Run the few
+// formerly in-process lock tests apart from parallel test fixture I/O.
+#[cfg(target_os = "linux")]
+fn run_isolated(name: &str) -> bool {
+    if std::env::var("FSGATE_ISOLATED_LOCK").as_deref() == Ok(name) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--include-ignored", "--nocapture"])
+        .env("FSGATE_ISOLATED_LOCK", name)
+        .output()
+        .expect("run the isolated lock test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn strict_lock_fails_closed_without_kernel_support() {
@@ -25,6 +46,10 @@ fn strict_lock_fails_closed_without_kernel_support() {
 
 #[test]
 fn best_effort_lock_ends_the_granting_phase() {
+    #[cfg(target_os = "linux")]
+    if run_isolated("best_effort_lock_ends_the_granting_phase") {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let mut gate = Gate::new();
     gate.grant(dir.path(), Rights::READ).unwrap();
@@ -160,6 +185,9 @@ mod without_landlock {
     #[test]
     #[ignore = "needs a kernel booted without Landlock; CI's kernels job runs it"]
     fn strict_lock_fails_closed() {
+        if run_isolated("without_landlock::strict_lock_fails_closed") {
+            return;
+        }
         let (root, mut gate, _secret) = granted_gate();
 
         let err = gate.lock().unwrap_err();
@@ -182,6 +210,9 @@ mod without_landlock {
     #[test]
     #[ignore = "needs a kernel booted without Landlock; CI's kernels job runs it"]
     fn best_effort_lock_reports_library_only() {
+        if run_isolated("without_landlock::best_effort_lock_reports_library_only") {
+            return;
+        }
         let (root, mut gate, secret) = granted_gate();
 
         let status = gate.lock_with(LockPolicy::BestEffort).unwrap();
@@ -200,6 +231,9 @@ mod without_landlock {
     #[test]
     #[ignore = "needs a kernel booted without Landlock; CI's kernels job runs it"]
     fn a_required_restriction_fails_even_under_best_effort() {
+        if run_isolated("without_landlock::a_required_restriction_fails_even_under_best_effort") {
+            return;
+        }
         let (_root, mut gate, _secret) = granted_gate();
 
         let options = LockOptions::new(LockPolicy::BestEffort).require(Restrictions::SIGNAL);
@@ -1337,7 +1371,13 @@ mod kernel {
         let polled = raw_uring::Ring::new(true).expect("an SQPOLL ring");
 
         let mut gate = granted_gate();
-        let (_, secret) = lock_and_prove(&mut gate);
+        gate.lock_with(LockOptions::default().allow_existing_io_uring(true))
+            .unwrap();
+        let secret = format!("{}/secret.txt", std::env::var("FSGATE_OUTSIDE").unwrap());
+        assert_eq!(
+            fs::read(&secret).unwrap_err().kind(),
+            ErrorKind::PermissionDenied
+        );
         let secret = std::ffi::CString::new(secret).unwrap();
 
         assert_eq!(
@@ -1358,6 +1398,182 @@ mod kernel {
         eprintln!("io_uring_child: opened the secret through both routes");
     }
 
+    #[derive(Default)]
+    struct RingAudit(std::sync::Mutex<Vec<fsgate::AuditEvent>>);
+
+    impl fsgate::AuditSink for RingAudit {
+        fn event(&self, event: &fsgate::AuditEvent) {
+            self.0.lock().unwrap().push(event.clone());
+        }
+    }
+
+    #[test]
+    fn visible_io_uring_resources_are_refused_before_locking() {
+        for mode in ["plain", "personality", "sqpoll", "registered-sqpoll"] {
+            let (_root, granted, outside) = dirs();
+            run_child(
+                "io_uring_refusal_child",
+                mode,
+                &[
+                    ("FSGATE_GRANTED", granted.as_os_str()),
+                    ("FSGATE_OUTSIDE", outside.as_os_str()),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn io_uring_refusal_child() {
+        let Some(mode) = child_mode("io_uring_refusal_child") else {
+            return;
+        };
+        let sqpoll = mode.ends_with("sqpoll");
+        let ring = raw_uring::Ring::new(sqpoll).expect("io_uring enabled for this test");
+        if mode == "personality" {
+            ring.register_personality().unwrap();
+        }
+        let secret = format!("{}/secret.txt", std::env::var("FSGATE_OUTSIDE").unwrap());
+        let ring = if mode == "registered-sqpoll" {
+            // Completion proves that the polling thread has started and
+            // named itself before its descriptor disappears.
+            drop(
+                ring.open(&std::ffi::CString::new(secret.clone()).unwrap(), None)
+                    .unwrap(),
+            );
+            ring.register_and_close().unwrap();
+            None
+        } else {
+            Some(ring)
+        };
+        for policy in [LockPolicy::Strict, LockPolicy::BestEffort] {
+            let mut gate = granted_gate();
+            let audit = std::sync::Arc::new(RingAudit::default());
+            gate.set_audit_sink(audit.clone());
+            let err = gate
+                .lock_with(policy)
+                .expect_err("a visible ring must prevent locking");
+            assert!(matches!(err, GateError::IoUringPresent { .. }), "{err:?}");
+            assert!(err.to_string().contains("allow_existing_io_uring(true)"));
+            assert_eq!(gate.restrictions(), None);
+            assert_eq!(fs::read(&secret).unwrap(), b"secret");
+            {
+                let events = audit.0.lock().unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].op, fsgate::AuditOp::Lock);
+                assert_eq!(events[0].decision, fsgate::AuditDecision::Deny);
+                assert_eq!(events[0].reason, fsgate::AuditReason::IoUring);
+                assert!(events[0].status.is_none());
+                assert!(events[0].restrictions.is_none());
+            }
+            gate.grant(std::env::var("FSGATE_GRANTED").unwrap(), Rights::READ)
+                .expect("a refused check leaves the gate granting");
+        }
+        drop(ring);
+        if !sqpoll {
+            let mut gate = granted_gate();
+            lock_and_prove(&mut gate);
+        }
+        eprintln!("io_uring_refusal_child: checked {mode}");
+    }
+
+    #[test]
+    fn rings_created_after_locking_use_confined_credentials() {
+        let (_root, granted, outside) = dirs();
+        fs::write(granted.join("inside.txt"), b"inside").unwrap();
+        run_locked("io_uring_after_lock_child", &granted, &outside);
+    }
+
+    #[test]
+    fn io_uring_after_lock_child() {
+        if child_mode("io_uring_after_lock_child").is_none() {
+            return;
+        }
+        let mut gate = granted_gate();
+        let (_, secret) = lock_and_prove(&mut gate);
+        let secret = std::ffi::CString::new(secret).unwrap();
+        let allowed = std::ffi::CString::new(format!(
+            "{}/inside.txt",
+            std::env::var("FSGATE_GRANTED").unwrap()
+        ))
+        .unwrap();
+        // The parent creates the allowed control before confinement.
+        for sqpoll in [false, true] {
+            let ring = raw_uring::Ring::new(sqpoll).unwrap();
+            let personality = ring.register_personality().unwrap();
+            for identity in [None, Some(personality)] {
+                assert_eq!(ring.open(&secret, identity).map(drop), Err(Errno::ACCESS));
+                let file = ring
+                    .open(&allowed, identity)
+                    .expect("open inside the grant");
+                let mut content = String::new();
+                fs::File::from(file).read_to_string(&mut content).unwrap();
+                assert_eq!(content, "inside");
+            }
+        }
+    }
+
+    #[test]
+    fn unreadable_procfs_refuses_locking_without_partial_containment() {
+        for mode in ["strict", "best-effort"] {
+            let (_root, granted, outside) = dirs();
+            run_child(
+                "io_uring_inspection_child",
+                mode,
+                &[
+                    ("FSGATE_GRANTED", granted.as_os_str()),
+                    ("FSGATE_OUTSIDE", outside.as_os_str()),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn io_uring_inspection_child() {
+        let Some(mode) = child_mode("io_uring_inspection_child") else {
+            return;
+        };
+        let granted = PathBuf::from(std::env::var("FSGATE_GRANTED").unwrap());
+        let secret = PathBuf::from(std::env::var("FSGATE_OUTSIDE").unwrap()).join("secret.txt");
+        let mut outer = Gate::new();
+        outer
+            .grant(granted.parent().unwrap(), Rights::READ | Rights::LIST)
+            .unwrap();
+        outer.lock().unwrap();
+        assert_eq!(fs::read(&secret).unwrap(), b"secret");
+
+        let mut gate = granted_gate();
+        let audit = std::sync::Arc::new(RingAudit::default());
+        gate.set_audit_sink(audit.clone());
+        let policy = if mode == "strict" {
+            LockPolicy::Strict
+        } else {
+            LockPolicy::BestEffort
+        };
+        let err = gate.lock_with(policy).unwrap_err();
+        assert!(
+            matches!(&err, GateError::IoUringInspection { source, .. }
+            if source.kind() == ErrorKind::PermissionDenied),
+            "{err:?}"
+        );
+        assert_eq!(gate.restrictions(), None);
+        assert_eq!(fs::read(&secret).unwrap(), b"secret");
+        {
+            let events = audit.0.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].decision, fsgate::AuditDecision::Deny);
+            assert_eq!(events[0].reason, fsgate::AuditReason::IoUring);
+            assert_eq!(events[0].errno, Some(libc::EACCES));
+            assert!(events[0].status.is_none());
+        }
+        gate.grant(&granted, Rights::READ).unwrap();
+        gate.lock_with(LockOptions::new(policy).allow_existing_io_uring(true))
+            .unwrap();
+        assert_eq!(
+            fs::read(&secret).unwrap_err().kind(),
+            ErrorKind::PermissionDenied
+        );
+    }
+
     /// A one-entry `io_uring` ring that opens files, which neither std nor
     /// `rustix` wraps safely.
     ///
@@ -1374,11 +1590,14 @@ mod kernel {
     ///   it is freed.
     /// - A descriptor is taken from a completion only when the kernel
     ///   returned one, and only once.
+    /// - Registering a ring uses an initialized, writable update. The
+    ///   child thread owns that reference until kernel cleanup on exit;
+    ///   no requests are pending when the descriptor and mappings close.
     #[allow(unsafe_code)]
     mod raw_uring {
         use std::ffi::{CStr, c_void};
         use std::mem::size_of;
-        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::ptr;
         use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1488,6 +1707,29 @@ mod kernel {
                     )?
                 };
                 Ok(u16::try_from(id).expect("a personality ID fits in a u16"))
+            }
+
+            /// The child thread owns the registration until it exits; the
+            /// kernel then releases it. No requests are pending when the
+            /// descriptor and mappings are dropped.
+            pub(super) fn register_and_close(self) -> Result<(), Errno> {
+                let mut update = rustix::io_uring::io_uring_rsrc_update::default();
+                update.offset = u32::MAX;
+                update.data = io_uring_ptr::new(self.fd.as_raw_fd() as usize as *mut c_void);
+                // SAFETY: this opcode interprets data as a live descriptor
+                // number, not a pointer. The initialized update remains
+                // writable until registration returns. The child thread
+                // owns the registered reference through its exit.
+                let count = unsafe {
+                    io_uring_register(
+                        &self.fd,
+                        IoringRegisterOp::RegisterRingFds,
+                        ptr::from_mut(&mut update).cast(),
+                        1,
+                    )?
+                };
+                assert_eq!(count, 1);
+                Ok(())
             }
 
             /// Opens `path` read-only through the ring, with `personality`'s

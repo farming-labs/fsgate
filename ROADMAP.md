@@ -338,6 +338,8 @@ Started. Today each attack in the threat model has a test written for it, and on
 
 Order: the model-based tests first, because they cover the most code on both platforms and need no new CI machinery. Then the kernel comparison, which reuses them, then mutation testing to find what all the tests miss, then fuzzing, kernels, and distributions.
 
+- [ ] Implement the accepted option B from [RFC 0014](docs/rfcs/0014-lock-io-uring-rings.md) ([#123](https://github.com/farming-labs/fsgate/pull/123)): refuse detectable pre-lock `io_uring` resources and fail when inspection cannot complete. The maintainer selected this behavior on 2026-11-17. Implementation and kernel tests are present on the PR; Linux execution is pending. Acceptance: refusal occurs before containment under both policies, an explicit opt-out preserves the measured bypass, new rings use confined credentials, the CI control fails with the guard removed, and the packaged crate and supported kernel matrix pass. Hidden registered rings, descriptors in flight, and concurrent changes remain documented limits. Not independently reviewed.
+
 ## Out of scope for v1
 
 Preload shim for unmodified binaries, Windows, quotas and rate budgets, network or non-filesystem capabilities.
