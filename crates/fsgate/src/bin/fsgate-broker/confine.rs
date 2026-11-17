@@ -12,12 +12,12 @@
 
 use std::convert::Infallible;
 use std::fs;
-use std::io;
+use std::io::{self, IsTerminal};
 use std::os::fd::RawFd;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitCode};
+use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use fsgate::Rights;
@@ -65,11 +65,14 @@ const STOP_SIGNALS: [libc::c_int; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHU
 ///
 /// `/proc/self/exe` names this binary even if its path has changed since it
 /// started. `direct` and `env` were validated when the broker parsed them.
+/// Unless `terminal` is set, a terminal on the standard streams reaches the
+/// worker for output only (see [`output_only_terminal`]).
 pub(super) fn command(
     connection: RawFd,
     grants: &[(PathBuf, Rights)],
     direct: &[String],
     env: &[String],
+    terminal: bool,
     worker: &[String],
 ) -> Result<(Command, Supervisor), String> {
     check_overlap(grants, direct)?;
@@ -86,9 +89,47 @@ pub(super) fn command(
         command.args(["--env", name]);
     }
     command.arg("--").args(worker);
+    if !terminal {
+        output_only_terminal(&mut command)?;
+    }
     let signals = sys::block_unignored(&STOP_SIGNALS)
         .map_err(|err| format!("blocking the broker's stop signals failed: {err}"))?;
     Ok((command, Supervisor { signals }))
+}
+
+/// Keeps the user's terminal from being the worker's input. The worker
+/// leads its own session, so job control never stops its reads, and with
+/// the terminal it could read what the user types while the shell has the
+/// foreground. A terminal on standard input becomes `/dev/null`, and one on
+/// standard output or error is opened again for writing only: a shell
+/// gives a program one terminal descriptor, opened for reading and writing,
+/// on all three streams. The worker cannot open the terminal itself, since
+/// it has no controlling terminal and its ruleset leaves out `/dev/pts`.
+fn output_only_terminal(command: &mut Command) -> Result<(), String> {
+    if io::stdin().is_terminal() {
+        command.stdin(Stdio::null());
+    }
+    if io::stdout().is_terminal() {
+        command.stdout(write_only_terminal(1, "output")?);
+    }
+    if io::stderr().is_terminal() {
+        command.stderr(write_only_terminal(2, "error")?);
+    }
+    Ok(())
+}
+
+/// Opens the terminal on descriptor `fd` again, for writing only.
+fn write_only_terminal(fd: RawFd, stream: &str) -> Result<fs::File, String> {
+    fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(format!("/proc/self/fd/{fd}"))
+        .map_err(|err| {
+            format!(
+                "opening the terminal on standard {stream} again for writing failed: {err}; \
+                 redirect the worker's standard {stream} or pass `--terminal`"
+            )
+        })
 }
 
 /// Ends a confined worker's process group when the worker exits or the

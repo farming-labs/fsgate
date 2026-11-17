@@ -5,6 +5,7 @@
 "--grant\x00"
 "--direct\x00"
 "--env\x00"
+"--terminal\x00"
 "--socket\x00"
 "--unconfined\x00"
 "--experimental-intercept\x00"
