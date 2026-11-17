@@ -217,3 +217,22 @@ open questions answered:
    already reads (`acl(5)`). Found in an internal review at `ea159a6`.
    `a_socket_path_whose_access_list_lets_others_change_it_is_refused`
    tests it on macOS.
+2. **Peers that look alike in a user namespace.** Linux reports a peer
+   whose uid has no mapping in the reader's user namespace as the overflow
+   uid, 65534 by default (`user_namespaces(7)`). A broker in a user
+   namespace with no uid map runs as that uid, and so does `nobody` in many
+   containers. There, the default check admitted every user who could
+   reach the socket, which
+   [#118](https://github.com/farming-labs/fsgate/pull/118) showed under
+   `unshare --user`. `serve` now fails with `ErrorKind::Unsupported` before
+   accepting anything when the uids it would admit include the overflow
+   uid and `/proc/self/uid_map` leaves some uid unmapped. The error says to
+   run the broker as a uid that maps, or to pass `ServeOptions::any_peer`,
+   which states that every peer is admitted. If either file cannot be
+   read, `serve` fails with that error, since it cannot tell. In the
+   initial user namespace every uid maps and nothing changes, and a broker
+   whose own uid maps still serves and refuses unmapped peers.
+   `fsgate-broker --socket` was still covered by its owner-only directory,
+   but it now refuses to serve there too, and exits 1.
+   `a_broker_that_cannot_tell_its_peers_apart_refuses_to_serve` runs both
+   namespaces in CI's `check` job.

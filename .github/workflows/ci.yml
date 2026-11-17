@@ -31,11 +31,11 @@ jobs:
       # Ignored elsewhere: it needs util-linux `unshare` and passwordless
       # `sudo`, which the runner has. The count fails a filter that matches
       # nothing.
-      - name: Test a broker in a user namespace without a uid map
+      - name: Test brokers in user namespaces
         shell: bash
         run: |
           if ! output=$(cargo test --locked -p fsgate --test broker_serve -- --ignored \
-              --exact a_broker_in_a_user_namespace_without_a_uid_map_admits_any_user 2>&1); then
+              --exact a_broker_that_cannot_tell_its_peers_apart_refuses_to_serve 2>&1); then
             printf '%s\n' "$output"
             exit 1
           fi
