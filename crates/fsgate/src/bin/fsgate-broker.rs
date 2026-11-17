@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! fsgate-broker --grant <path>:<rights> [--grant ...] [--direct <path>:<rights> ...] \
-//!     [--env <name> ...] -- <command> [args...]
+//!     [--env <name> ...] [--terminal] -- <command> [args...]
 //! fsgate-broker --unconfined --grant <path>:<rights> [--grant ...] [--socket <path>] \
 //!     -- <command> [args...]
 //! ```
@@ -18,9 +18,12 @@
 //! the broker, it can still open the files an ordinary program needs to
 //! start, and it inherits no environment beyond the names given with `--env`.
 //! `--direct` adds a path the child may open itself, with the letters `r`,
-//! `l`, and `x` (execute); those opens are not audited. If confinement cannot
-//! be applied, on macOS or on a kernel without Landlock ABI v3, the child
-//! does not start.
+//! `l`, and `x` (execute); those opens are not audited. A terminal on the
+//! child's standard input is replaced with `/dev/null`, and one on standard
+//! output or error is opened again for writing only, so the child can print
+//! to the terminal but not read what is typed into it; `--terminal` passes
+//! the terminal as it is. If confinement cannot be applied, on macOS or on a
+//! kernel without Landlock ABI v3, the child does not start.
 //!
 //! `--unconfined` starts the child with this process's own environment and
 //! filesystem access. `--socket`, which needs it, creates an owner-only
@@ -102,6 +105,7 @@ mod confine {
         _: &[(PathBuf, Rights)],
         _: &[String],
         _: &[String],
+        _: bool,
         _: &[String],
     ) -> Result<(Command, Supervisor), String> {
         Err(
@@ -185,9 +189,19 @@ fn run_inherited(
         .map_err(|err| format!("preparing the worker's connection failed: {err}"))?;
 
     let (mut worker, supervisor) = match start {
-        Start::Confined { direct, env } => {
-            let (worker, supervisor) =
-                confine::command(worker_end.as_raw_fd(), grants, &direct, &env, command)?;
+        Start::Confined {
+            direct,
+            env,
+            terminal,
+        } => {
+            let (worker, supervisor) = confine::command(
+                worker_end.as_raw_fd(),
+                grants,
+                &direct,
+                &env,
+                terminal,
+                command,
+            )?;
             (worker, Some(supervisor))
         }
         Start::Unconfined => {
@@ -376,7 +390,8 @@ struct SocketArgs {
 }
 
 const USAGE: &str = "usage: fsgate-broker --grant <path>:<rights> [--grant ...] \
-                     [--direct <path>:<rights> ...] [--env <name> ...] -- <command> [args...]\n\
+                     [--direct <path>:<rights> ...] [--env <name> ...] [--terminal] \
+                     -- <command> [args...]\n\
                      \x20      fsgate-broker --unconfined --grant <path>:<rights> [--grant ...] \
                      [--socket <path>] -- <command> [args...]\n\
                      \x20      fsgate-broker --experimental-intercept --grant <path>:<rights> [--grant ...] \

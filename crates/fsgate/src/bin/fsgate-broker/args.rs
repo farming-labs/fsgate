@@ -25,10 +25,12 @@ pub(super) enum Mode {
 /// How the command of [`Mode::Inherited`] starts.
 pub(super) enum Start {
     /// Confined (RFC 0008), with these validated `--direct` specs and
-    /// `--env` names.
+    /// `--env` names. `terminal` is `--terminal`: pass a terminal on the
+    /// standard streams as it is, instead of for output only.
     Confined {
         direct: Vec<String>,
         env: Vec<String>,
+        terminal: bool,
     },
     /// With this process's own environment and filesystem access.
     Unconfined,
@@ -62,6 +64,7 @@ pub(super) fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args,
     let mut unconfined = false;
     let mut direct = Vec::new();
     let mut env = Vec::new();
+    let mut terminal = false;
     let mut command = Vec::new();
 
     while let Some(arg) = args.next() {
@@ -90,6 +93,7 @@ pub(super) fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args,
                 }
                 env.push(name);
             }
+            "--terminal" => terminal = true,
             "--experimental-intercept" => intercept = true,
             "--apply" => apply = true,
             "--audit" => audit = true,
@@ -108,10 +112,11 @@ pub(super) fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args,
     if command.is_empty() {
         return Err("a command after `--` is required".into());
     }
-    let shapes_confinement = !direct.is_empty() || !env.is_empty();
+    let shapes_confinement = !direct.is_empty() || !env.is_empty() || terminal;
     if unconfined && shapes_confinement {
         return Err(
-            "`--direct` and `--env` describe a confined worker; drop them or drop `--unconfined`"
+            "`--direct`, `--env`, and `--terminal` describe a confined worker; \
+                    drop them or drop `--unconfined`"
                 .into(),
         );
     }
@@ -124,7 +129,7 @@ pub(super) fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args,
         (true, None) if unconfined || shapes_confinement => {
             return Err(
                 "`--experimental-intercept` has its own worker profile; drop `--unconfined`, \
-                 `--direct`, and `--env`"
+                 `--direct`, `--env`, and `--terminal`"
                     .into(),
             );
         }
@@ -141,7 +146,11 @@ pub(super) fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args,
         }
         (false, Some(socket)) => Mode::Socket(socket),
         (false, None) if unconfined => Mode::Inherited(Start::Unconfined),
-        (false, None) => Mode::Inherited(Start::Confined { direct, env }),
+        (false, None) => Mode::Inherited(Start::Confined {
+            direct,
+            env,
+            terminal,
+        }),
     };
     Ok(Args {
         grants,
