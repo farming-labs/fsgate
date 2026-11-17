@@ -301,5 +301,15 @@ The tests pin the errno each refusal returns. CI's runners boot Linux
   though setting that owner succeeds. CI recorded both on Linux 6.12.117,
   7.0, and 7.3.3 (`lock.rs::kernel::a_locked_process_still_signals_its_exit_to_its_parent`
   and `lock.rs::kernel::kernel_scopes_io_signals_a_locked_process_asks_for`),
-  and `Restrictions::SIGNAL` documents them. Other signals the kernel
-  sends, such as `SIGURG` or a parent's death signal, were not tested.
+  and `Restrictions::SIGNAL` documents them.
+  [#116](https://github.com/farming-labs/fsgate/pull/116) tested two more.
+  `SIGURG` the process asks for with `F_SETOWN` does not reach an outside
+  owner either. When the locked process exits, the kernel does not send
+  the death signal that a process started before the lock asked for with
+  `PR_SET_PDEATHSIG`. CI recorded `SIGURG` on 6.12.117, 7.0, and 7.3.3,
+  and the death signal on 7.0 and 7.3.3, where the lock covers every
+  thread (`lock.rs::kernel::kernel_scopes_urgent_signals_a_locked_process_asks_for`
+  and `lock.rs::kernel::kernel_scopes_the_death_signal_of_a_process_started_before_the_lock`).
+  Before 7.0 the lock covers only the calling thread, and the death signal
+  under the scope was not tested there. Also not tested: `SIGURG` from
+  TCP urgent data, and `F_SETOWN_EX` naming a thread.

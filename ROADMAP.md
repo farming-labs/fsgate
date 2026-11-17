@@ -120,7 +120,14 @@ Design accepted in [RFC 0006](docs/rfcs/0006-lock-restrictions.md). Implemented 
   - `SIGCHLD` reaches the parent when a locked process exits, in both modes. Under the scope, signal 0 from the same child to that parent fails with `EPERM`.
   - A locked process can set an outside process as the `F_SETOWN` owner of a socket, but when the socket becomes readable the kernel does not send that owner `SIGIO`. The control run, without the scope, delivers it.
 
-  On Linux 6.6.162, which lacks the scope, both signals arrive. `Restrictions::SIGNAL` and the threat model state both. Other signals the kernel sends, such as `SIGURG` or a parent's death signal, were not tested. Not independently reviewed.
+  On Linux 6.6.162, which lacks the scope, both signals arrive. `Restrictions::SIGNAL` and the threat model state both. `SIGURG` and a death signal followed in the next item. Not independently reviewed.
+- [x] Record whether the signal scope stops `SIGURG` and a death signal, which #113 left untested ([#116](https://github.com/farming-labs/fsgate/pull/116)). Acceptance: tests record the behavior on each kernel CI boots, and the docs state it.
+
+  Evidence comes from [CI](https://github.com/farming-labs/fsgate/actions/runs/44042714535) on `a357dfc`, with the same observer pattern. Each job's log shows the modes each child ran in.
+  - A locked process can set an outside process as the `F_SETOWN` owner of a Unix socket, but when out-of-band data arrives on it the kernel does not send that owner `SIGURG`. The control run, without the scope, delivers it. Recorded on Linux 6.12.117 and 7.3.3 (the `kernels` job) and on the runners' Linux 7.0 (all three runs of `check`, both runs of `msrv`, and `arm64`).
+  - A process started before the lock with `PR_SET_PDEATHSIG` gets no death signal when the locked process exits with every thread locked. The control run delivers it. Recorded on Linux 7.3.3 and the runners' Linux 7.0, in the same jobs. On Linux 6.12.117, where the lock covers only the calling thread, only the control run ran.
+
+  On Linux 6.6.162, which lacks the scope, both signals arrive. Not tested: the death signal under the scope before Linux 7.0, `SIGURG` from TCP urgent data, and `F_SETOWN_EX` naming a thread. Not independently reviewed.
 
 ## M9 — review readiness and 0.2.0
 
