@@ -853,10 +853,12 @@ mod kernel {
         for mode in modes {
             let (_root, granted, outside) = dirs();
             // The observer inherits the parent's standard output, so this
-            // reads to its end only once both have exited.
+            // reads to its end only once both have exited. Standard error
+            // passes through, so CI logs show which mode each child ran.
             let output = child_command("death_signal_parent", mode)
                 .env("FSGATE_GRANTED", &granted)
                 .env("FSGATE_OUTSIDE", &outside)
+                .stderr(Stdio::inherit())
                 .output()
                 .expect("spawn the locked parent");
             assert!(
