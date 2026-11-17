@@ -32,6 +32,19 @@ jobs:
       # feature; its tests need a C compiler and static libc.
       - run: cargo clippy -p fsgate --all-targets --features experimental-intercept -- -D warnings
       - run: cargo test --locked -p fsgate --features experimental-intercept
+      # Ignored elsewhere: mounting needs root, so it runs its child with
+      # passwordless `sudo` and util-linux `unshare`, which the runner has.
+      # The count fails a filter that matches nothing.
+      - name: Test mounts beneath a grant
+        shell: bash
+        run: |
+          if ! output=$(cargo test --locked -p fsgate --test lock -- --ignored \
+              --exact kernel::mounts_beneath_a_grant_are_reached_through_it 2>&1); then
+            printf '%s\n' "$output"
+            exit 1
+          fi
+          printf '%s\n' "$output"
+          grep --quiet '^test result: ok\. 1 passed' <<<"$output"
       - run: cargo package --locked -p fsgate
       - name: Test the packaged crate
         shell: bash

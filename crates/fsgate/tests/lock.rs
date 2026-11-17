@@ -1333,6 +1333,128 @@ mod kernel {
         fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
+    /// Mounts beneath a grant, which the threat model lists among the gaps:
+    /// - A file system mounted beneath a grant after `grant()` is reached
+    ///   through the gate, which does not refuse crossing a mount point, and
+    ///   after `lock()` through the kernel rules, which follow a path up
+    ///   through the mount.
+    /// - A directory bind-mounted into a grant is reached with that grant's
+    ///   rights, even though it has its own grant with fewer. `grant` reads
+    ///   nesting up through `..`, which leads to where the directory really
+    ///   is (RFC 0012's limits). A real subdirectory granted with fewer
+    ///   rights is refused.
+    ///
+    /// Mounting needs root, so the child runs as root in a mount namespace
+    /// of its own, where its mounts end with it.
+    #[test]
+    #[ignore = "needs passwordless `sudo` and util-linux `unshare`; CI's check job runs it"]
+    fn mounts_beneath_a_grant_are_reached_through_it() {
+        let (_root, granted, outside) = dirs();
+        let apart = outside.join("apart");
+        for dir in [granted.join("mnt"), granted.join("bound"), apart.clone()] {
+            fs::create_dir(dir).unwrap();
+        }
+
+        // `sudo` resets the environment, so `env` sets it inside.
+        let output = Command::new("sudo")
+            .args(["--non-interactive", "env", "FSGATE_CHILD=mount_child"])
+            .arg("FSGATE_MODE=root")
+            .arg(format!("FSGATE_GRANTED={}", granted.display()))
+            .arg(format!("FSGATE_OUTSIDE={}", outside.display()))
+            .args(["unshare", "--mount", "--propagation", "private", "--"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "kernel::mount_child", "--nocapture"])
+            .output()
+            .expect("run `sudo`");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the child failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // The mounts ended with the child's namespace. What it wrote
+        // through the bind mount is in the directory itself.
+        assert_eq!(fs::read_dir(granted.join("mnt")).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(granted.join("bound")).unwrap().count(), 0);
+        assert!(apart.join("through_gate.txt").exists());
+        assert!(apart.join("through_kernel.txt").exists());
+        assert!(!apart.join("direct.txt").exists());
+    }
+
+    #[test]
+    fn mount_child() {
+        use std::os::unix::fs::MetadataExt;
+
+        if child_mode("mount_child").is_none() {
+            return;
+        }
+        let granted = PathBuf::from(std::env::var("FSGATE_GRANTED").unwrap());
+        let outside = PathBuf::from(std::env::var("FSGATE_OUTSIDE").unwrap());
+        let (mnt, bound, apart) = (
+            granted.join("mnt"),
+            granted.join("bound"),
+            outside.join("apart"),
+        );
+        let mount = |args: &[&std::ffi::OsStr]| {
+            let status = Command::new("mount")
+                .args(args)
+                .status()
+                .expect("run `mount`");
+            assert!(status.success(), "mount {args:?}: {status}");
+        };
+
+        let mut gate = Gate::new();
+        gate.grant(&granted, Rights::READ | Rights::WRITE | Rights::CREATE)
+            .unwrap();
+
+        // A file system mounted after the grant.
+        mount(&[
+            "-t".as_ref(),
+            "tmpfs".as_ref(),
+            "tmpfs".as_ref(),
+            mnt.as_os_str(),
+        ]);
+        fs::write(mnt.join("file.txt"), b"mounted").unwrap();
+        assert_ne!(
+            fs::metadata(&mnt).unwrap().dev(),
+            fs::metadata(&granted).unwrap().dev(),
+            "the mount is another file system"
+        );
+        let mut content = String::new();
+        gate.open(mnt.join("file.txt"))
+            .expect("open across the mount point")
+            .read_to_string(&mut content)
+            .unwrap();
+        assert_eq!(content, "mounted");
+
+        // A real subdirectory with fewer rights is refused, but a directory
+        // bind-mounted in is not, and the outer grant's rights reach it.
+        fs::create_dir(granted.join("sub")).unwrap();
+        let err = gate.grant(granted.join("sub"), Rights::READ).unwrap_err();
+        assert!(matches!(err, GateError::NestedGrant { .. }), "got {err:?}");
+        mount(&["--bind".as_ref(), apart.as_os_str(), bound.as_os_str()]);
+        gate.grant(&apart, Rights::READ)
+            .expect("the bind mount hides the nesting");
+        gate.create(bound.join("through_gate.txt"))
+            .expect("create through the outer grant");
+        let err = gate.create(apart.join("direct.txt")).unwrap_err();
+        assert!(
+            matches!(err, GateError::RightsExceeded { .. }),
+            "got {err:?}"
+        );
+
+        // The kernel rules after the lock: the same, by each path.
+        assert_eq!(gate.lock().expect("strict lock"), LockStatus::FullyEnforced);
+        let err = fs::read(outside.join("secret.txt")).expect_err("read outside the grants");
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        assert_eq!(fs::read_to_string(mnt.join("file.txt")).unwrap(), "mounted");
+        fs::write(bound.join("through_kernel.txt"), b"")
+            .expect("write through the outer grant's rule");
+        let err = fs::write(apart.join("direct.txt"), b"").expect_err("write by the real path");
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    }
+
     /// The installed ruleset never changes, so only operations through the
     /// gate see a later narrow or revoke.
     #[test]
