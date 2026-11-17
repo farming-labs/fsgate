@@ -61,7 +61,8 @@ fn assert_ran(output: &Output) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success() && stdout.contains("1 passed"),
-        "the worker did not pass: {stdout}\n{}",
+        "the worker did not pass ({}): {stdout}\n{}",
+        output.status,
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -625,6 +626,132 @@ mod kernel {
         }
         let leader = rustix::process::getsid(None).unwrap() == rustix::process::getpid();
         assert_eq!(leader, expect_denied());
+    }
+
+    /// What leading its own session costs: the terminal a confined worker
+    /// inherits is not its controlling terminal, so job control never stops
+    /// it. `shell_scenario` plays the user's shell. It leads a session with a
+    /// pseudo-terminal and keeps the foreground, as a shell does while it
+    /// reads a command, with a line already typed and waiting. It runs the
+    /// broker as a background job whose worker reads standard input. The
+    /// confined worker reads the line. In the control, the unconfined worker
+    /// shares the broker's background group, so its read stops that group
+    /// with `SIGTTIN` and reads nothing.
+    #[test]
+    fn a_confined_worker_reads_the_terminal_while_the_shell_has_the_foreground() {
+        for mode in ["confined", "unconfined"] {
+            let output = Command::new(env::current_exe().unwrap())
+                .args(["--exact", "kernel::shell_scenario", "--nocapture"])
+                .env("FSGATE_CHILD", "kernel::shell_scenario")
+                .env("FSGATE_TERMINAL", mode)
+                .output()
+                .expect("run the shell scenario");
+            assert_ran(&output);
+        }
+    }
+
+    const TYPED: &str = "typed at the shell\n";
+
+    #[test]
+    fn shell_scenario() {
+        use rustix::fs::{Mode, OFlags};
+        use rustix::process::{WaitId, WaitIdOptions};
+        use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+        use std::mem::ManuallyDrop;
+        use std::os::unix::process::CommandExt;
+
+        if !in_child("kernel::shell_scenario") {
+            return;
+        }
+        // Never closed here. Closing the master hangs up the terminal, and the
+        // kernel then sends `SIGHUP` to its session's leader, this process,
+        // which would die before the harness reports. Exiting closes it.
+        let master = ManuallyDrop::new(
+            openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)
+                .expect("open a pseudo-terminal"),
+        );
+        grantpt(&*master).unwrap();
+        unlockpt(&*master).unwrap();
+        let name = ptsname(&*master, Vec::new()).unwrap();
+        rustix::process::setsid().unwrap();
+        let terminal = rustix::fs::open(
+            name.as_c_str(),
+            OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        rustix::process::ioctl_tiocsctty(&terminal).unwrap();
+        // Taking the terminal made this process's group its foreground group.
+        assert_eq!(
+            rustix::termios::tcgetpgrp(&terminal).unwrap(),
+            rustix::process::getpgrp()
+        );
+        assert_eq!(
+            rustix::io::write(&*master, TYPED.as_bytes()).unwrap(),
+            TYPED.len()
+        );
+
+        let fixture = fixture();
+        let confined_run = env::var("FSGATE_TERMINAL").unwrap() == "confined";
+        let flags = if confined_run {
+            confined(&[])
+        } else {
+            unconfined()
+        };
+        let mut child = broker(&fixture, &flags, "kernel::terminal_scenario")
+            .stdin(Stdio::from(terminal))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn fsgate-broker");
+        let pid = Pid::from_child(&child);
+        // Looks without reaping, so `wait` below still can.
+        let status = rustix::process::waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::STOPPED | WaitIdOptions::NOWAIT,
+        )
+        .unwrap()
+        .expect("a status for the broker");
+        let stopped_by = status.stopping_signal();
+        if status.stopped() {
+            // A stopped group would hold the pipes below open.
+            rustix::process::kill_process_group(pid, Signal::KILL).unwrap();
+        }
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        let exit = child.wait().expect("reap fsgate-broker");
+        let report = format!("{exit}, stopped by {stopped_by:?}\n{stdout}\n{stderr}");
+
+        if confined_run {
+            assert!(exit.success(), "{report}");
+            assert!(stdout.contains("1 passed"), "{report}");
+        } else {
+            assert_eq!(stopped_by, Some(Signal::TTIN.as_raw()), "{report}");
+            assert!(!stdout.contains("1 passed"), "{report}");
+        }
+    }
+
+    #[test]
+    fn terminal_scenario() {
+        if !in_child("kernel::terminal_scenario") {
+            return;
+        }
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).unwrap();
+        assert_eq!(line, TYPED);
     }
 
     /// `/proc/<pid>/environ` is guarded by the same kernel check as ptrace,
