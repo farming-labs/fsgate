@@ -718,8 +718,11 @@ impl Gate {
     /// Linux 7.0 and later it covers every thread of the process
     /// ([`Restrictions::ALL_THREADS`]); on older kernels it covers the
     /// calling thread and what it spawns afterwards, so call `lock` before
-    /// spawning threads. On platforms without Landlock a strict lock fails
-    /// with [`GateError::LockUnsupported`].
+    /// spawning threads. Access the process already holds stays: a file
+    /// opened before the lock keeps its access, and so does an `io_uring`
+    /// ring set up before it with `SQPOLL` or with a registered
+    /// personality. On platforms without Landlock a strict lock fails with
+    /// [`GateError::LockUnsupported`].
     pub fn lock(&mut self) -> Result<LockStatus, GateError> {
         self.lock_with(LockOptions::default())
     }

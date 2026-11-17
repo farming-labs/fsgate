@@ -892,9 +892,9 @@ mod kernel {
     }
 
     /// The gap: the death signal binds only the worker. A program it starts
-    /// never has one, so it outlives a killed broker, still confined. The
-    /// worker could also clear its own, but on its main thread, and libtest
-    /// runs each scenario on another.
+    /// never has one, so it outlives a killed broker, still confined.
+    /// [`a_confined_worker_that_drops_its_death_signal_outlives_its_broker`]
+    /// covers a worker that drops its own.
     #[test]
     fn a_program_a_confined_worker_starts_outlives_its_broker() {
         let fixture = fixture();
@@ -947,6 +947,87 @@ mod kernel {
         let err = fs::read(secret).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::PermissionDenied);
         println!("alive");
+    }
+
+    /// The other half of the gap: a worker that drops its own death signal.
+    /// The signal belongs to a thread, and the broker sets it on the worker's
+    /// main thread, while libtest runs each scenario on another. So the
+    /// scenario changes its own thread's signal and then execs the program
+    /// that waits: the thread that execs becomes the program's only thread
+    /// and keeps its signal.
+    ///
+    /// - `keeps`, the control: the scenario sets `SIGKILL` and execs, and
+    ///   the program dies with the broker.
+    /// - `clears`: it sets `SIGKILL`, clears it, and execs. The program
+    ///   outlives the broker, so clearing is the only difference.
+    /// - `execs`: it execs with the thread's signal as it found it. A thread
+    ///   the worker starts has none, so the program outlives the broker.
+    ///
+    /// After the broker is reaped the test sends the line the program waits
+    /// for and reads standard output to its end. A program that outlived the
+    /// broker answers `alive` and exits; a killed one never reads the line.
+    /// Either way the read ends, with no timeout.
+    #[test]
+    fn a_confined_worker_that_drops_its_death_signal_outlives_its_broker() {
+        for (mode, survives) in [("keeps", false), ("clears", true), ("execs", true)] {
+            let fixture = fixture();
+            let mut broker = broker(
+                &fixture,
+                &confined(&["FSGATE_DEATH"]),
+                "kernel::drops_its_death_signal_scenario",
+            )
+            .env("FSGATE_DEATH", mode)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn fsgate-broker");
+            let mut stdin = broker.stdin.take().expect("piped stdin");
+            let mut stdout = BufReader::new(broker.stdout.take().expect("piped stdout"));
+            wait_until_ready(&mut stdout);
+
+            broker.kill().expect("kill the broker");
+            broker.wait().expect("reap the broker");
+
+            // A killed program has closed its end, or will before it could
+            // read this, so the write may fail.
+            let _ = stdin.write_all(b"ping\n");
+            drop(stdin);
+            let mut rest = String::new();
+            stdout.read_to_string(&mut rest).expect("read the program");
+            assert_eq!(
+                rest.contains("alive") && rest.contains("1 passed"),
+                survives,
+                "mode {mode}: {rest:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn drops_its_death_signal_scenario() {
+        use std::os::unix::process::CommandExt;
+
+        use rustix::process::{parent_process_death_signal, set_parent_process_death_signal};
+
+        if !in_child("kernel::drops_its_death_signal_scenario") {
+            return;
+        }
+        let mode = env::var("FSGATE_DEATH").unwrap();
+        let found = parent_process_death_signal().unwrap();
+        eprintln!("drops_its_death_signal_scenario: mode {mode}, this thread's signal {found:?}");
+        match mode.as_str() {
+            "keeps" => set_parent_process_death_signal(Some(Signal::KILL)).unwrap(),
+            "clears" => {
+                set_parent_process_death_signal(Some(Signal::KILL)).unwrap();
+                set_parent_process_death_signal(None).unwrap();
+            }
+            "execs" => assert_eq!(found, None, "a thread the worker starts has no signal"),
+            other => panic!("unknown mode `{other}`"),
+        }
+        let err = Command::new(env::current_exe().unwrap())
+            .args(["--exact", "kernel::outlives_scenario", "--nocapture"])
+            .env("FSGATE_CHILD", "kernel::outlives_scenario")
+            .exec();
+        panic!("exec the program: {err}");
     }
 
     /// Reads the line a worker prints once it and its program run:
