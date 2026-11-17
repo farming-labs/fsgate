@@ -403,37 +403,10 @@ fn check_image(image: &File, executable: &Path) -> io::Result<()> {
         Err(err) => return Err(err.into()),
     }
 
-    let not_elf = || {
-        refuse("is not an ELF executable (scripts are not supported); pass a static native binary")
-    };
-    let mut header = [0u8; 64];
-    image.read_exact_at(&mut header, 0).map_err(|_| not_elf())?;
-    let u16_at = |at: usize| u16::from_le_bytes([header[at], header[at + 1]]);
-    if header[..4] != *b"\x7fELF" {
-        return Err(not_elf());
-    }
-    // ELFCLASS64, ELFDATA2LSB, EM_X86_64, and ET_EXEC or ET_DYN (static PIE).
-    if header[4] != 2 || header[5] != 1 || u16_at(18) != 62 {
-        return Err(refuse(
-            "is not a 64-bit x86_64 ELF; the interception profile supports native x86_64 only",
-        ));
-    }
-    if !matches!(u16_at(16), 2 | 3) {
-        return Err(not_elf());
-    }
-    let mut phoff = [0u8; 8];
-    phoff.copy_from_slice(&header[32..40]);
-    let (phoff, entry_size, entries) = (u64::from_le_bytes(phoff), u16_at(54), u16_at(56));
-    // Elf64_Phdr is 56 bytes; 0xffff (PN_XNUM) and absurd counts are refused.
-    if entry_size != 56 || entries == 0 || entries > 1024 {
-        return Err(refuse("has an unsupported program header table"));
-    }
-    let mut table = vec![0u8; 56 * usize::from(entries)];
-    image
-        .read_exact_at(&mut table, phoff)
-        .map_err(|_| refuse("has a truncated program header table"))?;
-    const PT_INTERP: [u8; 4] = 3u32.to_le_bytes();
-    if table.chunks_exact(56).any(|entry| entry[..4] == PT_INTERP) {
+    let inspected = crate::intercept_image::inspect(image).map_err(|error| {
+        io::Error::new(error.kind(), format!("`{}` {error}", executable.display()))
+    })?;
+    if inspected.interpreter.is_some() {
         return Err(refuse(
             "needs an ELF interpreter (it is dynamically linked); build it static, for example with `cc -static`",
         ));
