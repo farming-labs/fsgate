@@ -37,9 +37,20 @@ jobs:
           # Ubuntu restricts uid-map writes inside unprivileged namespaces.
           # Allow the test to construct both maps, then restore the policy.
           policy=kernel.apparmor_restrict_unprivileged_userns
+          previous=
+          broker_source=crates/fsgate/src/broker.rs
+          broker_backup=$(mktemp)
+          cp "$broker_source" "$broker_backup"
+          restore() {
+            cp "$broker_backup" "$broker_source"
+            rm "$broker_backup"
+            if [ -n "$previous" ]; then
+              sudo sysctl -w "$policy=$previous"
+            fi
+          }
+          trap restore EXIT
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             previous=$(sysctl -n "$policy")
-            trap 'sudo sysctl -w "$policy=$previous"' EXIT
             sudo sysctl -w "$policy=0"
           fi
           if ! output=$(cargo test --locked -p fsgate --test broker_serve -- --ignored \
@@ -49,6 +60,27 @@ jobs:
           fi
           printf '%s\n' "$output"
           grep --quiet '^test result: ok\. 1 passed' <<<"$output"
+          # Prove the test catches the missing guard, not just setup or a
+          # build failure. Restore the source before any later step runs.
+          python3 - "$broker_source" <<'PY'
+          import pathlib
+          import sys
+          path = pathlib.Path(sys.argv[1])
+          source = path.read_text()
+          guard = "        refuse_lookalike_uids(&uids)?;\n"
+          assert source.count(guard) == 1, "expected exactly one peer-identity guard"
+          path.write_text(source.replace(guard, ""))
+          PY
+          if output=$(cargo test --locked -p fsgate --test broker_serve -- --ignored \
+              --exact a_broker_that_cannot_tell_its_peers_apart_refuses_to_serve 2>&1); then
+            printf '%s\n' "$output"
+            echo "::error::the namespace regression passed with its guard removed"
+            exit 1
+          fi
+          printf '%s\n' "$output"
+          grep --quiet 'left: WouldBlock' <<<"$output"
+          grep --quiet 'right: Unsupported' <<<"$output"
+          grep --quiet '^test result: FAILED\. 0 passed; 1 failed;' <<<"$output"
       # The experimental interception code (RFC 0004) builds only with its
       # feature; its tests need a C compiler and static libc.
       - run: cargo clippy -p fsgate --all-targets --features experimental-intercept -- -D warnings

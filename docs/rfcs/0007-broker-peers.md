@@ -245,5 +245,8 @@ open questions answered:
    nonblocking listener makes removing the guard fail with `WouldBlock`
    instead of hanging. The CI step temporarily permits unprivileged user
    namespace mappings under Ubuntu's AppArmor policy, restoring it on exit.
+   It repeats the test with the peer-identity guard removed and requires
+   the `WouldBlock` versus `Unsupported` assertion to fail, then restores
+   the source before later checks. A build or setup failure does not count.
    The VM kernel configuration enables user namespaces so the same broker
    check runs there.
