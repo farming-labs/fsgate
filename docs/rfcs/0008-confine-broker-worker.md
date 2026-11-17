@@ -317,7 +317,8 @@ Accepted by the maintainer, with these answers:
    ([below](#programs-that-read-files-in-etc)). Other files in `/etc` stay
    opt-in with `--direct`.
 5. A terminal reaches a confined worker for output only, and `--terminal`
-   passes it as it is ([above](#the-terminal)).
+   passes it as it is ([above](#the-terminal),
+   [#117](https://github.com/farming-labs/fsgate/pull/117)).
 
 ## Open question
 
