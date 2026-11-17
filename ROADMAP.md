@@ -349,12 +349,23 @@ Order: the model-based tests first, because they cover the most code on both pla
 
 ## M11 — interception for unmodified programs
 
-Prioritized after the initial M6 static-binary profile. Design: [RFC 0015](docs/rfcs/0015-dynamic-interception.md), currently a draft. The next compatibility target is dynamically linked glibc programs on Linux x86_64. The dynamic launch profile is not implemented or released; the runtime-grant policy awaits a maintainer decision.
+Prioritized after the initial M6 static-binary profile. Design: [RFC 0015](docs/rfcs/0015-dynamic-interception.md), implemented locally with explicit runtime grants selected by the maintainer. The compatibility targets are dynamically linked glibc programs on Linux x86_64. Local packaged release tests pass on Linux 6.18.60; the declared CI kernel matrix, merge, and release are pending.
 
-- [ ] Inspect the interpreter in a held ELF image with bounded, non-executing parsing. Acceptance: native static/PIE and dynamic layouts are distinguished, malformed headers/interpreters are refused, and the existing launcher still refuses dynamic execution until the complete profile is ready. Implemented locally: eight focused host tests pass in the checkout and unpacked release-mode crate; all 145 host tests pass, and Linux x86_64 interception clippy passes. Linux execution and merge evidence are pending.
+- [ ] Inspect the interpreter in a held ELF image with bounded, non-executing parsing. Acceptance: native static/PIE and dynamic layouts are distinguished, malformed headers/interpreters are refused, and the existing launcher still refuses dynamic execution until the complete profile is ready. Implemented locally: eight focused host tests pass in the checkout and unpacked release-mode crate; all 145 host tests pass, and Linux x86_64 interception clippy passes. The parser is also covered by the local packaged Linux release tests; merge evidence is pending.
 - [ ] Settle runtime grants and loader identity. Acceptance: the selected policy, runtime/data overlap rules, symlink behavior, audit attribution, and lifecycle are documented; runtime resolution and interpreter replacement have real filesystem tests.
 - [ ] Implement measured loader and command syscall compatibility. Acceptance: focused fixtures cover every added syscall form, including metadata results, denials, cancellation, and invalid memory where applicable.
 - [ ] Launch unmodified dynamic programs through the API and CLI. Acceptance: the release build of the packaged source runs the dynamic C fixture and unmodified `cat`, `wc`, and `sha256sum` on the declared kernels, with exact output and no denied side effects. The static suite and unsupported-host checks still pass.
+
+Local M11 evidence (2026-11-17): 146 host tests pass; host and Linux x86_64
+interception clippy pass; the CLI fuzz oracle compiles. In a disposable Linux
+6.18.60-0-virt VM, the unpacked crate's optimized build passes 94 tests: 44 library
+unit tests, 12 interception tests, 30 static-launch tests, and eight dynamic-launch
+tests. Two no-Landlock cases are ignored on this supported kernel and are not
+counted as passes. Dynamic tests compare exact API/CLI output with unconfined GNU
+`cat`, `wc`, and `sha256sum`, and cover grant refusal, metadata copies, denied
+writes without side effects, revocation, child lifetime, and cleanup. See the
+[RFC's environment and remaining checks](docs/rfcs/0015-dynamic-interception.md#local-verification).
+Boxes remain open until merge and the declared CI acceptance are complete.
 
 ## Out of scope for v1
 

@@ -13,7 +13,8 @@
 //! before any grant is matched.
 //!
 //! [`Launch`] (x86_64 only) is the launcher and supervisor that does all of
-//! this for a static worker binary: it checks the image, starts the worker
+//! this for a native ELF worker binary (dynamic images need explicit runtime
+//! grants, RFC 0015): it checks the image, starts the worker
 //! under Landlock and two seccomp filters, copies each notified request,
 //! and answers it through `open_intercepted`.
 //!
@@ -41,6 +42,8 @@ use crate::AuditReason;
 mod filters;
 #[cfg(target_arch = "x86_64")]
 mod launch;
+#[cfg(target_arch = "x86_64")]
+mod runtime;
 #[cfg(target_arch = "x86_64")]
 #[allow(unsafe_code)]
 mod sys;

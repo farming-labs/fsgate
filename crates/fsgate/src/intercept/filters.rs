@@ -158,9 +158,15 @@ fn native_x86_64_only(program: &mut Vec<sock_filter>) {
 
 /// The notification filter: native x86_64 only, the three open syscalls go
 /// to the supervisor, and everything else is left to the allowlist.
-pub(crate) fn notify_filter() -> Vec<sock_filter> {
+pub(crate) fn notify_filter(runtime: bool) -> Vec<sock_filter> {
     let mut program = Vec::new();
     native_x86_64_only(&mut program);
+    if runtime {
+        program.extend([
+            jump(BPF_JEQ_K, libc::SYS_newfstatat as u32, 0, 1),
+            stmt(BPF_RET_K, NOTIFY),
+        ]);
+    }
     program.extend([
         jump(BPF_JEQ_K, libc::SYS_open as u32, 3, 0),
         jump(BPF_JEQ_K, libc::SYS_openat as u32, 2, 0),
@@ -190,9 +196,35 @@ fn one_of(program: &mut Vec<sock_filter>, nr: libc::c_long, offset: u32, values:
 }
 
 /// The final allowlist, built around the image at `image_fd`.
-pub(crate) fn final_allowlist(image_fd: RawFd) -> Vec<sock_filter> {
+pub(crate) fn final_allowlist(image_fd: RawFd, runtime: bool) -> Vec<sock_filter> {
     let mut program = Vec::new();
     native_x86_64_only(&mut program);
+    if runtime {
+        for nr in [
+            libc::SYS_fork,
+            libc::SYS_vfork,
+            libc::SYS_clone,
+            libc::SYS_clone3,
+        ] {
+            program.extend([jump(BPF_JEQ_K, nr as u32, 0, 1), stmt(BPF_RET_K, REFUSE)]);
+        }
+        program.extend([
+            jump(BPF_JEQ_K, libc::SYS_newfstatat as u32, 0, 1),
+            stmt(BPF_RET_K, ALLOW),
+            jump(BPF_JEQ_K, libc::SYS_statx as u32, 0, 1),
+            stmt(BPF_RET_K, errno(libc::ENOSYS)),
+            // prlimit64: pid is an int; the new-limit pointer is 64-bit.
+            jump(BPF_JEQ_K, libc::SYS_prlimit64 as u32, 0, 8),
+            stmt(BPF_LD_W_ABS, arg_low(0)),
+            jump(BPF_JEQ_K, 0, 0, 5),
+            stmt(BPF_LD_W_ABS, arg_low(2)),
+            jump(BPF_JEQ_K, 0, 0, 3),
+            stmt(BPF_LD_W_ABS, arg_low(2) + 4),
+            jump(BPF_JEQ_K, 0, 0, 1),
+            stmt(BPF_RET_K, ALLOW),
+            stmt(BPF_RET_K, REFUSE),
+        ]);
+    }
     for &nr in ALLOWED {
         program.push(jump(BPF_JEQ_K, nr as u32, 0, 1));
         program.push(stmt(BPF_RET_K, ALLOW));
@@ -292,7 +324,7 @@ mod tests {
     const IMAGE: RawFd = RESERVED_IMAGE_FD;
 
     fn allowlist(nr: libc::c_long, args: [u64; 6]) -> u32 {
-        eval(&final_allowlist(IMAGE), nr, AUDIT_ARCH_X86_64, args)
+        eval(&final_allowlist(IMAGE, false), nr, AUDIT_ARCH_X86_64, args)
     }
 
     fn call(nr: libc::c_long) -> u32 {
@@ -300,8 +332,59 @@ mod tests {
     }
 
     #[test]
+    fn runtime_profile_denies_descendants_and_notifies_descriptor_metadata() {
+        let program = final_allowlist(IMAGE, true);
+        for nr in [
+            libc::SYS_fork,
+            libc::SYS_vfork,
+            libc::SYS_clone,
+            libc::SYS_clone3,
+        ] {
+            assert_eq!(eval(&program, nr, AUDIT_ARCH_X86_64, [0; 6]), REFUSE);
+        }
+        assert_eq!(
+            eval(
+                &notify_filter(true),
+                libc::SYS_newfstatat,
+                AUDIT_ARCH_X86_64,
+                [0; 6]
+            ),
+            NOTIFY
+        );
+        assert_eq!(
+            eval(&program, libc::SYS_newfstatat, AUDIT_ARCH_X86_64, [0; 6]),
+            ALLOW
+        );
+        assert_eq!(
+            eval(&program, libc::SYS_statx, AUDIT_ARCH_X86_64, [0; 6]),
+            errno(libc::ENOSYS)
+        );
+    }
+
+    #[test]
+    fn runtime_limits_are_self_queries_only() {
+        let program = final_allowlist(IMAGE, true);
+        for (pid, pointer, expected) in [
+            (0, 0, ALLOW),
+            (1, 0, REFUSE),
+            (0, 1, REFUSE),
+            (0, 1 << 32, REFUSE),
+        ] {
+            assert_eq!(
+                eval(
+                    &program,
+                    libc::SYS_prlimit64,
+                    AUDIT_ARCH_X86_64,
+                    [pid, 3, pointer, 1, 0, 0]
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn non_native_calls_are_killed_by_both_filters() {
-        for program in [notify_filter(), final_allowlist(IMAGE)] {
+        for program in [notify_filter(false), final_allowlist(IMAGE, false)] {
             assert_eq!(eval(&program, libc::SYS_read, 0x4000_0003, [0; 6]), KILL);
             let x32 = libc::SYS_read | X32_SYSCALL_BIT as libc::c_long;
             assert_eq!(eval(&program, x32, AUDIT_ARCH_X86_64, [0; 6]), KILL);
@@ -310,7 +393,7 @@ mod tests {
 
     #[test]
     fn the_notification_filter_sends_only_the_open_family() {
-        let program = notify_filter();
+        let program = notify_filter(false);
         for nr in [libc::SYS_open, libc::SYS_openat, libc::SYS_openat2] {
             assert_eq!(eval(&program, nr, AUDIT_ARCH_X86_64, [0; 6]), NOTIFY);
         }

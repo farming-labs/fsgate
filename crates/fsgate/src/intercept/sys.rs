@@ -15,6 +15,10 @@
 //!   `repr(C)` copies below), zero-initialized where the kernel requires it
 //!   (`SECCOMP_IOCTL_NOTIF_RECV` rejects a non-zero buffer), and outlive the
 //!   call that reads or writes them.
+//! - **Worker writes.** [`write_metadata`] copies only initialized native stat
+//!   bytes with process_vm_writev. Its caller retains the owned child PID,
+//!   denies descendants and threads, and joins before reaping. It never uses
+//!   procfs writes, which would bypass the worker's memory protections.
 //! - **Post-fork code.** [`install_child_setup`] registers a closure that
 //!   runs in a child forked from a multi-threaded process, before exec. It
 //!   only makes raw syscalls on stack memory and on data captured before the
@@ -87,9 +91,11 @@ pub(crate) fn landlock_abi() -> io::Result<c_long> {
 }
 
 /// A ruleset that handles every ABI v3 filesystem right and allows only
-/// `READ_FILE | EXECUTE` on `executable`: the worker may run its own image
-/// and nothing else.
-pub(crate) fn executable_ruleset(executable: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+/// `READ_FILE | EXECUTE` on the held main image and optional loader.
+pub(crate) fn executable_ruleset(
+    executable: BorrowedFd<'_>,
+    loader: Option<BorrowedFd<'_>>,
+) -> io::Result<OwnedFd> {
     let attr = RulesetAttr {
         handled_access_fs: ACCESS_FS_V3,
     };
@@ -105,21 +111,23 @@ pub(crate) fn executable_ruleset(executable: BorrowedFd<'_>) -> io::Result<Owned
     })?;
     // SAFETY: the syscall returned a new descriptor that nothing else owns.
     let ruleset = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
-    let rule = PathBeneathAttr {
-        allowed_access: ACCESS_FS_EXECUTE | ACCESS_FS_READ_FILE,
-        parent_fd: executable.as_raw_fd(),
-    };
-    // SAFETY: `rule` is a valid path-beneath attribute; `ruleset` and
-    // `executable` are open descriptors; all three outlive the call.
-    check(unsafe {
-        libc::syscall(
-            libc::SYS_landlock_add_rule,
-            ruleset.as_raw_fd(),
-            LANDLOCK_RULE_PATH_BENEATH,
-            &rule as *const PathBeneathAttr,
-            0u32,
-        )
-    })?;
+    for image in std::iter::once(executable).chain(loader) {
+        let rule = PathBeneathAttr {
+            allowed_access: ACCESS_FS_EXECUTE | ACCESS_FS_READ_FILE,
+            parent_fd: image.as_raw_fd(),
+        };
+        // SAFETY: `rule` is a valid path-beneath attribute; `ruleset` and
+        // `image` are open descriptors; all three outlive the call.
+        check(unsafe {
+            libc::syscall(
+                libc::SYS_landlock_add_rule,
+                ruleset.as_raw_fd(),
+                LANDLOCK_RULE_PATH_BENEATH,
+                &rule as *const PathBeneathAttr,
+                0u32,
+            )
+        })?;
+    }
     Ok(ruleset)
 }
 
@@ -431,7 +439,7 @@ fn send_listener(socket: RawFd, listener: RawFd) -> io::Result<()> {
     message.msg_iov = &mut iov;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = CONTROL_SPACE;
+    message.msg_controllen = CONTROL_SPACE as _;
     // SAFETY: the control buffer has room for one header carrying one
     // descriptor, so CMSG_FIRSTHDR is non-null and every write below stays
     // inside `control`.
@@ -439,7 +447,7 @@ fn send_listener(socket: RawFd, listener: RawFd) -> io::Result<()> {
         let header = libc::CMSG_FIRSTHDR(&message);
         (*header).cmsg_level = libc::SOL_SOCKET;
         (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as u32) as usize;
+        (*header).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as u32) as _;
         libc::CMSG_DATA(header)
             .cast::<RawFd>()
             .write_unaligned(listener);
@@ -448,6 +456,58 @@ fn send_listener(socket: RawFd, listener: RawFd) -> io::Result<()> {
     let sent = check(unsafe { libc::sendmsg(socket, &message, libc::MSG_NOSIGNAL) } as c_long)?;
     if sent as usize != payload.len() {
         return Err(io::Error::from_raw_os_error(libc::EPROTO));
+    }
+    Ok(())
+}
+
+/// The supervisor writes only to its owned, single-threaded worker. Keeping
+/// that child waitable until the supervisor joins prevents PID reuse. The
+/// trusted embedder must preserve this policy and not reap the child itself.
+pub(crate) fn check_child_waitability() -> io::Result<()> {
+    let mut action = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
+    // SAFETY: a null new action only queries; the output buffer has the exact
+    // native layout and remains writable for this call.
+    check(unsafe { libc::sigaction(libc::SIGCHLD, ptr::null(), action.as_mut_ptr()) } as c_long)?;
+    // SAFETY: successful sigaction initialized the action fields.
+    let action = unsafe { action.assume_init() };
+    if action.sa_sigaction != libc::SIG_DFL || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "dynamic interception needs waitable children; keep SIGCHLD at its default disposition without SA_NOCLDWAIT",
+        ));
+    }
+    Ok(())
+}
+
+/// Writes native x86_64 metadata to a live worker's writable mapping.
+///
+/// The caller owns `pid`, forbids all worker threads and descendants, and
+/// retains the unreaped child until this call finishes. It checks the seccomp
+/// notification around this call. No pointer supplied by the worker is ever
+/// dereferenced locally; process_vm_writev validates the remote range and
+/// respects its page protections. A short copy fails, even if some bytes were
+/// already written. All local bytes, including padding, are initialized before
+/// fstat and are copied in place without moving the stat value.
+pub(crate) fn write_metadata(pid: i32, file: BorrowedFd<'_>, address: u64) -> io::Result<()> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: file is held, and stat is correctly aligned writable storage
+    // for the native libc layout. fstat cannot retain this pointer.
+    check(unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } as c_long)?;
+    let local = libc::iovec {
+        iov_base: stat.as_mut_ptr().cast(),
+        iov_len: size_of::<libc::stat>(),
+    };
+    let remote = libc::iovec {
+        iov_base: address as usize as *mut libc::c_void,
+        iov_len: local.iov_len,
+    };
+    // SAFETY: both iovecs and every byte of local storage live through the
+    // call. The remote pointer is interpreted only by the kernel, against
+    // the caller-owned PID under the lifetime contract above.
+    let written =
+        check(unsafe { libc::process_vm_writev(pid, &local, 1, &remote, 1, 0) } as c_long)?;
+    if written as usize != local.iov_len {
+        return Err(io::Error::from_raw_os_error(libc::EFAULT));
     }
     Ok(())
 }

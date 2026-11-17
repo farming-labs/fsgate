@@ -20,3 +20,4 @@
 ":rwcl"
 ":rlx"
 "="
+"--runtime\x00"

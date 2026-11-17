@@ -19,6 +19,7 @@ use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fs::{FileType, Mode, OFlags};
 use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
 
+use super::runtime::Runtime;
 use super::{CopyFault, OPEN_HOW_SIZE, OpenCall, OpenHow, OpenRequest, PATH_MAX, filters, sys};
 use crate::{Gate, GateError, Grant, Rights};
 
@@ -53,11 +54,17 @@ enum Fault {
     /// supervisor renames `with` over the executable path.
     #[cfg_attr(not(test), allow(dead_code))]
     ReplaceImage { with: PathBuf },
+    /// Replaces the declared interpreter after its rule has been prepared.
+    #[cfg_attr(not(test), allow(dead_code))]
+    ReplaceLoader { path: PathBuf, with: PathBuf },
     /// After deciding the first request, and before delivering it, the
     /// supervisor interrupts the worker with `SIGUSR1` and waits until the
     /// request is cancelled.
     #[cfg_attr(not(test), allow(dead_code))]
     InterruptFirstRequest,
+    /// Cancels the first metadata request immediately before its result copy.
+    #[cfg_attr(not(test), allow(dead_code))]
+    InterruptFirstMetadata,
 }
 
 /// Launches a worker under the RFC 0004 interception profile and answers
@@ -68,14 +75,21 @@ enum Fault {
 /// independently reviewed.
 ///
 /// The worker image must be a regular, native x86_64 ELF executable with no
-/// interpreter (statically linked), not set-ID, and without file
-/// capabilities. It starts with only stdio open (standard input empty,
+/// interpreter unless explicitly covered by [`runtime`](Launch::runtime),
+/// not set-ID, and without file capabilities. It starts with only stdio open (standard input empty,
 /// standard output and error captured), an empty environment, under
 /// `no_new_privs`, a Landlock ruleset that allows it nothing but executing
-/// its own image, and two seccomp filters: one that sends `open`, `openat`,
-/// and `openat2` to the supervisor, and the RFC's final syscall allowlist.
-/// Each notified open is decided by [`Gate::open_intercepted`], which emits
-/// one audit event per request through the gate's sink.
+/// its own image and its held loader, and two seccomp filters: one that sends
+/// `open`, `openat`, and `openat2` to the supervisor, and the RFC's final syscall
+/// allowlist. Data opens are decided by [`Gate::open_intercepted`], which emits
+/// one audit event per request through the gate's sink. Runtime opens use
+/// distinct audit operations. With runtime grants, the worker cannot create
+/// threads or descendants; grant-checked `newfstatat` is mediated too.
+///
+/// The trusted parent must keep `SIGCHLD` at its default disposition without
+/// `SA_NOCLDWAIT` and must not independently reap this owned worker. Startup
+/// checks that disposition; runtime-profile cleanup joins the supervisor
+/// before reaping, so a metadata write cannot target a recycled PID.
 ///
 /// ```no_run
 /// use fsgate::{Gate, Rights};
@@ -96,6 +110,7 @@ enum Fault {
 pub struct Launch {
     executable: PathBuf,
     args: Vec<OsString>,
+    runtime: Vec<PathBuf>,
 }
 
 impl Launch {
@@ -104,6 +119,7 @@ impl Launch {
         Launch {
             executable: executable.into(),
             args: Vec::new(),
+            runtime: Vec::new(),
         }
     }
 
@@ -123,14 +139,48 @@ impl Launch {
         self
     }
 
+    /// Grants read access to this runtime file or directory. No runtime paths
+    /// are added automatically. Runtime and data grants must not overlap.
+    ///
+    /// A nonempty runtime list selects the single-process, single-thread
+    /// profile. Directory symlinks must stay beneath the held directory;
+    /// exact file grants pin the object selected during startup.
+    pub fn runtime(&mut self, path: impl Into<PathBuf>) -> &mut Launch {
+        self.runtime.push(path.into());
+        self
+    }
+
     /// Checks kernel support and the image rule without launching
     /// anything: Landlock ABI 3, seccomp user notifications, and the
     /// executable itself. Fails with `Unsupported` for a missing kernel
     /// feature and `InvalidInput` for an image the profile refuses.
     pub fn check(&self) -> io::Result<()> {
+        self.check_grants(None)
+    }
+
+    /// Checks startup, including runtime/data overlap, without starting a worker.
+    pub fn check_with(&self, gate: &Gate) -> io::Result<()> {
+        self.check_grants(Some(gate))
+    }
+
+    /// Reads the native ELF interpreter path without executing the image.
+    /// Returns `None` for a static image. This does not grant the interpreter.
+    pub fn interpreter(&self) -> io::Result<Option<PathBuf>> {
+        Ok(check_image(&open_image(&self.executable)?, &self.executable)?.interpreter)
+    }
+
+    fn check_grants(&self, data: Option<&Gate>) -> io::Result<()> {
         preflight()?;
         let image = open_image(&self.executable)?;
-        check_image(&image, &self.executable)
+        let runtime = Runtime::prepare(&self.runtime)?;
+        if let Some(data) = data {
+            runtime.check_overlap(data)?;
+        }
+        prepare_loader(&image, &self.executable, &runtime)?;
+        if !self.runtime.is_empty() {
+            sys::check_child_waitability()?;
+        }
+        Ok(())
     }
 
     /// Starts the worker and returns a handle to it while its supervisor
@@ -141,7 +191,13 @@ impl Launch {
     /// supervisor answers until the worker exits, or gives up after 30
     /// seconds without a request or an exit, failing any pending open.
     pub fn spawn(&self, gate: Gate) -> io::Result<Running> {
-        spawn(&self.executable, &self.args, gate, Fault::None)
+        spawn(
+            &self.executable,
+            &self.args,
+            &self.runtime,
+            gate,
+            Fault::None,
+        )
     }
 
     /// Runs the worker to completion, with standard input closed, and
@@ -164,14 +220,15 @@ impl Launch {
 ///
 /// Standard output and error are drained in the background and returned by
 /// [`wait`](Running::wait). Dropping a `Running` without waiting kills and
-/// reaps the worker; its supervisor then stops on its own.
+/// reaps the worker. Runtime-profile cleanup joins its supervisor first.
 pub struct Running {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     stdout: Option<JoinHandle<io::Result<Vec<u8>>>>,
     stderr: Option<JoinHandle<io::Result<Vec<u8>>>>,
     supervisor: Option<JoinHandle<io::Result<()>>>,
-    gate: Arc<Mutex<Gate>>,
+    gate: Arc<Mutex<Authority>>,
+    runtime_profile: bool,
 }
 
 impl Running {
@@ -188,12 +245,20 @@ impl Running {
 
     /// Revokes `grant` for every later request (see [`Gate::revoke`]).
     pub fn revoke(&self, grant: Grant) -> Result<(), GateError> {
-        lock(&self.gate).revoke(grant)
+        lock(&self.gate).data.revoke(grant)
     }
 
     /// Narrows `grant` for every later request (see [`Gate::narrow`]).
     pub fn narrow(&self, grant: Grant, rights: Rights) -> Result<(), GateError> {
-        lock(&self.gate).narrow(grant, rights)
+        lock(&self.gate).data.narrow(grant, rights)
+    }
+
+    /// Removes an explicit runtime grant for later opens. Already delivered
+    /// files, mapped libraries, and the loader execution rule remain usable.
+    pub fn revoke_runtime(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let mut authority = lock(&self.gate);
+        let Authority { data, runtime } = &mut *authority;
+        runtime.revoke(path.as_ref(), data)
     }
 
     /// Kills the worker with `SIGKILL`. Call [`wait`](Running::wait)
@@ -210,6 +275,12 @@ impl Running {
     /// example after 30 seconds without a request or an exit.
     pub fn wait(mut self) -> io::Result<Outcome> {
         drop(self.stdin.take());
+        // Retain the owned PID until the last metadata write has finished.
+        if self.runtime_profile {
+            if let Some(supervisor) = self.supervisor.take() {
+                join(supervisor)?;
+            }
+        }
         let status = match self.child.take() {
             Some(mut child) => child.wait(),
             None => Err(io::Error::other("the worker was already reaped")),
@@ -232,15 +303,24 @@ impl Drop for Running {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
+            if self.runtime_profile {
+                if let Some(supervisor) = self.supervisor.take() {
+                    let _ = join(supervisor);
+                }
+            }
             let _ = child.wait();
         }
     }
 }
 
-/// Locks the shared gate. A panic while it was held cannot leave a grant
-/// half changed, because each gate method completes or returns an error, so
-/// a poisoned lock is used as is: revocation must keep working.
-fn lock(gate: &Mutex<Gate>) -> MutexGuard<'_, Gate> {
+struct Authority {
+    data: Gate,
+    runtime: Runtime,
+}
+
+/// A grant mutation completes before its audit callback. If that callback
+/// panics, revocation must still work through the poisoned lock.
+fn lock(gate: &Mutex<Authority>) -> MutexGuard<'_, Authority> {
     gate.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -287,11 +367,24 @@ fn open_image(executable: &Path) -> io::Result<File> {
 /// syscalls are answered from `gate`. A failure before exec, including the
 /// supervisor refusing to release the startup barrier, returns the child's
 /// error and the worker never runs.
-fn spawn(executable: &Path, args: &[OsString], gate: Gate, fault: Fault) -> io::Result<Running> {
+fn spawn(
+    executable: &Path,
+    args: &[OsString],
+    runtime_paths: &[PathBuf],
+    gate: Gate,
+    fault: Fault,
+) -> io::Result<Running> {
     preflight()?;
     let image = open_image(executable)?;
-    check_image(&image, executable)?;
-    let ruleset = sys::executable_ruleset(image.as_fd())?;
+    let runtime_profile = !runtime_paths.is_empty();
+    if runtime_profile {
+        sys::check_child_waitability()?;
+    }
+    let runtime = Runtime::prepare(runtime_paths)?;
+    runtime.check_overlap(&gate)?;
+    let loader = prepare_loader(&image, executable, &runtime)?;
+    let ruleset = sys::executable_ruleset(image.as_fd(), loader.as_ref().map(AsFd::as_fd))?;
+    runtime.audit_grants(&gate);
     let argv = std::iter::once(executable.as_os_str())
         .chain(args.iter().map(OsString::as_os_str))
         .map(|arg| {
@@ -304,13 +397,17 @@ fn spawn(executable: &Path, args: &[OsString], gate: Gate, fault: Fault) -> io::
         })
         .collect::<io::Result<Vec<_>>>()?;
     let target = executable.to_path_buf();
-    let gate = Arc::new(Mutex::new(gate));
+    let gate = Arc::new(Mutex::new(Authority {
+        data: gate,
+        runtime,
+    }));
     let shared = Arc::clone(&gate);
     let (supervisor_end, child_end) = UnixStream::pair()?;
     // The supervisor holds its end until the child has sent the listener or
     // died, so this number stays valid through the fork.
     let peer = supervisor_end.as_raw_fd();
-    let supervisor = thread::spawn(move || supervise(supervisor_end, &shared, fault, &target));
+    let supervisor =
+        thread::spawn(move || supervise(supervisor_end, &shared, fault, &target, runtime_profile));
 
     let mut command = Command::new(executable);
     command
@@ -325,8 +422,8 @@ fn spawn(executable: &Path, args: &[OsString], gate: Gate, fault: Fault) -> io::
             ruleset: ruleset.as_raw_fd(),
             socket: child_end.as_raw_fd(),
             peer,
-            filter: filters::notify_filter(),
-            allowlist: filters::final_allowlist(filters::RESERVED_IMAGE_FD),
+            filter: filters::notify_filter(runtime_profile),
+            allowlist: filters::final_allowlist(filters::RESERVED_IMAGE_FD, runtime_profile),
             image: image.as_raw_fd(),
             argv,
         },
@@ -351,6 +448,7 @@ fn spawn(executable: &Path, args: &[OsString], gate: Gate, fault: Fault) -> io::
         child: Some(child),
         supervisor: Some(supervisor),
         gate,
+        runtime_profile,
     })
 }
 
@@ -373,9 +471,9 @@ fn preflight() -> io::Result<()> {
 }
 
 /// The RFC 0004 image rule, checked on the held image itself: a regular,
-/// native x86_64 ELF executable with no interpreter, not set-ID, and with
+/// native x86_64 ELF executable, not set-ID, and with
 /// no file capabilities. The child later executes this same descriptor.
-fn check_image(image: &File, executable: &Path) -> io::Result<()> {
+fn check_image(image: &File, executable: &Path) -> io::Result<crate::intercept_image::Image> {
     let refuse = |problem: &str| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -403,15 +501,24 @@ fn check_image(image: &File, executable: &Path) -> io::Result<()> {
         Err(err) => return Err(err.into()),
     }
 
-    let inspected = crate::intercept_image::inspect(image).map_err(|error| {
+    crate::intercept_image::inspect(image).map_err(|error| {
         io::Error::new(error.kind(), format!("`{}` {error}", executable.display()))
-    })?;
-    if inspected.interpreter.is_some() {
-        return Err(refuse(
-            "needs an ELF interpreter (it is dynamically linked); build it static, for example with `cc -static`",
+    })
+}
+
+fn prepare_loader(image: &File, executable: &Path, runtime: &Runtime) -> io::Result<Option<File>> {
+    let inspected = check_image(image, executable)?;
+    let Some(path) = inspected.interpreter else {
+        return Ok(None);
+    };
+    let loader = runtime.open_loader(&path)?;
+    if check_image(&loader, &path)?.interpreter.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ELF interpreter has its own interpreter; grant a native standalone loader",
         ));
     }
-    Ok(())
+    Ok(Some(loader))
 }
 
 fn unsupported(message: String) -> io::Error {
@@ -426,17 +533,20 @@ fn join(supervisor: JoinHandle<io::Result<()>>) -> io::Result<()> {
 
 fn supervise(
     socket: UnixStream,
-    gate: &Mutex<Gate>,
+    gate: &Mutex<Authority>,
     fault: Fault,
     executable: &Path,
+    runtime_profile: bool,
 ) -> io::Result<()> {
     let interrupt_first = fault == Fault::InterruptFirstRequest;
+    let interrupt_metadata = fault == Fault::InterruptFirstMetadata;
     let (listener, pid) = receive_listener(&socket)?;
     await_restricted(&socket)?;
     verify_listener(&listener)?;
     verify_child_memory(pid)?;
     match fault {
         Fault::ReplaceImage { with } => std::fs::rename(with, executable)?,
+        Fault::ReplaceLoader { path, with } => std::fs::rename(with, path)?,
         // Dropping the socket without the ready byte fails the barrier.
         Fault::AbortStartup => return Ok(()),
         Fault::CloseListener => {
@@ -444,11 +554,17 @@ fn supervise(
             release(&socket)?;
             return Ok(());
         }
-        Fault::None | Fault::InterruptFirstRequest => {}
+        Fault::None | Fault::InterruptFirstRequest | Fault::InterruptFirstMetadata => {}
     }
     release(&socket)?;
     drop(socket);
-    serve(&listener, gate, interrupt_first)
+    serve(
+        &listener,
+        gate,
+        interrupt_first,
+        runtime_profile.then_some(pid),
+        interrupt_metadata,
+    )
 }
 
 fn startup_error(message: &str) -> io::Error {
@@ -527,7 +643,13 @@ fn release(socket: &UnixStream) -> io::Result<()> {
     (&*socket).write_all(&[sys::RELEASE_BYTE])
 }
 
-fn serve(listener: &OwnedFd, gate: &Mutex<Gate>, mut interrupt_next: bool) -> io::Result<()> {
+fn serve(
+    listener: &OwnedFd,
+    gate: &Mutex<Authority>,
+    mut interrupt_next: bool,
+    runtime_pid: Option<i32>,
+    mut interrupt_metadata: bool,
+) -> io::Result<()> {
     loop {
         let mut fds = [PollFd::new(listener, PollFlags::IN)];
         if rustix::event::poll(&mut fds, Some(&IDLE_TIMEOUT))? == 0 {
@@ -539,7 +661,17 @@ fn serve(listener: &OwnedFd, gate: &Mutex<Gate>, mut interrupt_next: bool) -> io
         let revents = fds[0].revents();
         if revents.contains(PollFlags::IN) {
             match sys::notif_recv(listener.as_fd()) {
-                Ok(notif) => answer(listener, gate, &notif, std::mem::take(&mut interrupt_next)),
+                Ok(notif) => answer(
+                    listener,
+                    gate,
+                    &notif,
+                    if i64::from(notif.data.nr) == libc::SYS_newfstatat {
+                        std::mem::take(&mut interrupt_metadata)
+                    } else {
+                        std::mem::take(&mut interrupt_next)
+                    },
+                    runtime_pid,
+                ),
                 // The target died or its syscall was interrupted first.
                 Err(err) if err.raw_os_error() == Some(libc::ENOENT) => {}
                 Err(err) => return Err(err),
@@ -565,7 +697,23 @@ enum Copied {
 /// delivers the file or the errno. The gate stays locked from the decision
 /// through the delivery, so a concurrent revoke waits for this request and
 /// applies to every later one.
-fn answer(listener: &OwnedFd, gate: &Mutex<Gate>, notif: &libc::seccomp_notif, interrupt: bool) {
+fn answer(
+    listener: &OwnedFd,
+    gate: &Mutex<Authority>,
+    notif: &libc::seccomp_notif,
+    interrupt: bool,
+    runtime_pid: Option<i32>,
+) {
+    if let Some(pid) = runtime_pid {
+        if notif.pid != pid as u32 {
+            let _ = sys::notif_send_error(listener.as_fd(), notif.id, libc::EACCES);
+            return;
+        }
+        if i64::from(notif.data.nr) == libc::SYS_newfstatat {
+            answer_metadata(listener, gate, notif, pid, interrupt);
+            return;
+        }
+    }
     let request = match copy_request(listener, notif) {
         Copied::Cancelled => return,
         Copied::NotAnOpen => {
@@ -575,7 +723,11 @@ fn answer(listener: &OwnedFd, gate: &Mutex<Gate>, notif: &libc::seccomp_notif, i
         Copied::Request(request) => request,
     };
     let gate = lock(gate);
-    let errno = match gate.open_intercepted(&request) {
+    let opened = gate
+        .runtime
+        .open(&request, &gate.data)
+        .unwrap_or_else(|| gate.data.open_intercepted(&request));
+    let errno = match opened {
         Ok(file) => {
             if interrupt {
                 interrupt_request(listener, notif);
@@ -598,6 +750,140 @@ fn answer(listener: &OwnedFd, gate: &Mutex<Gate>, notif: &libc::seccomp_notif, i
     // Fails with ENOENT if the request was cancelled meanwhile; then there
     // is nobody to answer.
     let _ = sys::notif_send_error(listener.as_fd(), notif.id, errno);
+}
+
+/// Only the owned worker can reach this handler. Its PID stays unreaped
+/// until the supervisor exits, including on cancellation and drop.
+fn answer_metadata(
+    listener: &OwnedFd,
+    authority: &Mutex<Authority>,
+    notif: &libc::seccomp_notif,
+    pid: i32,
+    interrupt: bool,
+) {
+    let authority = lock(authority);
+    let origin = crate::Origin {
+        op: crate::AuditOp::Metadata,
+        notified: Some(crate::Notified {
+            syscall: "newfstatat",
+            notification: notif.id,
+        }),
+    };
+    let mut reason = crate::AuditReason::Ok;
+    let mut audited = false;
+    let mut requested = None;
+    let result = (|| -> io::Result<()> {
+        if !sys::notif_id_valid(listener.as_fd(), notif.id) {
+            return Ok(());
+        }
+        let args = notif.data.args;
+        let flags = args[3] as u32;
+        if flags & !(libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT) as u32
+            != 0
+        {
+            reason = crate::AuditReason::UnsupportedInput;
+            return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+        }
+        let memory = File::open(format!("/proc/{pid}/mem")).inspect_err(|_| {
+            reason = crate::AuditReason::InvalidMemory;
+        })?;
+        let path = read_path(&memory, args[1]).map_err(|fault| {
+            reason = crate::AuditReason::InvalidMemory;
+            io::Error::from(fault.errno())
+        })?;
+        let copy = |file: &File| {
+            if interrupt {
+                interrupt_request(listener, notif);
+            }
+            if !sys::notif_id_valid(listener.as_fd(), notif.id) {
+                return Ok(());
+            }
+            sys::write_metadata(pid, file.as_fd(), args[2])
+        };
+        if path.is_empty() {
+            let fd = args[0] as i32;
+            if fd < 0 || flags & libc::AT_EMPTY_PATH as u32 == 0 {
+                reason = crate::AuditReason::UnsupportedInput;
+                return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+            }
+            let file = rustix::fs::open(
+                format!("/proc/{pid}/fd/{fd}"),
+                OFlags::PATH | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|error| {
+                if error == rustix::io::Errno::NOENT {
+                    io::Error::from_raw_os_error(libc::EBADF)
+                } else {
+                    error.into()
+                }
+            })?;
+            return copy(&File::from(file));
+        }
+        let nofollow = flags & libc::AT_SYMLINK_NOFOLLOW as u32 != 0;
+        let request = OpenRequest {
+            notification: notif.id,
+            call: OpenCall::Open {
+                flags: if nofollow { OFlags::NOFOLLOW.bits() } else { 0 },
+            },
+            path: Ok(path),
+        };
+        let path = super::validate(&request).map_err(|refusal| {
+            reason = refusal.reason;
+            requested = refusal.path.map(PathBuf::from);
+            io::Error::from(refusal.errno)
+        })?;
+        let path = Path::new(&path);
+        if let Some(file) = authority.runtime.open_path(path, nofollow, false) {
+            let result = file.and_then(|file| copy(&file));
+            authority.data.emit(
+                crate::Origin {
+                    op: crate::AuditOp::RuntimeMetadata,
+                    ..origin
+                },
+                Some(path),
+                None,
+                crate::AuditDecision::Allow,
+                crate::AuditReason::Ok,
+                result.as_ref().err().and_then(io::Error::raw_os_error),
+            );
+            audited = true;
+            return result;
+        }
+        audited = true;
+        authority
+            .data
+            .gated(origin, path, Rights::READ, |entry, rel| {
+                let file = super::open_regular_beneath(&entry.dir, rel)?;
+                copy(&file)
+            })
+            .map_err(super::runtime::gate_error)
+    })();
+    if sys::notif_id_valid(listener.as_fd(), notif.id) {
+        if !audited {
+            let allowed = reason == crate::AuditReason::Ok;
+            authority.data.emit(
+                origin,
+                requested.as_deref(),
+                None,
+                if allowed {
+                    crate::AuditDecision::Allow
+                } else {
+                    crate::AuditDecision::Deny
+                },
+                reason,
+                if allowed {
+                    result.as_ref().err().and_then(io::Error::raw_os_error)
+                } else {
+                    None
+                },
+            );
+        }
+        let errno = result
+            .err()
+            .map_or(0, |error| error.raw_os_error().unwrap_or(libc::EIO));
+        let _ = sys::notif_send_error(listener.as_fd(), notif.id, errno);
+    }
 }
 
 /// The `InterruptFirstRequest` fault: signals the worker and waits, without
@@ -772,7 +1058,7 @@ mod tests {
 
     /// `spawn` with a fault, standard input closed, then `wait`.
     fn run(executable: &Path, args: &[OsString], gate: Gate, fault: Fault) -> io::Result<Outcome> {
-        let mut running = spawn(executable, args, gate, fault)?;
+        let mut running = spawn(executable, args, &[], gate, fault)?;
         drop(running.take_stdin());
         running.wait()
     }
@@ -832,6 +1118,85 @@ mod tests {
             fs::read(&fixture.worker).unwrap(),
             b"#!/bin/sh\necho swapped\n"
         );
+    }
+
+    #[test]
+    fn a_replaced_interpreter_is_refused_by_its_held_landlock_rule() {
+        let fixture = Fixture::new();
+        let interpreter = crate::intercept_image::inspect(&File::open("/bin/true").unwrap())
+            .unwrap()
+            .interpreter
+            .unwrap();
+        let loader = fixture.root.path().join("loader");
+        fs::copy(&interpreter, &loader).unwrap();
+        let dynamic = fixture.root.path().join("dynamic");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/worker.c");
+        assert!(
+            Command::new("cc")
+                .args(["-pthread", "-O2", "-o"])
+                .arg(&dynamic)
+                .arg(format!("-Wl,--dynamic-linker={}", loader.display()))
+                .arg(source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let replacement = fixture.root.path().join("replacement");
+        fs::copy(&fixture.worker, &replacement).unwrap();
+        let error = match spawn(
+            &dynamic,
+            &fixture.read_args(),
+            std::slice::from_ref(&loader),
+            fixture.gate(),
+            Fault::ReplaceLoader {
+                path: loader.clone(),
+                with: replacement,
+            },
+        ) {
+            Ok(_) => panic!("the replaced interpreter must not execute"),
+            Err(error) => error,
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        assert_eq!(fs::read(fixture.granted.join("a.txt")).unwrap(), b"inside");
+    }
+
+    #[test]
+    fn cancelled_metadata_does_not_copy_a_result() {
+        let fixture = Fixture::new();
+        let worker = fixture.root.path().join("metadata-worker");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dynamic-worker.c");
+        assert!(
+            Command::new("cc")
+                .args(["-static", "-O2", "-Wall", "-Werror", "-o"])
+                .arg(&worker)
+                .arg(source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let runtime = fixture.root.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        let args = [
+            OsString::from("metadata-cancel"),
+            fixture.granted.join("a.txt").into(),
+        ];
+        let outcome = spawn(
+            &worker,
+            &args,
+            &[runtime],
+            fixture.gate(),
+            Fault::InterruptFirstMetadata,
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+        assert!(
+            outcome.status.success(),
+            "{:?}: {:?}",
+            outcome.status,
+            outcome.stderr
+        );
+        assert_eq!(outcome.stdout, b"ok\n");
     }
 
     #[test]
