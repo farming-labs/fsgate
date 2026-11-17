@@ -148,8 +148,9 @@ Each step closes a specific hole:
   cannot help, because the terminal was opened before the sandbox.
 - **Step 2.** After `setsid`, Ctrl-C reaches only the broker. Without this
   a killed broker would leave its worker running. It binds only a worker
-  that keeps it: the worker can clear its own death signal, and a program
-  the worker starts never has one. [RFC 0010](0010-worker-process-group.md)
+  that keeps it: the signal belongs to a thread, so the worker can clear
+  it there or exec from a new thread, which starts without one. A forked
+  child has none either. [RFC 0010](0010-worker-process-group.md)
   kills the worker's process group when the worker exits or the broker
   gets `SIGINT`, `SIGTERM`, `SIGHUP`, or `SIGQUIT`, which covers those
   programs unless the broker gets `SIGKILL` or another signal it does not
@@ -228,8 +229,9 @@ command line keeps working with one added flag. The library and
   act for their caller, such as systemd's user manager on the session
   bus. [RFC 0009](0009-worker-unix-sockets.md) refuses the worker new
   Unix sockets there instead.
-- After `SIGKILL` to the broker, a worker that cleared its death signal,
-  and programs it started, which never had one. Otherwise RFC 0010 ends
+- After `SIGKILL` to the broker, a worker that dropped its death signal
+  by clearing it or execing from a new thread, and programs it started,
+  which never had one. Otherwise RFC 0010 ends
   them, except a program that left the worker's process group with
   `setsid` or `setpgid`.
 - With `--terminal`, the worker's use of the terminal it inherited. It
@@ -269,7 +271,12 @@ the denial and the absence of the side effect:
   terminal. With `--terminal` it reads the line. In an unconfined control
   the worker shares the broker's background group, so its read stops the
   group with `SIGTTIN`.
-- Killing the broker kills the worker.
+- Killing the broker kills a worker that keeps its death signal.
+  `a_confined_worker_that_drops_its_death_signal_outlives_its_broker`
+  also runs a worker that clears the signal before exec, and one that
+  execs from a new thread without setting it. Both survive the broker
+  but still fail to read outside their allowed paths. The control sets
+  the signal and keeps it across exec, then ends with the broker.
 - `--direct` allows a read beneath its path. A `w` or `c` letter is a
   usage error, as is `--socket` without `--unconfined`.
 - With `--direct /proc:r`, a worker cannot read its broker's
