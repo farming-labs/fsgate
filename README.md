@@ -23,6 +23,8 @@ cargo add fsgate             # the library
 cargo install fsgate         # the fsgate-broker binary
 ```
 
+To try a complete worker, follow the [broker quickstart](docs/quickstart.md): build the example, read and write granted files, list a directory, and see a refused operation.
+
 ## How it enforces
 
 Two layers:

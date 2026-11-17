@@ -38,6 +38,8 @@ Acceptance met: `tests/lock.rs` re-executes the test binary as a locked child an
 
 Acceptance met: `tests/broker.rs` covers socketpair and real-binary transports, typed denials crossing the wire with no side effects, and the kill test — after `fsgate-broker` dies, every client operation returns `GateError::Broker`. Verified on macOS and Linux (CI).
 
+- [ ] Ship a [runnable broker quickstart](docs/quickstart.md) with a worker that reads, writes, and lists through `BrokerGate`. Acceptance: the documented release build runs those operations and demonstrates refused reads and writes without side effects; the example is included in the packaged crate. Implemented locally: the macOS release binaries and binaries built from the unpacked crate each pass 19 workflow scenarios, the documented macOS commands run verbatim, and the host suite passes all 137 tests. The example compiles for Linux x86_64; Linux execution and merge evidence are pending.
+
 ## M4 — revocation and audit
 
 - [x] `revoke(grant)` takes effect for subsequent operations and is covered by tests (landed early, in M1)
