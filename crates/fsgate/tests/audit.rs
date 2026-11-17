@@ -250,6 +250,26 @@ fn an_escape_is_audited_with_its_errno() {
 
 #[test]
 fn lifecycle_events_cover_grant_revoke_and_lock() {
+    // Keep the pre-lock scan apart from other tests changing descriptors.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("FSGATE_ISOLATED_AUDIT").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "lifecycle_events_cover_grant_revoke_and_lock",
+                "--nocapture",
+            ])
+            .env("FSGATE_ISOLATED_AUDIT", "1")
+            .output()
+            .expect("run the isolated audit test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     let (_root, granted, _) = setup();
     let sink = Arc::new(Capture::default());
     let mut gate = Gate::new();

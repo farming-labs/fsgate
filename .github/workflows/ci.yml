@@ -28,6 +28,35 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
       - run: cargo test --locked
+      - name: Prove the io_uring pre-lock regression
+        shell: bash
+        run: |
+          guard_source=crates/fsgate/src/containment.rs
+          guard_backup=$(mktemp)
+          cp "$guard_source" "$guard_backup"
+          restore() {
+            cp "$guard_backup" "$guard_source"
+            rm "$guard_backup"
+          }
+          trap restore EXIT
+          python3 - "$guard_source" <<'PY'
+          import pathlib
+          import sys
+          path = pathlib.Path(sys.argv[1])
+          source = path.read_text()
+          guard = "        crate::uring_guard::check()?;\n"
+          assert source.count(guard) == 1, "expected exactly one io_uring guard"
+          path.write_text(source.replace(guard, ""))
+          PY
+          if output=$(cargo test --locked -p fsgate --test lock -- --exact \
+              kernel::visible_io_uring_resources_are_refused_before_locking --nocapture 2>&1); then
+            printf '%s\n' "$output"
+            echo "::error::the ring regression passed with its guard removed"
+            exit 1
+          fi
+          printf '%s\n' "$output"
+          grep --quiet 'a visible ring must prevent locking: FullyEnforced' <<<"$output"
+          grep --quiet '^test result: FAILED\. 0 passed; 1 failed;' <<<"$output"
       # Ignored elsewhere: it needs util-linux `unshare` and passwordless
       # `sudo`, which the runner has. The count fails a filter that matches
       # nothing.

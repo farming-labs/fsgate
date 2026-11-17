@@ -578,6 +578,8 @@ fn error_response(err: GateError) -> Response {
         | GateError::Locked
         | GateError::LockUnsupported { .. }
         | GateError::LockFailed { .. }
+        | GateError::IoUringPresent { .. }
+        | GateError::IoUringInspection { .. }
         | GateError::Broker { .. } => {
             wire.kind = "broker".into();
         }

@@ -111,6 +111,8 @@ pub enum AuditReason {
     Locked,
     /// Kernel containment was unavailable or failed to apply.
     Unsupported,
+    /// A pre-lock io_uring resource was found or inspection failed.
+    IoUring,
     /// The revoked or narrowed grant did not exist.
     UnknownGrant,
     /// A `grant` or `narrow` would leave a grant with fewer rights than
@@ -156,6 +158,7 @@ impl AuditReason {
             AuditReason::NotAbsolute => "not_absolute",
             AuditReason::Locked => "locked",
             AuditReason::Unsupported => "unsupported",
+            AuditReason::IoUring => "io_uring",
             AuditReason::UnknownGrant => "unknown_grant",
             AuditReason::NestedGrant => "nested_grant",
             AuditReason::UnsupportedInput => "unsupported_input",
