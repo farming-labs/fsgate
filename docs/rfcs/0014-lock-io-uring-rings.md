@@ -1,6 +1,6 @@
 # RFC 0014: `io_uring` rings set up before `lock()`
 
-- Status: accepted; implementation under verification
+- Status: accepted; implemented and tested; not independently reviewed or released
 - Date: 2026-11-17
 - Roadmap: [M10](../../ROADMAP.md#m10--battle-tested-tests)
 - Builds on: [RFC 0006](0006-lock-restrictions.md) (restrictions at `lock()`), [ADR 0002](../decisions/0002-landlock-not-seccomp-for-paths.md) (seccomp's job), [RFC 0009](0009-worker-unix-sockets.md) (the worker's seccomp filter), the [threat model](../threat-model.md#2-the-locked-process-linux)
@@ -29,16 +29,17 @@ trust. `fsgate-broker`'s confined worker is not: the broker confines it
 before `exec`, so it has no ring from before, and below Linux 7.1 its
 seccomp filter refuses `io_uring` anyway (RFC 0009).
 
-Today fsgate only documents this, in the README's limits, the
-`Gate::lock` rustdoc, and the threat model (#119).
+Before this change, fsgate documented the risk in the README's limits,
+the `Gate::lock` rustdoc, and the threat model (#119).
 
-From the kernel source, not run:
+A ring set up after the lock uses the locked credentials, including its
+registered personalities. The tests below verify that ordinary and
+`SQPOLL` rings created after locking cannot open outside the grants.
 
-- A ring set up after the lock is not a route. Its saved credentials
-  and its personalities are the locked ones.
-- `io-wq` is not a route. Work handed to `io-wq` takes the submitter's
-  credentials at that moment (`io_prep_async_work`), so a worker thread
-  started before the lock does not carry its own to new submissions.
+From the kernel source, not separately tested: work handed to `io-wq`
+takes the submitter's credentials at that moment (`io_prep_async_work`),
+so a worker thread started before the lock does not carry its own
+credentials to new submissions.
 
 ## Goals
 
@@ -47,7 +48,8 @@ From the kernel source, not run:
   credentials.
 - It fails closed, before applying anything, with an error that names
   the ring and the fix.
-- A process with no ring and readable procfs keeps working.
+- A process with no detectable ring, readable procfs, and stable threads
+  and descriptors keeps working, subject to the name-prefix limit below.
 - A caller that needs its ring after the lock keeps it by an explicit
   choice.
 
@@ -174,23 +176,24 @@ this decision does not authorize a release.
 
 ## Testing
 
-These are acceptance tests; kernel execution of the implementation is
-pending. Test helpers extend #119's isolated unsafe module and its written
-safety contract; the runtime guard uses only safe Rust.
+Test helpers extend #119's isolated unsafe module and its written safety
+contract; the runtime guard uses only safe Rust. Kernel tests in
+`tests/lock.rs` cover:
 
-
-Kernel tests in `tests/lock.rs`, extending #119's:
-
-- A ring with a personality, an `SQPOLL` ring, and an `SQPOLL` ring
-  whose descriptor was registered and closed: each makes `lock()` fail
-  with the new error, and a raw read outside the grants still succeeds,
-  so nothing was applied.
-- The control: the same with `allow_existing_io_uring(true)` keeps today's behavior,
-  and both routes open the file.
-- A ring set up after the lock: `lock()` succeeds and the ring's open
-  fails with `EACCES`.
-- With C: `io_uring_setup` after the lock fails with `ENOSYS`, and the
-  registered ring cannot submit.
+- Ordinary rings, registered personalities, `SQPOLL` rings, and a
+  registered `SQPOLL` ring whose descriptor was closed: both policies
+  refuse before containment, leave the gate grantable, and emit one
+  denied audit event. An outside read still succeeds after refusal.
+  Closing ordinary or personality rings permits a successful retry.
+- The explicit opt-out: `allow_existing_io_uring(true)` preserves the
+  measured personality and `SQPOLL` bypasses, while a raw outside read
+  is denied by the locked credentials.
+- New ordinary and `SQPOLL` rings after locking: with and without a
+  registered personality, they read inside the grants and receive
+  `EACCES` outside them.
+- Procfs made unreadable by an outer gate: both policies return an
+  inspection error without partial containment. The gate remains
+  grantable; the explicit opt-out permits retry.
 
 ## Acceptance and verification
 
@@ -211,6 +214,23 @@ Kernel tests in `tests/lock.rs`, extending #119's:
 - Update the README, threat model, audit contract, changelog, and roadmap
   with the implementation. No independent-review claim.
 
-The original #119 evidence measures the bypass, not this detector.
-Detection, inspection failure, and post-lock ring behavior remain untested
-until the new implementation's kernel tests run.
+[CI on `da5cff2`](https://github.com/farming-labs/fsgate/actions/runs/44157981690)
+passed all 20 jobs. Each of the three new parent tests passed nine times:
+the default, experimental-feature, and unpacked-crate runs in `check`;
+both runs under Rust 1.85.0 in `msrv`; `arm64`; and the packaged release
+build on Linux 6.6.162, 6.12.117, and 7.3.3. Every refusal run exercised all
+four ring modes. The existing opt-out control passed in the same matrix.
+
+In `check`, removing the guard made the focused refusal regression fail
+with `a visible ring must prevent locking: FullyEnforced`. The source was
+restored before the later passing feature and packaged-crate runs. The
+four jobs in the [fuzz run](https://github.com/farming-labs/fsgate/actions/runs/44157981500)
+also passed; they are not evidence of detector coverage.
+
+Locally on macOS, `cargo fmt --all --check`, host and Linux cross-target
+Clippy with warnings denied, and Linux rustdoc with warnings denied passed.
+`cargo test --locked --target-dir /private/tmp/fsgate-deathsig-verify`
+passed 137 tests. Linux behavior was executed in CI, not on this host.
+Hidden-ring cases and deliberately misleading procfs mounts remain limits,
+not verified containment claims. No independent security review or release
+has occurred for this change.
