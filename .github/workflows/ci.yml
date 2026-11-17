@@ -28,6 +28,19 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
       - run: cargo test --locked
+      # Ignored elsewhere: it needs util-linux `unshare` and passwordless
+      # `sudo`, which the runner has. The count fails a filter that matches
+      # nothing.
+      - name: Test a broker in a user namespace without a uid map
+        shell: bash
+        run: |
+          if ! output=$(cargo test --locked -p fsgate --test broker_serve -- --ignored \
+              --exact a_broker_in_a_user_namespace_without_a_uid_map_admits_any_user 2>&1); then
+            printf '%s\n' "$output"
+            exit 1
+          fi
+          printf '%s\n' "$output"
+          grep --quiet '^test result: ok\. 1 passed' <<<"$output"
       # The experimental interception code (RFC 0004) builds only with its
       # feature; its tests need a C compiler and static libc.
       - run: cargo clippy -p fsgate --all-targets --features experimental-intercept -- -D warnings

@@ -777,3 +777,137 @@ fn no_threads_scenario() {
         .exec();
     panic!("exec failed: {err}");
 }
+
+/// Linux reports a peer whose uid has no mapping in the reader's user
+/// namespace as the overflow uid, 65534 by default (`user_namespaces(7)`).
+/// A broker in a user namespace with no uid map runs as that uid too, so
+/// `ServeOptions::default()`, which admits the broker's own user, admits a
+/// peer of any other user. `unmapped_broker_scenario` serves under
+/// `unshare --user`, and a peer running as `nobody` connects and is
+/// admitted. In the control the test serves in its own namespace, where
+/// the same peer is refused.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs util-linux `unshare` and passwordless `sudo`; CI's check job runs it"]
+fn a_broker_in_a_user_namespace_without_a_uid_map_admits_any_user() {
+    let _serial = serial();
+    let (root, granted, _) = setup();
+    // `nobody` must reach the socket and run the peer.
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let peer = root.path().join("peer");
+    fs::copy(std::env::current_exe().unwrap(), &peer).unwrap();
+    fs::set_permissions(&peer, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let control = root.path().join("control.sock");
+    let (gate, events) = audited_gate(&granted, Rights::READ);
+    serving(gate, &control, ServeOptions::default());
+    fs::set_permissions(&control, fs::Permissions::from_mode(0o777)).unwrap();
+    let before = events.seen().len();
+    run_as_nobody(&peer, &control);
+    events.wait_for(before + 1);
+    let (op, decision, reason, uid) = events.seen()[before];
+    assert_eq!(
+        (op, decision, reason),
+        connect(AuditReason::PeerRefused),
+        "the control admitted `nobody`"
+    );
+    let nobody = uid.expect("the kernel reported no uid");
+    assert_ne!(nobody, own_uid(), "the peer ran as the test's own user");
+
+    let socket = root.path().join("unmapped.sock");
+    let mut broker = Command::new("unshare")
+        .args(["--user", "--"])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", "unmapped_broker_scenario", "--nocapture"])
+        .env("FSGATE_UNMAPPED_SOCKET", &socket)
+        .env("FSGATE_UNMAPPED_GRANTED", &granted)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("run `unshare`");
+    let mut lines = BufReader::new(broker.stdout.take().unwrap()).lines();
+    let mut shown = String::new();
+    loop {
+        let line = lines
+            .next()
+            .unwrap_or_else(|| panic!("the broker exited before it was ready: {shown}"))
+            .unwrap();
+        shown.push_str(&line);
+        shown.push('\n');
+        if line == "ready" {
+            break;
+        }
+    }
+    run_as_nobody(&peer, &socket);
+    for line in lines {
+        shown.push_str(&line.unwrap());
+        shown.push('\n');
+    }
+    let status = broker.wait().unwrap();
+    assert!(
+        status.success() && shown.contains("1 passed"),
+        "{status}\n{shown}"
+    );
+}
+
+/// Runs `unmapped_peer_scenario` from `peer` as `nobody`, against `socket`.
+#[cfg(target_os = "linux")]
+fn run_as_nobody(peer: &Path, socket: &Path) {
+    // `sudo` resets the environment, so `env` sets the socket inside it.
+    let output = Command::new("sudo")
+        .args(["--non-interactive", "--user", "nobody", "env"])
+        .arg(format!("FSGATE_UNMAPPED_PEER={}", socket.display()))
+        .arg(peer)
+        .args(["--exact", "unmapped_peer_scenario", "--nocapture"])
+        .output()
+        .expect("run `sudo`");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "the peer failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Serves under `unshare --user`, where no uid maps, and checks that the
+/// first connection, from `nobody`, is admitted with the overflow uid.
+#[cfg(target_os = "linux")]
+#[test]
+fn unmapped_broker_scenario() {
+    let Some(socket) = std::env::var_os("FSGATE_UNMAPPED_SOCKET") else {
+        return;
+    };
+    let granted = std::env::var_os("FSGATE_UNMAPPED_GRANTED").unwrap();
+    let overflow: u32 = fs::read_to_string("/proc/sys/kernel/overflowuid")
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(own_uid(), overflow, "the broker's own uid maps");
+
+    let (gate, events) = audited_gate(Path::new(&granted), Rights::READ);
+    serving(gate, Path::new(&socket), ServeOptions::default());
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o777)).unwrap();
+    let before = events.seen().len();
+    println!("ready");
+    std::io::stdout().flush().unwrap();
+    events.wait_for(before + 1);
+    assert_eq!(
+        events.seen()[before],
+        with_uid(connect(AuditReason::Ok), Some(overflow)),
+        "`nobody` was not admitted"
+    );
+}
+
+/// Connects to the socket in `FSGATE_UNMAPPED_PEER` and hangs up. The
+/// broker's audit event says whether it admitted the connection.
+#[cfg(target_os = "linux")]
+#[test]
+fn unmapped_peer_scenario() {
+    let Some(socket) = std::env::var_os("FSGATE_UNMAPPED_PEER") else {
+        return;
+    };
+    let mut stream = UnixStream::connect(socket).unwrap();
+    // A refused peer may already be hung up on.
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = stream.read_to_end(&mut Vec::new());
+}
