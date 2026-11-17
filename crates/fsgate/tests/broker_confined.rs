@@ -61,7 +61,8 @@ fn assert_ran(output: &Output) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success() && stdout.contains("1 passed"),
-        "the worker did not pass: {stdout}\n{}",
+        "the worker did not pass ({}): {stdout}\n{}",
+        output.status,
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -656,16 +657,22 @@ mod kernel {
         use rustix::fs::{Mode, OFlags};
         use rustix::process::{WaitId, WaitIdOptions};
         use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+        use std::mem::ManuallyDrop;
         use std::os::unix::process::CommandExt;
 
         if !in_child("kernel::shell_scenario") {
             return;
         }
-        let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)
-            .expect("open a pseudo-terminal");
-        grantpt(&master).unwrap();
-        unlockpt(&master).unwrap();
-        let name = ptsname(&master, Vec::new()).unwrap();
+        // Never closed here. Closing the master hangs up the terminal, and the
+        // kernel then sends `SIGHUP` to its session's leader, this process,
+        // which would die before the harness reports. Exiting closes it.
+        let master = ManuallyDrop::new(
+            openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)
+                .expect("open a pseudo-terminal"),
+        );
+        grantpt(&*master).unwrap();
+        unlockpt(&*master).unwrap();
+        let name = ptsname(&*master, Vec::new()).unwrap();
         rustix::process::setsid().unwrap();
         let terminal = rustix::fs::open(
             name.as_c_str(),
@@ -680,7 +687,7 @@ mod kernel {
             rustix::process::getpgrp()
         );
         assert_eq!(
-            rustix::io::write(&master, TYPED.as_bytes()).unwrap(),
+            rustix::io::write(&*master, TYPED.as_bytes()).unwrap(),
             TYPED.len()
         );
 
