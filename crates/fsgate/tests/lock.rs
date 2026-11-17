@@ -1304,6 +1304,266 @@ mod kernel {
         assert_eq!(content, "secret");
     }
 
+    /// Landlock checks the credentials a file is opened with. `io_uring`
+    /// opens a file with the submitter's credentials, unless the request
+    /// names a personality, a set of credentials registered earlier, or
+    /// the ring has an `SQPOLL` thread, which submits with the credentials
+    /// of whoever set the ring up. A personality or `SQPOLL` ring from
+    /// before the lock therefore opens files outside the grants after it.
+    /// An open submitted with the locked process's own credentials is
+    /// refused.
+    #[test]
+    fn an_io_uring_ring_set_up_before_the_lock_keeps_its_credentials() {
+        let (_root, granted, outside) = dirs();
+        run_locked("io_uring_child", &granted, &outside);
+    }
+
+    #[test]
+    fn io_uring_child() {
+        if child_mode("io_uring_child").is_none() {
+            return;
+        }
+        let ring = match raw_uring::Ring::new(false) {
+            Ok(ring) => ring,
+            // `kernel.io_uring_disabled` refuses every ring, so there is no
+            // ring to keep.
+            Err(Errno::PERM) => {
+                eprintln!("io_uring_child: io_uring is disabled here");
+                return;
+            }
+            Err(err) => panic!("io_uring_setup: {err}"),
+        };
+        let personality = ring.register_personality().expect("a personality");
+        let polled = raw_uring::Ring::new(true).expect("an SQPOLL ring");
+
+        let mut gate = granted_gate();
+        let (_, secret) = lock_and_prove(&mut gate);
+        let secret = std::ffi::CString::new(secret).unwrap();
+
+        assert_eq!(
+            ring.open(&secret, None).map(drop),
+            Err(Errno::ACCESS),
+            "an open with the locked process's own credentials"
+        );
+        let through = [
+            ("the personality", ring.open(&secret, Some(personality))),
+            ("the SQPOLL thread", polled.open(&secret, None)),
+        ];
+        for (route, opened) in through {
+            let opened = opened.unwrap_or_else(|err| panic!("open through {route}: {err}"));
+            let mut content = String::new();
+            fs::File::from(opened).read_to_string(&mut content).unwrap();
+            assert_eq!(content, "secret", "read through {route}");
+        }
+        eprintln!("io_uring_child: opened the secret through both routes");
+    }
+
+    /// A one-entry `io_uring` ring that opens files, which neither std nor
+    /// `rustix` wraps safely.
+    ///
+    /// Safety contract:
+    /// - Each mapping is a new shared mapping of the ring at the offset and
+    ///   length the kernel reported in `io_uring_params`, and lives as long
+    ///   as the `Ring`. Every pointer into it is checked to lie inside it.
+    /// - Only this thread writes the submission tail and the completion
+    ///   head. Each is stored with release ordering after the entry it
+    ///   publishes or consumes, and the kernel's completion tail is loaded
+    ///   with acquire ordering, as the `io_uring` ABI requires.
+    /// - A submission names a path that outlives the `io_uring_enter` call
+    ///   that waits for its completion, so the kernel never reads it after
+    ///   it is freed.
+    /// - A descriptor is taken from a completion only when the kernel
+    ///   returned one, and only once.
+    #[allow(unsafe_code)]
+    mod raw_uring {
+        use std::ffi::{CStr, c_void};
+        use std::mem::size_of;
+        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::ptr;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        use rustix::fs::OFlags;
+        use rustix::io::Errno;
+        use rustix::io_uring::{
+            IORING_OFF_CQ_RING, IORING_OFF_SQ_RING, IORING_OFF_SQES, IoringEnterFlags, IoringOp,
+            IoringRegisterOp, IoringSetupFlags, addr_or_splice_off_in_union, io_uring_cqe,
+            io_uring_enter, io_uring_params, io_uring_ptr, io_uring_register, io_uring_setup,
+            io_uring_sqe, op_flags_union,
+        };
+        use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
+
+        /// One shared mapping of a ring.
+        struct Map {
+            ptr: *mut c_void,
+            len: usize,
+        }
+
+        impl Map {
+            fn new(ring: &OwnedFd, offset: u64, len: usize) -> Result<Map, Errno> {
+                // SAFETY: a new mapping at an address the kernel picks, so no
+                // existing memory changes.
+                let ptr = unsafe {
+                    mmap(
+                        ptr::null_mut(),
+                        len,
+                        ProtFlags::READ | ProtFlags::WRITE,
+                        MapFlags::SHARED | MapFlags::POPULATE,
+                        ring,
+                        offset,
+                    )?
+                };
+                Ok(Map { ptr, len })
+            }
+
+            /// A pointer to a `T` at `offset` bytes into the mapping.
+            fn at<T>(&self, offset: usize) -> *mut T {
+                assert!(offset + size_of::<T>() <= self.len, "outside the mapping");
+                // SAFETY: inside the mapping, as checked above.
+                unsafe { self.ptr.byte_add(offset).cast() }
+            }
+
+            /// The ring's `u32` at `offset`, shared with the kernel.
+            fn atomic(&self, offset: u32) -> &AtomicU32 {
+                let field = self.at::<u32>(offset as usize);
+                assert!(field.is_aligned(), "a misaligned ring field");
+                // SAFETY: an aligned `u32` inside the mapping, which outlives
+                // the borrow of `self`, and which the kernel accesses
+                // atomically.
+                unsafe { AtomicU32::from_ptr(field) }
+            }
+        }
+
+        impl Drop for Map {
+            fn drop(&mut self) {
+                // SAFETY: unmaps only this mapping, and no pointer into it
+                // outlives the `Ring` that owns it.
+                let _ = unsafe { munmap(self.ptr, self.len) };
+            }
+        }
+
+        pub(super) struct Ring {
+            fd: OwnedFd,
+            params: io_uring_params,
+            sq: Map,
+            cq: Map,
+            sqes: Map,
+        }
+
+        impl Ring {
+            /// Sets up a ring, with an `SQPOLL` thread if `sqpoll`.
+            pub(super) fn new(sqpoll: bool) -> Result<Ring, Errno> {
+                let mut params = io_uring_params::default();
+                if sqpoll {
+                    params.flags = IoringSetupFlags::SQPOLL;
+                }
+                // SAFETY: `params` is initialized, and the kernel writes only
+                // into it.
+                let fd = unsafe { io_uring_setup(1, &mut params)? };
+                let sq_len =
+                    params.sq_off.array as usize + params.sq_entries as usize * size_of::<u32>();
+                let cq_len = params.cq_off.cqes as usize
+                    + params.cq_entries as usize * size_of::<io_uring_cqe>();
+                let sqes_len = params.sq_entries as usize * size_of::<io_uring_sqe>();
+                let sq = Map::new(&fd, IORING_OFF_SQ_RING, sq_len)?;
+                let cq = Map::new(&fd, IORING_OFF_CQ_RING, cq_len)?;
+                let sqes = Map::new(&fd, IORING_OFF_SQES, sqes_len)?;
+                Ok(Ring {
+                    fd,
+                    params,
+                    sq,
+                    cq,
+                    sqes,
+                })
+            }
+
+            /// Registers the calling thread's credentials as a personality.
+            pub(super) fn register_personality(&self) -> Result<u16, Errno> {
+                // SAFETY: this opcode takes no argument.
+                let id = unsafe {
+                    io_uring_register(
+                        &self.fd,
+                        IoringRegisterOp::RegisterPersonality,
+                        ptr::null(),
+                        0,
+                    )?
+                };
+                Ok(u16::try_from(id).expect("a personality ID fits in a u16"))
+            }
+
+            /// Opens `path` read-only through the ring, with `personality`'s
+            /// credentials if one is given, and waits for the result.
+            pub(super) fn open(
+                &self,
+                path: &CStr,
+                personality: Option<u16>,
+            ) -> Result<OwnedFd, Errno> {
+                let sq_off = &self.params.sq_off;
+                let cq_off = &self.params.cq_off;
+
+                let sqe = io_uring_sqe {
+                    opcode: IoringOp::Openat,
+                    fd: libc::AT_FDCWD,
+                    addr_or_splice_off_in: addr_or_splice_off_in_union {
+                        addr: io_uring_ptr::new(path.as_ptr().cast_mut().cast()),
+                    },
+                    op_flags: op_flags_union {
+                        open_flags: OFlags::RDONLY | OFlags::CLOEXEC,
+                    },
+                    personality: personality.unwrap_or(0),
+                    ..Default::default()
+                };
+
+                let tail = self.sq.atomic(sq_off.tail);
+                let position = tail.load(Ordering::Relaxed);
+                let slot = position & self.sq.atomic(sq_off.ring_mask).load(Ordering::Relaxed);
+                let entry = self
+                    .sqes
+                    .at::<io_uring_sqe>(slot as usize * size_of::<io_uring_sqe>());
+                let index = self
+                    .sq
+                    .at::<u32>(sq_off.array as usize + slot as usize * size_of::<u32>());
+                // SAFETY: both are inside their mappings, as `at` checked, and
+                // the kernel reads them only after the tail below publishes
+                // them.
+                unsafe {
+                    entry.write(sqe);
+                    index.write(slot);
+                }
+                tail.store(position.wrapping_add(1), Ordering::Release);
+
+                let mut flags = IoringEnterFlags::GETEVENTS;
+                if self.params.flags.contains(IoringSetupFlags::SQPOLL) {
+                    flags |= IoringEnterFlags::SQ_WAKEUP;
+                }
+                // SAFETY: the submission's path outlives this call, which
+                // returns only once its completion is posted.
+                unsafe { io_uring_enter(&self.fd, 1, 1, flags)? };
+
+                let head = self.cq.atomic(cq_off.head);
+                let seen = head.load(Ordering::Relaxed);
+                assert_ne!(
+                    seen,
+                    self.cq.atomic(cq_off.tail).load(Ordering::Acquire),
+                    "a completion is posted"
+                );
+                let slot = seen & self.cq.atomic(cq_off.ring_mask).load(Ordering::Relaxed);
+                let cqe = self.cq.at::<io_uring_cqe>(
+                    cq_off.cqes as usize + slot as usize * size_of::<io_uring_cqe>(),
+                );
+                // SAFETY: inside the mapping, as `at` checked, and the acquire
+                // load above makes the kernel's write visible.
+                let res = unsafe { ptr::addr_of!((*cqe).res).read() };
+                head.store(seen.wrapping_add(1), Ordering::Release);
+                match res {
+                    // SAFETY: the kernel returned a new descriptor, and nothing
+                    // else takes it.
+                    fd if fd >= 0 => Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
+                    errno => Err(Errno::from_raw_os_error(-errno)),
+                }
+            }
+        }
+    }
+
     /// Landlock has no rights for these call families.
     #[test]
     fn metadata_and_modes_outside_the_grants_are_not_restricted() {
@@ -1331,6 +1591,128 @@ mod kernel {
 
         assert_eq!(fs::metadata(&secret).unwrap().len(), b"secret".len() as u64);
         fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// Mounts beneath a grant, which the threat model lists among the gaps:
+    /// - A file system mounted beneath a grant after `grant()` is reached
+    ///   through the gate, which does not refuse crossing a mount point, and
+    ///   after `lock()` through the kernel rules, which follow a path up
+    ///   through the mount.
+    /// - A directory bind-mounted into a grant is reached with that grant's
+    ///   rights, even though it has its own grant with fewer. `grant` reads
+    ///   nesting up through `..`, which leads to where the directory really
+    ///   is (RFC 0012's limits). A real subdirectory granted with fewer
+    ///   rights is refused.
+    ///
+    /// Mounting needs root, so the child runs as root in a mount namespace
+    /// of its own, where its mounts end with it.
+    #[test]
+    #[ignore = "needs passwordless `sudo` and util-linux `unshare`; CI's check job runs it"]
+    fn mounts_beneath_a_grant_are_reached_through_it() {
+        let (_root, granted, outside) = dirs();
+        let apart = outside.join("apart");
+        for dir in [granted.join("mnt"), granted.join("bound"), apart.clone()] {
+            fs::create_dir(dir).unwrap();
+        }
+
+        // `sudo` resets the environment, so `env` sets it inside.
+        let output = Command::new("sudo")
+            .args(["--non-interactive", "env", "FSGATE_CHILD=mount_child"])
+            .arg("FSGATE_MODE=root")
+            .arg(format!("FSGATE_GRANTED={}", granted.display()))
+            .arg(format!("FSGATE_OUTSIDE={}", outside.display()))
+            .args(["unshare", "--mount", "--propagation", "private", "--"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "kernel::mount_child", "--nocapture"])
+            .output()
+            .expect("run `sudo`");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the child failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // The mounts ended with the child's namespace. What it wrote
+        // through the bind mount is in the directory itself.
+        assert_eq!(fs::read_dir(granted.join("mnt")).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(granted.join("bound")).unwrap().count(), 0);
+        assert!(apart.join("through_gate.txt").exists());
+        assert!(apart.join("through_kernel.txt").exists());
+        assert!(!apart.join("direct.txt").exists());
+    }
+
+    #[test]
+    fn mount_child() {
+        use std::os::unix::fs::MetadataExt;
+
+        if child_mode("mount_child").is_none() {
+            return;
+        }
+        let granted = PathBuf::from(std::env::var("FSGATE_GRANTED").unwrap());
+        let outside = PathBuf::from(std::env::var("FSGATE_OUTSIDE").unwrap());
+        let (mnt, bound, apart) = (
+            granted.join("mnt"),
+            granted.join("bound"),
+            outside.join("apart"),
+        );
+        let mount = |args: &[&std::ffi::OsStr]| {
+            let status = Command::new("mount")
+                .args(args)
+                .status()
+                .expect("run `mount`");
+            assert!(status.success(), "mount {args:?}: {status}");
+        };
+
+        let mut gate = Gate::new();
+        gate.grant(&granted, Rights::READ | Rights::WRITE | Rights::CREATE)
+            .unwrap();
+
+        // A file system mounted after the grant.
+        mount(&[
+            "-t".as_ref(),
+            "tmpfs".as_ref(),
+            "tmpfs".as_ref(),
+            mnt.as_os_str(),
+        ]);
+        fs::write(mnt.join("file.txt"), b"mounted").unwrap();
+        assert_ne!(
+            fs::metadata(&mnt).unwrap().dev(),
+            fs::metadata(&granted).unwrap().dev(),
+            "the mount is another file system"
+        );
+        let mut content = String::new();
+        gate.open(mnt.join("file.txt"))
+            .expect("open across the mount point")
+            .read_to_string(&mut content)
+            .unwrap();
+        assert_eq!(content, "mounted");
+
+        // A real subdirectory with fewer rights is refused, but a directory
+        // bind-mounted in is not, and the outer grant's rights reach it.
+        fs::create_dir(granted.join("sub")).unwrap();
+        let err = gate.grant(granted.join("sub"), Rights::READ).unwrap_err();
+        assert!(matches!(err, GateError::NestedGrant { .. }), "got {err:?}");
+        mount(&["--bind".as_ref(), apart.as_os_str(), bound.as_os_str()]);
+        gate.grant(&apart, Rights::READ)
+            .expect("the bind mount hides the nesting");
+        gate.create(bound.join("through_gate.txt"))
+            .expect("create through the outer grant");
+        let err = gate.create(apart.join("direct.txt")).unwrap_err();
+        assert!(
+            matches!(err, GateError::RightsExceeded { .. }),
+            "got {err:?}"
+        );
+
+        // The kernel rules after the lock: the same, by each path.
+        assert_eq!(gate.lock().expect("strict lock"), LockStatus::FullyEnforced);
+        let err = fs::read(outside.join("secret.txt")).expect_err("read outside the grants");
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        assert_eq!(fs::read_to_string(mnt.join("file.txt")).unwrap(), "mounted");
+        fs::write(bound.join("through_kernel.txt"), b"")
+            .expect("write through the outer grant's rule");
+        let err = fs::write(apart.join("direct.txt"), b"").expect_err("write by the real path");
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
     }
 
     /// The installed ruleset never changes, so only operations through the
