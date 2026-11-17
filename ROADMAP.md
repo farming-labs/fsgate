@@ -322,6 +322,8 @@ Started. Today each attack in the threat model has a test written for it, and on
 
     So `Broker::serve` now refuses to start when it would admit the overflow uid and `/proc/self/uid_map` leaves some uid unmapped, and names `ServeOptions::any_peer` ([RFC 0007](docs/rfcs/0007-broker-peers.md#changes-after-release)). The test, renamed `a_broker_that_cannot_tell_its_peers_apart_refuses_to_serve`, now checks that refusal with no uid map, that `any_peer` still serves there, and that a broker whose own uid maps, under `unshare --user --map-current-user`, serves and refuses `nobody`.
 
+    [#121](https://github.com/farming-labs/fsgate/pull/121) is still in validation. Its [first CI run](https://github.com/farming-labs/fsgate/actions/runs/44057200634) failed when Ubuntu denied writing the mapped case's uid map, and when the VM kernels lacked `/proc/self/uid_map`. The namespace step now temporarily permits those mappings under AppArmor and restores the policy on exit; the VM configuration enables `CONFIG_USER_NS`. The test also queues a create request before each startup refusal and checks that no connection was accepted and no file was created. A nonblocking listener makes a missing guard fail instead of hang. The procfs requirement is documented; a missing map still fails closed.
+
 Order: the model-based tests first, because they cover the most code on both platforms and need no new CI machinery. Then the kernel comparison, which reuses them, then mutation testing to find what all the tests miss, then fuzzing, kernels, and distributions.
 
 ## Out of scope for v1

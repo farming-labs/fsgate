@@ -229,10 +229,21 @@ open questions answered:
    uid and `/proc/self/uid_map` leaves some uid unmapped. The error says to
    run the broker as a uid that maps, or to pass `ServeOptions::any_peer`,
    which states that every peer is admitted. If either file cannot be
-   read, `serve` fails with that error, since it cannot tell. In the
-   initial user namespace every uid maps and nothing changes, and a broker
+   read, `serve` fails with that error, since it cannot tell. This requires
+   a mounted, readable procfs and `CONFIG_USER_NS=y`, even in the initial
+   namespace: a kernel built without user namespaces has no `uid_map`.
+   `serve_conn` and inherited connections do not need these reads.
+   In the initial user namespace every uid maps and the check admits the
+   same users when it can read the map, and a broker
    whose own uid maps still serves and refuses unmapped peers.
    `fsgate-broker --socket` was still covered by its owner-only directory,
    but it now refuses to serve there too, and exits 1.
    `a_broker_that_cannot_tell_its_peers_apart_refuses_to_serve` runs both
    namespaces in CI's `check` job.
+   Its refusal cases queue a create request and assert that no connection
+   was accepted, no audit event was emitted, and no file was created. A
+   nonblocking listener makes removing the guard fail with `WouldBlock`
+   instead of hanging. The CI step temporarily permits unprivileged user
+   namespace mappings under Ubuntu's AppArmor policy, restoring it on exit.
+   The VM kernel configuration enables user namespaces so the same broker
+   check runs there.

@@ -352,6 +352,12 @@ impl Broker {
     /// could not tell them apart; a broker in a user namespace with no uid
     /// map runs as it.
     ///
+    /// On Linux and Android, the check needs readable `/proc/self/uid_map`
+    /// (`CONFIG_USER_NS=y`) and, for a partial map, `/proc/sys/kernel/overflowuid`.
+    /// If a required file is missing or unreadable, serving fails with that
+    /// I/O error. [`ServeOptions::any_peer`] skips these reads and admits all
+    /// peers; [`Broker::serve_conn`] uses a connection the caller already chose.
+    ///
     /// Each accepted connection is one [`AuditOp::Connect`] event on the
     /// gate's sink: `allow`, on the connection's thread before its first
     /// request, or `deny` with the reason it was closed. Each carries the

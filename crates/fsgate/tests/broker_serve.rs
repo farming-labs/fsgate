@@ -898,23 +898,40 @@ fn unmapped_broker_scenario() {
         .unwrap();
     assert_eq!(own_uid() != overflow, mapped, "the broker's own uid");
 
-    let (gate, events) = audited_gate(Path::new(&granted), Rights::READ);
+    let (gate, events) = audited_gate(
+        Path::new(&granted),
+        Rights::READ | Rights::WRITE | Rights::CREATE,
+    );
     let listener = UnixListener::bind(&socket).unwrap();
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o777)).unwrap();
     let broker = Broker::new(gate);
     let options = if mapped {
         ServeOptions::default()
     } else {
+        // Without the guard, an empty nonblocking listener returns
+        // WouldBlock instead of hanging in accept after the request.
+        listener.set_nonblocking(true).unwrap();
+        let planted = Path::new(&granted).join("unmapped-peer.txt");
         for options in [
             ServeOptions::default(),
             ServeOptions::default().allow_peer_uids([overflow]),
         ] {
+            let before = events.seen();
+            let mut pending = UnixStream::connect(&socket).unwrap();
+            let body = create_request(&planted);
+            pending.write_all(&frame(body.len() as u32, &body)).unwrap();
+            pending.shutdown(std::net::Shutdown::Write).unwrap();
             let err = broker
                 .serve_with(&listener, options)
                 .expect_err("served peers it cannot tell apart");
             assert_eq!(err.kind(), ErrorKind::Unsupported, "{err}");
             assert!(err.to_string().contains("any_peer"), "no remedy in: {err}");
+            assert!(!planted.exists(), "the refused broker created a file");
+            assert_eq!(events.seen(), before, "the refused broker accepted a peer");
+            // The connection is still queued: serve refused before accept.
+            drop(listener.accept().unwrap());
         }
+        listener.set_nonblocking(false).unwrap();
         ServeOptions::default().any_peer()
     };
     let before = events.seen().len();

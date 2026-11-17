@@ -34,6 +34,14 @@ jobs:
       - name: Test brokers in user namespaces
         shell: bash
         run: |
+          # Ubuntu restricts uid-map writes inside unprivileged namespaces.
+          # Allow the test to construct both maps, then restore the policy.
+          policy=kernel.apparmor_restrict_unprivileged_userns
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            previous=$(sysctl -n "$policy")
+            trap 'sudo sysctl -w "$policy=$previous"' EXIT
+            sudo sysctl -w "$policy=0"
+          fi
           if ! output=$(cargo test --locked -p fsgate --test broker_serve -- --ignored \
               --exact a_broker_that_cannot_tell_its_peers_apart_refuses_to_serve 2>&1); then
             printf '%s\n' "$output"
