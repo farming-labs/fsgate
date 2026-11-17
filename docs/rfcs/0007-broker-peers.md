@@ -228,14 +228,17 @@ open questions answered:
    accepting anything when the uids it would admit include the overflow
    uid and `/proc/self/uid_map` leaves some uid unmapped. The error says to
    run the broker as a uid that maps, or to pass `ServeOptions::any_peer`,
-   which states that every peer is admitted. If either file cannot be
-   read, `serve` fails with that error, since it cannot tell. This requires
+   which states that every peer is admitted. The check reads
+   `/proc/self/uid_map` and, for a partial map, `/proc/sys/kernel/overflowuid`.
+   If a required file cannot be read, `serve` returns that I/O error,
+   preserving its kind. This requires
    a mounted, readable procfs and `CONFIG_USER_NS=y`, even in the initial
    namespace: a kernel built without user namespaces has no `uid_map`.
    `serve_conn` and inherited connections do not need these reads.
    In the initial user namespace every uid maps and the check admits the
    same users when it can read the map, and a broker
-   whose own uid maps still serves and refuses unmapped peers.
+   whose own uid is mapped and differs from the overflow uid still serves
+   and refuses unmapped peers.
    `fsgate-broker --socket` was still covered by its owner-only directory,
    but it now refuses to serve there too, and exits 1.
    `a_broker_that_cannot_tell_its_peers_apart_refuses_to_serve` runs both
