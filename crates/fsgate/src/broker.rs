@@ -160,17 +160,86 @@ impl ServeOptions {
 
     /// The uids to admit, or `None` to admit every peer.
     fn allowed_uids(&self) -> io::Result<Option<Vec<u32>>> {
-        match &self.peers {
-            Peers::Any => Ok(None),
-            _ if !CAN_READ_PEER_UID => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "fsgate cannot read a peer's identity on this platform; \
-                 pass `ServeOptions::any_peer` to serve without the check",
-            )),
-            Peers::BrokerUser => Ok(Some(vec![rustix::process::geteuid().as_raw()])),
-            Peers::Uids(uids) => Ok(Some(uids.clone())),
+        let uids = match &self.peers {
+            Peers::Any => return Ok(None),
+            _ if !CAN_READ_PEER_UID => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "fsgate cannot read a peer's identity on this platform; \
+                     pass `ServeOptions::any_peer` to serve without the check",
+                ));
+            }
+            Peers::BrokerUser => vec![rustix::process::geteuid().as_raw()],
+            Peers::Uids(uids) => uids.clone(),
+        };
+        refuse_lookalike_uids(&uids)?;
+        Ok(Some(uids))
+    }
+}
+
+/// Refuses to admit the overflow uid where some uids do not map. Linux
+/// reports a peer whose uid has no mapping in the reader's user namespace
+/// as the overflow uid, 65534 by default (`user_namespaces(7)`), so there
+/// admitting that uid admits every such user. A broker in a user namespace
+/// with no uid map runs as it, and so does `nobody` in many containers.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn refuse_lookalike_uids(uids: &[u32]) -> io::Result<()> {
+    let read = |path: &str| {
+        std::fs::read_to_string(path).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "reading `{path}` failed: {err}; fsgate reads it to check that the \
+                     broker can tell its peers apart, or pass `ServeOptions::any_peer` \
+                     to serve without the check"
+                ),
+            )
+        })
+    };
+    if maps_every_uid(&read("/proc/self/uid_map")?) {
+        return Ok(());
+    }
+    let overflow_file = "/proc/sys/kernel/overflowuid";
+    let overflow: u32 = read(overflow_file)?.trim().parse().map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("`{overflow_file}` is not a uid: {err}"),
+        )
+    })?;
+    if uids.contains(&overflow) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "fsgate cannot tell this broker's peers apart: it would admit uid {overflow}, \
+                 the overflow uid, which Linux reports for every user that does not map into \
+                 this user namespace; run the broker as a uid that maps, or pass \
+                 `ServeOptions::any_peer` to serve every peer that can reach the socket"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// No user namespaces here, so a reported uid is the peer's own.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn refuse_lookalike_uids(_uids: &[u32]) -> io::Result<()> {
+    Ok(())
+}
+
+/// Whether a `/proc/<pid>/uid_map` maps every uid, as the initial user
+/// namespace's `0 0 4294967295` does. Ranges cannot overlap, and a child
+/// namespace can map only what its parent maps, so only such a map leaves
+/// no uid reported as the overflow uid. Anything unreadable counts as not.
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+fn maps_every_uid(map: &str) -> bool {
+    let mut mapped: u64 = 0;
+    for line in map.lines() {
+        match line.split_whitespace().nth(2).map(str::parse::<u64>) {
+            Some(Ok(count)) => mapped += count,
+            _ => return false,
         }
     }
+    mapped >= u64::from(u32::MAX)
 }
 
 const CAN_READ_PEER_UID: bool = cfg!(any(
@@ -277,7 +346,17 @@ impl Broker {
     /// process is out of descriptors, new connections wait in the listen
     /// backlog. Returns only when the listener fails, or at once with
     /// [`io::ErrorKind::Unsupported`] if `options` needs a peer's identity
-    /// and this platform cannot provide it.
+    /// and this platform cannot provide it, or if it would admit the
+    /// overflow uid in a Linux user namespace where some uids do not map.
+    /// Linux reports every such user's peers as that uid, so the broker
+    /// could not tell them apart; a broker in a user namespace with no uid
+    /// map runs as it.
+    ///
+    /// On Linux and Android, the check needs readable `/proc/self/uid_map`
+    /// (`CONFIG_USER_NS=y`) and, for a partial map, `/proc/sys/kernel/overflowuid`.
+    /// If a required file is missing or unreadable, serving fails with that
+    /// I/O error. [`ServeOptions::any_peer`] skips these reads and admits all
+    /// peers; [`Broker::serve_conn`] uses a connection the caller already chose.
     ///
     /// Each accepted connection is one [`AuditOp::Connect`] event on the
     /// gate's sink: `allow`, on the connection's thread before its first
@@ -499,6 +578,8 @@ fn error_response(err: GateError) -> Response {
         | GateError::Locked
         | GateError::LockUnsupported { .. }
         | GateError::LockFailed { .. }
+        | GateError::IoUringPresent { .. }
+        | GateError::IoUringInspection { .. }
         | GateError::Broker { .. } => {
             wire.kind = "broker".into();
         }
@@ -876,5 +957,25 @@ fn read_frame(
             ));
         }
         acc.extend_from_slice(&buf[..received.bytes]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::maps_every_uid;
+
+    #[test]
+    fn only_a_map_of_every_uid_counts() {
+        assert!(maps_every_uid("         0          0 4294967295\n"));
+        assert!(maps_every_uid("0 0 1000\n1000 1000 4294966295\n"));
+        for partial in [
+            "",
+            "     65534       1000          1\n",
+            "0 1000 1\n1 100000 65536\n",
+            "0 0\n",
+            "0 0 many\n",
+        ] {
+            assert!(!maps_every_uid(partial), "{partial:?}");
+        }
     }
 }

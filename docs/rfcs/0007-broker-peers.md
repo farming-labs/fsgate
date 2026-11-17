@@ -217,3 +217,39 @@ open questions answered:
    already reads (`acl(5)`). Found in an internal review at `ea159a6`.
    `a_socket_path_whose_access_list_lets_others_change_it_is_refused`
    tests it on macOS.
+2. **Peers that look alike in a user namespace.** Linux reports a peer
+   whose uid has no mapping in the reader's user namespace as the overflow
+   uid, 65534 by default (`user_namespaces(7)`). A broker in a user
+   namespace with no uid map runs as that uid, and so does `nobody` in many
+   containers. There, the default check admitted every user who could
+   reach the socket, which
+   [#118](https://github.com/farming-labs/fsgate/pull/118) showed under
+   `unshare --user`. `serve` now fails with `ErrorKind::Unsupported` before
+   accepting anything when the uids it would admit include the overflow
+   uid and `/proc/self/uid_map` leaves some uid unmapped. The error says to
+   run the broker as a uid that maps, or to pass `ServeOptions::any_peer`,
+   which states that every peer is admitted. The check reads
+   `/proc/self/uid_map` and, for a partial map, `/proc/sys/kernel/overflowuid`.
+   If a required file cannot be read, `serve` returns that I/O error,
+   preserving its kind. This requires
+   a mounted, readable procfs and `CONFIG_USER_NS=y`, even in the initial
+   namespace: a kernel built without user namespaces has no `uid_map`.
+   `serve_conn` and inherited connections do not need these reads.
+   In the initial user namespace every uid maps and the check admits the
+   same users when it can read the map, and a broker
+   whose own uid is mapped and differs from the overflow uid still serves
+   and refuses unmapped peers.
+   `fsgate-broker --socket` was still covered by its owner-only directory,
+   but it now refuses to serve there too, and exits 1.
+   `a_broker_that_cannot_tell_its_peers_apart_refuses_to_serve` runs both
+   namespaces in CI's `check` job.
+   Its refusal cases queue a create request and assert that no connection
+   was accepted, no audit event was emitted, and no file was created. A
+   nonblocking listener makes removing the guard fail with `WouldBlock`
+   instead of hanging. The CI step temporarily permits unprivileged user
+   namespace mappings under Ubuntu's AppArmor policy, restoring it on exit.
+   It repeats the test with the peer-identity guard removed and requires
+   the `WouldBlock` versus `Unsupported` assertion to fail, then restores
+   the source before later checks. A build or setup failure does not count.
+   The VM kernel configuration enables user namespaces so the same broker
+   check runs there.

@@ -207,10 +207,12 @@ fn a_direct_path_must_be_absolute() {
 #[test]
 fn confinement_flags_need_a_confined_worker() {
     for flags in [
-        ["--unconfined", "--direct", "/usr:r"],
-        ["--unconfined", "--env", "PATH"],
-        ["--experimental-intercept", "--direct", "/usr:r"],
-        ["--experimental-intercept", "--env", "PATH"],
+        &["--unconfined", "--direct", "/usr:r"][..],
+        &["--unconfined", "--env", "PATH"],
+        &["--unconfined", "--terminal"],
+        &["--experimental-intercept", "--direct", "/usr:r"],
+        &["--experimental-intercept", "--env", "PATH"],
+        &["--experimental-intercept", "--terminal"],
     ] {
         let mut args = vec!["--grant", "/tmp:r"];
         args.extend(flags);
@@ -628,18 +630,22 @@ mod kernel {
         assert_eq!(leader, expect_denied());
     }
 
-    /// What leading its own session costs: the terminal a confined worker
-    /// inherits is not its controlling terminal, so job control never stops
-    /// it. `shell_scenario` plays the user's shell. It leads a session with a
-    /// pseudo-terminal and keeps the foreground, as a shell does while it
-    /// reads a command, with a line already typed and waiting. It runs the
-    /// broker as a background job whose worker reads standard input. The
-    /// confined worker reads the line. In the control, the unconfined worker
-    /// shares the broker's background group, so its read stops that group
-    /// with `SIGTTIN` and reads nothing.
+    /// A confined worker leads its own session, so the terminal it inherits
+    /// is not its controlling terminal and job control never stops its reads.
+    /// It gets the terminal for output only. `shell_scenario` plays the
+    /// user's shell: it leads a session with a pseudo-terminal and keeps the
+    /// foreground, as a shell does while it reads a command, with a line
+    /// already typed and waiting. It runs the broker as a background job with
+    /// the terminal on all three streams, opened for reading and writing as a
+    /// shell gives it. The confined worker finds standard input empty and
+    /// cannot read from standard output or error, which still print to the
+    /// terminal. With `--terminal` it reads the typed line, which is what it
+    /// could do before. In the unconfined control, the worker shares the
+    /// broker's background group, so its read stops that group with
+    /// `SIGTTIN` and reads nothing.
     #[test]
-    fn a_confined_worker_reads_the_terminal_while_the_shell_has_the_foreground() {
-        for mode in ["confined", "unconfined"] {
+    fn a_confined_worker_gets_its_terminal_for_output_only() {
+        for mode in ["output-only", "terminal", "unconfined"] {
             let output = Command::new(env::current_exe().unwrap())
                 .args(["--exact", "kernel::shell_scenario", "--nocapture"])
                 .env("FSGATE_CHILD", "kernel::shell_scenario")
@@ -655,6 +661,7 @@ mod kernel {
     #[test]
     fn shell_scenario() {
         use rustix::fs::{Mode, OFlags};
+        use rustix::io::Errno;
         use rustix::process::{WaitId, WaitIdOptions};
         use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
         use std::mem::ManuallyDrop;
@@ -691,17 +698,25 @@ mod kernel {
             TYPED.len()
         );
 
-        let fixture = fixture();
-        let confined_run = env::var("FSGATE_TERMINAL").unwrap() == "confined";
-        let flags = if confined_run {
-            confined(&[])
-        } else {
-            unconfined()
+        let mode = env::var("FSGATE_TERMINAL").unwrap();
+        let (flags, expect) = match mode.as_str() {
+            "output-only" => (confined(&["FSGATE_EXPECT"]), "denied"),
+            "terminal" => {
+                let mut flags = confined(&["FSGATE_EXPECT"]);
+                flags.push("--terminal".to_string());
+                (flags, "allowed")
+            }
+            "unconfined" => (unconfined(), "allowed"),
+            other => panic!("unknown mode `{other}`"),
         };
+        let fixture = fixture();
+        let output = terminal.try_clone().unwrap();
+        let errors = terminal.try_clone().unwrap();
         let mut child = broker(&fixture, &flags, "kernel::terminal_scenario")
+            .env("FSGATE_EXPECT", expect)
             .stdin(Stdio::from(terminal))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::from(output))
+            .stderr(Stdio::from(errors))
             .process_group(0)
             .spawn()
             .expect("spawn fsgate-broker");
@@ -715,43 +730,58 @@ mod kernel {
         .expect("a status for the broker");
         let stopped_by = status.stopping_signal();
         if status.stopped() {
-            // A stopped group would hold the pipes below open.
+            // A stopped group would hold the terminal open.
             rustix::process::kill_process_group(pid, Signal::KILL).unwrap();
         }
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        child
-            .stdout
-            .take()
-            .unwrap()
-            .read_to_string(&mut stdout)
-            .unwrap();
-        child
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut stderr)
-            .unwrap();
         let exit = child.wait().expect("reap fsgate-broker");
-        let report = format!("{exit}, stopped by {stopped_by:?}\n{stdout}\n{stderr}");
+        // What the broker and its worker printed, after the echo of the typed
+        // line. Once no process holds the terminal, the master reads `EIO`.
+        let mut shown = Vec::new();
+        let mut buffer = [0; 4096];
+        loop {
+            match rustix::io::read(&*master, &mut buffer) {
+                Ok(0) | Err(Errno::IO) => break,
+                Ok(read) => shown.extend_from_slice(&buffer[..read]),
+                Err(err) => panic!("reading the terminal failed: {err}"),
+            }
+        }
+        let shown = String::from_utf8_lossy(&shown);
+        let report = format!("{exit}, stopped by {stopped_by:?}\n{shown}");
 
-        if confined_run {
-            assert!(exit.success(), "{report}");
-            assert!(stdout.contains("1 passed"), "{report}");
-        } else {
+        if mode == "unconfined" {
             assert_eq!(stopped_by, Some(Signal::TTIN.as_raw()), "{report}");
-            assert!(!stdout.contains("1 passed"), "{report}");
+            assert!(!shown.contains("1 passed"), "{report}");
+        } else {
+            assert!(exit.success(), "{report}");
+            assert!(shown.contains("1 passed"), "{report}");
         }
     }
 
     #[test]
     fn terminal_scenario() {
+        use std::io::IsTerminal;
+        use std::os::fd::AsFd;
+
         if !in_child("kernel::terminal_scenario") {
             return;
         }
         let mut line = String::new();
-        std::io::stdin().read_line(&mut line).unwrap();
-        assert_eq!(line, TYPED);
+        let read = std::io::stdin().read_line(&mut line).unwrap();
+        if expect_denied() {
+            assert_eq!((read, line.as_str()), (0, ""), "standard input held input");
+            assert!(!std::io::stdin().is_terminal());
+            let (stdout, stderr) = (std::io::stdout(), std::io::stderr());
+            for stream in [stdout.as_fd(), stderr.as_fd()] {
+                assert!(stream.is_terminal(), "the stream is not the terminal");
+                assert_eq!(
+                    rustix::io::read(stream, &mut [0; 16]).unwrap_err(),
+                    rustix::io::Errno::BADF,
+                    "the stream can be read"
+                );
+            }
+        } else {
+            assert_eq!(line, TYPED);
+        }
     }
 
     /// `/proc/<pid>/environ` is guarded by the same kernel check as ptrace,
@@ -862,9 +892,9 @@ mod kernel {
     }
 
     /// The gap: the death signal binds only the worker. A program it starts
-    /// never has one, so it outlives a killed broker, still confined. The
-    /// worker could also clear its own, but on its main thread, and libtest
-    /// runs each scenario on another.
+    /// never has one, so it outlives a killed broker, still confined.
+    /// [`a_confined_worker_that_drops_its_death_signal_outlives_its_broker`]
+    /// covers a worker that drops its own.
     #[test]
     fn a_program_a_confined_worker_starts_outlives_its_broker() {
         let fixture = fixture();
@@ -917,6 +947,87 @@ mod kernel {
         let err = fs::read(secret).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::PermissionDenied);
         println!("alive");
+    }
+
+    /// The other half of the gap: a worker that drops its own death signal.
+    /// The signal belongs to a thread, and the broker sets it on the worker's
+    /// main thread, while libtest runs each scenario on another. So the
+    /// scenario changes its own thread's signal and then execs the program
+    /// that waits: the thread that execs becomes the program's only thread
+    /// and keeps its signal.
+    ///
+    /// - `keeps`, the control: the scenario sets `SIGKILL` and execs, and
+    ///   the program dies with the broker.
+    /// - `clears`: it sets `SIGKILL`, clears it, and execs. The program
+    ///   outlives the broker, so clearing is the only difference.
+    /// - `execs`: it execs with the thread's signal as it found it. A thread
+    ///   the worker starts has none, so the program outlives the broker.
+    ///
+    /// After the broker is reaped the test sends the line the program waits
+    /// for and reads standard output to its end. A program that outlived the
+    /// broker answers `alive` and exits; a killed one never reads the line.
+    /// Either way the read ends, with no timeout.
+    #[test]
+    fn a_confined_worker_that_drops_its_death_signal_outlives_its_broker() {
+        for (mode, survives) in [("keeps", false), ("clears", true), ("execs", true)] {
+            let fixture = fixture();
+            let mut broker = broker(
+                &fixture,
+                &confined(&["FSGATE_DEATH"]),
+                "kernel::drops_its_death_signal_scenario",
+            )
+            .env("FSGATE_DEATH", mode)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn fsgate-broker");
+            let mut stdin = broker.stdin.take().expect("piped stdin");
+            let mut stdout = BufReader::new(broker.stdout.take().expect("piped stdout"));
+            wait_until_ready(&mut stdout);
+
+            broker.kill().expect("kill the broker");
+            broker.wait().expect("reap the broker");
+
+            // A killed program has closed its end, or will before it could
+            // read this, so the write may fail.
+            let _ = stdin.write_all(b"ping\n");
+            drop(stdin);
+            let mut rest = String::new();
+            stdout.read_to_string(&mut rest).expect("read the program");
+            assert_eq!(
+                rest.contains("alive") && rest.contains("1 passed"),
+                survives,
+                "mode {mode}: {rest:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn drops_its_death_signal_scenario() {
+        use std::os::unix::process::CommandExt;
+
+        use rustix::process::{parent_process_death_signal, set_parent_process_death_signal};
+
+        if !in_child("kernel::drops_its_death_signal_scenario") {
+            return;
+        }
+        let mode = env::var("FSGATE_DEATH").unwrap();
+        let found = parent_process_death_signal().unwrap();
+        eprintln!("drops_its_death_signal_scenario: mode {mode}, this thread's signal {found:?}");
+        match mode.as_str() {
+            "keeps" => set_parent_process_death_signal(Some(Signal::KILL)).unwrap(),
+            "clears" => {
+                set_parent_process_death_signal(Some(Signal::KILL)).unwrap();
+                set_parent_process_death_signal(None).unwrap();
+            }
+            "execs" => assert_eq!(found, None, "a thread the worker starts has no signal"),
+            other => panic!("unknown mode `{other}`"),
+        }
+        let err = Command::new(env::current_exe().unwrap())
+            .args(["--exact", "kernel::outlives_scenario", "--nocapture"])
+            .env("FSGATE_CHILD", "kernel::outlives_scenario")
+            .exec();
+        panic!("exec the program: {err}");
     }
 
     /// Reads the line a worker prints once it and its program run:

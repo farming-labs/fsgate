@@ -148,8 +148,9 @@ Each step closes a specific hole:
   cannot help, because the terminal was opened before the sandbox.
 - **Step 2.** After `setsid`, Ctrl-C reaches only the broker. Without this
   a killed broker would leave its worker running. It binds only a worker
-  that keeps it: the worker can clear its own death signal, and a program
-  the worker starts never has one. [RFC 0010](0010-worker-process-group.md)
+  that keeps it: the signal belongs to a thread, so the worker can clear
+  it there or exec from a new thread, which starts without one. A forked
+  child has none either. [RFC 0010](0010-worker-process-group.md)
   kills the worker's process group when the worker exits or the broker
   gets `SIGINT`, `SIGTERM`, `SIGHUP`, or `SIGQUIT`, which covers those
   programs unless the broker gets `SIGKILL` or another signal it does not
@@ -164,6 +165,32 @@ Each step closes a specific hole:
   Descriptors close at `exec` either way.
 - **Step 6.** Environments often hold tokens, and Landlock does not cover
   them. The launcher's worker already starts with an empty environment.
+
+### The terminal
+
+Step 1 has a cost, which a test showed after this RFC was accepted
+([#115](https://github.com/farming-labs/fsgate/pull/115)). The terminal a
+worker inherits is not its controlling terminal, so job control never
+stops its reads. While the user's shell has the foreground, and after
+Ctrl-Z stops the broker, a worker holding the terminal can read what the
+user types: the next command, or a password typed at a prompt.
+
+So the broker passes a terminal on to a confined worker for output only.
+A terminal on standard input becomes `/dev/null`. One on standard output
+or error is opened again through `/proc/self/fd`, for writing only,
+because a shell gives a program one terminal descriptor, open for reading
+and writing, on all three streams. A stream that is not a terminal passes
+as it is, so piped input still reaches the worker. The worker cannot open
+the terminal itself: it has no controlling terminal, so `/dev/tty` fails,
+and its ruleset leaves out `/dev/pts`.
+
+`--terminal` passes the terminal as it is, for an interactive program the
+user trusts with the keyboard. Like `--direct` and `--env`, it describes a
+confined worker and is refused with `--unconfined`. If a terminal cannot be
+opened again, the broker exits 1 and names `--terminal`.
+
+This changes behavior for the next minor release, and the changelog names
+it: a confined program that reads the keyboard needs `--terminal`.
 
 ### The `--socket` form
 
@@ -202,12 +229,14 @@ command line keeps working with one added flag. The library and
   act for their caller, such as systemd's user manager on the session
   bus. [RFC 0009](0009-worker-unix-sockets.md) refuses the worker new
   Unix sockets there instead.
-- After `SIGKILL` to the broker, a worker that cleared its death signal,
-  and programs it started, which never had one. Otherwise RFC 0010 ends
+- After `SIGKILL` to the broker, a worker that dropped its death signal
+  by clearing it or execing from a new thread, and programs it started,
+  which never had one. Otherwise RFC 0010 ends
   them, except a program that left the worker's process group with
   `setsid` or `setpgid`.
-- The worker's use of the terminal it inherited. It leads its own
-  session, so job control does not stop it.
+- With `--terminal`, the worker's use of the terminal it inherited. It
+  leads its own session, so job control does not stop it
+  ([above](#the-terminal)).
 - Any containment on macOS.
 
 ## Testing
@@ -234,7 +263,20 @@ the denial and the absence of the side effect:
   test checks the session rather than `TIOCSTI` itself: calling that ioctl
   needs `unsafe`, and whether a control could succeed depends on
   `dev.tty.legacy_tiocsti`.
-- Killing the broker kills the worker.
+- A scenario plays the user's shell: it leads a session with a
+  pseudo-terminal, keeps the foreground with a line already typed, and
+  runs the broker in the background with the terminal on all three
+  streams. The confined worker finds standard input empty and gets
+  `EBADF` reading standard output and error, which still print to the
+  terminal. With `--terminal` it reads the line. In an unconfined control
+  the worker shares the broker's background group, so its read stops the
+  group with `SIGTTIN`.
+- Killing the broker kills a worker that keeps its death signal.
+  `a_confined_worker_that_drops_its_death_signal_outlives_its_broker`
+  also runs a worker that clears the signal before exec, and one that
+  execs from a new thread without setting it. Both survive the broker
+  but still fail to read outside their allowed paths. The control sets
+  the signal and keeps it across exec, then ends with the broker.
 - `--direct` allows a read beneath its path. A `w` or `c` letter is a
   usage error, as is `--socket` without `--unconfined`.
 - With `--direct /proc:r`, a worker cannot read its broker's
@@ -259,6 +301,13 @@ kernel.
 - **An opt-in `--confine` flag.** A new flag does not fix a bad default.
 - **Keeping `--socket` confined without `RESOLVE_UNIX`.** Leaves every
   other pathname socket reachable, including the ones this should close.
+- **A terminal relay, as sudo's `use_pty` does.** The worker would get a
+  pseudo-terminal of its own, and the broker would pass keystrokes on only
+  while it has the foreground, so interactive programs would keep working.
+  It needs a relay loop, window sizes, and suspend handling in the broker.
+  It can come later, with `--terminal` until then.
+- **Documenting the terminal as a limit.** Leaves the default reading the
+  user's keyboard.
 
 ## Decisions
 
@@ -274,6 +323,9 @@ Accepted by the maintainer, with these answers:
    because Node.js does not start without it
    ([below](#programs-that-read-files-in-etc)). Other files in `/etc` stay
    opt-in with `--direct`.
+5. A terminal reaches a confined worker for output only, and `--terminal`
+   passes it as it is ([above](#the-terminal),
+   [#117](https://github.com/farming-labs/fsgate/pull/117)).
 
 ## Open question
 

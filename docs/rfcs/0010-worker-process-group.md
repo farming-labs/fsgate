@@ -42,7 +42,8 @@ to stop too.
 - **Programs that leave the group.** A program that calls `setsid` or
   `setpgid` is out of reach. See below.
 - **`SIGKILL` to the broker.** Nothing runs after it. The worker's death
-  signal still applies.
+  signal still applies if it keeps it. The worker can drop it by
+  clearing it or execing from a new thread, which starts without one.
 - **`--unconfined`.** That worker shares the broker's process group, and
   often the user's shell job, so killing the group would kill the broker
   and its caller.
@@ -122,7 +123,8 @@ under Changed. A worker that needs that runs with `--unconfined`.
   confined, and keeps the network, its `--direct` paths, and any terminal
   it holds.
 - Anything after `SIGKILL` to the broker, beyond the worker's own death
-  signal. The same holds for another signal that kills the broker without
+  signal, which it can drop by clearing it or execing from a new thread.
+  The same holds for another signal that kills the broker without
   being handled, such as `SIGUSR1` sent with `kill`.
 
 ## Testing
@@ -145,6 +147,10 @@ assert the kill and the absence of the side effect:
   worker's exit. The test then kills it.
 - **`SIGKILL` to the broker.** The existing test that shows a program
   outliving it stays, as the documented limit.
+  `a_confined_worker_that_drops_its_death_signal_outlives_its_broker`
+  shows the worker itself surviving if it clears its death signal or
+  execs from a new thread. Both survivors still fail to read outside
+  their allowed paths; the control that keeps the signal ends.
 - **`--unconfined`.** The broker exits with the worker's code and kills
   nothing.
 

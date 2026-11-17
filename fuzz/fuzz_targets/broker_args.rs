@@ -27,10 +27,11 @@ mod args;
 use args::{Args, Mode, Start};
 
 /// Arguments of one byte that stand for an option.
-const OPTIONS: [(u8, &str); 10] = [
+const OPTIONS: [(u8, &str); 11] = [
     (b'G', "--grant"),
     (b'D', "--direct"),
     (b'E', "--env"),
+    (b'Y', "--terminal"),
     (b'S', "--socket"),
     (b'U', "--unconfined"),
     (b'I', "--experimental-intercept"),
@@ -77,6 +78,7 @@ struct Asked<'a> {
     socket: Option<&'a str>,
     direct: Vec<&'a str>,
     env: Vec<&'a str>,
+    terminal: bool,
     unconfined: bool,
     intercept: bool,
     apply: bool,
@@ -109,6 +111,7 @@ fn expected_args(argv: &[String]) -> Option<Asked<'_>> {
                 }
                 asked.env.push(name);
             }
+            "--terminal" => asked.terminal = true,
             "--unconfined" => asked.unconfined = true,
             "--experimental-intercept" => asked.intercept = true,
             "--apply" => asked.apply = true,
@@ -121,7 +124,7 @@ fn expected_args(argv: &[String]) -> Option<Asked<'_>> {
         }
     }
 
-    let shapes_confinement = !asked.direct.is_empty() || !asked.env.is_empty();
+    let shapes_confinement = !asked.direct.is_empty() || !asked.env.is_empty() || asked.terminal;
     let valid = !asked.grants.is_empty()
         && !asked.command.is_empty()
         && !(asked.unconfined && shapes_confinement)
@@ -204,13 +207,18 @@ fn check_args(argv: &[String]) {
                 "{argv:?} started its worker unconfined"
             );
         }
-        Mode::Inherited(Start::Confined { direct, env }) => {
+        Mode::Inherited(Start::Confined {
+            direct,
+            env,
+            terminal,
+        }) => {
             assert!(
                 !asked.intercept && !asked.unconfined && asked.socket.is_none(),
                 "{argv:?} became confined mode"
             );
             assert_eq!(direct, asked.direct, "the `--direct` specs of {argv:?}");
             assert_eq!(env, asked.env, "the `--env` names of {argv:?}");
+            assert_eq!(terminal, asked.terminal, "`--terminal` in {argv:?}");
         }
     }
 }
