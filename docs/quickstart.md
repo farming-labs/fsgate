@@ -127,9 +127,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Start it with `fsgate-broker --grant /srv/data:r -- ./your-worker` on Linux.
 Ordinary file opens in a program that does not use `BrokerGate` are a separate
-[experimental interception mode](rfcs/0004-filesystem-interception.md), currently
-limited to static Linux x86_64 binaries. This walkthrough uses the supported
-broker API.
+[experimental interception mode](interception.md). It supports a limited Linux
+x86_64 read-only profile; dynamically linked programs require explicit runtime
+grants for their loader and libraries. This walkthrough uses the supported broker
+API.
 
 ## Clean up
 
