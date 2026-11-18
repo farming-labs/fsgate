@@ -35,7 +35,7 @@
 //!
 //! ```text
 //! fsgate-broker --experimental-intercept --grant <path>:<rights> [--grant ...] \
-//!     [--audit] [--apply] -- <static-binary> [args...]
+//!     [--runtime <absolute-path> ...] [--audit] [--apply] -- <native-elf> [args...]
 //! ```
 //!
 //! Without `--apply` it prints the plan (the worker check, the grants, and
@@ -151,8 +151,12 @@ fn main() -> ExitCode {
             socket,
             command,
         }),
-        Mode::Intercept { apply, audit } => {
-            return intercept::run(&grants, &command, apply, audit);
+        Mode::Intercept {
+            apply,
+            audit,
+            runtime,
+        } => {
+            return intercept::run(&grants, &command, apply, audit, &runtime);
         }
     };
     match result {
@@ -395,7 +399,7 @@ const USAGE: &str = "usage: fsgate-broker --grant <path>:<rights> [--grant ...] 
                      \x20      fsgate-broker --unconfined --grant <path>:<rights> [--grant ...] \
                      [--socket <path>] -- <command> [args...]\n\
                      \x20      fsgate-broker --experimental-intercept --grant <path>:<rights> [--grant ...] \
-                     [--audit] [--apply] -- <static-binary> [args...]\n\
+                     [--runtime <absolute-path> ...] [--audit] [--apply] -- <native-elf> [args...]\n\
                      rights letters: r read, w write, c create, l list; \
                      for --direct: r read, l list, x execute";
 
@@ -436,25 +440,28 @@ mod intercept {
         command: &[String],
         apply: bool,
         audit: bool,
+        runtime: &[PathBuf],
     ) -> ExitCode {
         let mut launch = Launch::new(&command[0]);
         launch.args(&command[1..]);
-        let check = launch.check();
-        if !apply {
-            print_plan(grants, command, &check);
-            return check.map_or_else(|err| exit_for(&err), |()| ExitCode::SUCCESS);
+        for path in runtime {
+            launch.runtime(path);
         }
-        if let Err(err) = check {
-            eprintln!("fsgate-broker: {err}");
-            return exit_for(&err);
-        }
-
         let mut gate = Gate::new();
         for (path, rights) in grants {
             if let Err(err) = gate.grant(path, *rights) {
                 eprintln!("fsgate-broker: granting `{}` failed: {err}", path.display());
                 return ExitCode::from(1);
             }
+        }
+        let check = launch.check_with(&gate);
+        if !apply {
+            print_plan(grants, command, runtime, &launch, &check);
+            return check.map_or_else(|err| exit_for(&err), |()| ExitCode::SUCCESS);
+        }
+        if let Err(err) = check {
+            eprintln!("fsgate-broker: {err}");
+            return exit_for(&err);
         }
         if audit {
             gate.set_audit_sink(Arc::new(StderrSink));
@@ -473,18 +480,36 @@ mod intercept {
         }
     }
 
-    fn print_plan(grants: &[(PathBuf, Rights)], command: &[String], check: &io::Result<()>) {
+    fn print_plan(
+        grants: &[(PathBuf, Rights)],
+        command: &[String],
+        runtime: &[PathBuf],
+        launch: &Launch,
+        check: &io::Result<()>,
+    ) {
         let mut out = io::stdout().lock();
         let _ = writeln!(
             out,
             "fsgate-broker: experimental interception plan (RFC 0004, unsupported)"
         );
         let _ = writeln!(out, "  worker:  {}", command.join(" "));
+        if let Ok(Some(interpreter)) = launch.interpreter() {
+            let _ = writeln!(out, "  loader:  {}", interpreter.display());
+        }
+        for path in runtime {
+            let _ = writeln!(out, "  runtime: {} READ", path.display());
+        }
+        if !runtime.is_empty() {
+            let _ = writeln!(
+                out,
+                "  runtime profile: one process, one thread; runtime directory symlinks stay beneath their grants"
+            );
+        }
         match check {
             Ok(()) => {
                 let _ = writeln!(
                     out,
-                    "  check:   ok (kernel support, static x86_64 ELF image)"
+                    "  check:   ok (kernel support, x86_64 ELF image, explicit runtime authority)"
                 );
             }
             Err(err) => {
@@ -505,7 +530,7 @@ mod intercept {
         }
         for line in [
             "  profile: read-only opens of absolute paths through open, openat, and openat2;",
-            "           symlinks, directories, special files, writes, and creation are refused;",
+            "           data symlinks, directories, special files, writes, and creation are refused;",
             "           execve, sockets, io_uring, namespaces, and ptrace are refused by the",
             "           syscall allowlist; the worker gets only stdio and an empty environment",
         ] {
@@ -529,7 +554,13 @@ mod intercept {
 
     use fsgate::Rights;
 
-    pub(super) fn run(_: &[(PathBuf, Rights)], _: &[String], _: bool, _: bool) -> ExitCode {
+    pub(super) fn run(
+        _: &[(PathBuf, Rights)],
+        _: &[String],
+        _: bool,
+        _: bool,
+        _: &[PathBuf],
+    ) -> ExitCode {
         if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
             eprintln!(
                 "fsgate-broker: this build has no interception mode; rebuild with \

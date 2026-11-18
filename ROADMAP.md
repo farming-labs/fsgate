@@ -351,6 +351,39 @@ Order: the model-based tests first, because they cover the most code on both pla
 
 - [x] Implement the accepted option B from [RFC 0014](docs/rfcs/0014-lock-io-uring-rings.md) ([#123](https://github.com/farming-labs/fsgate/pull/123)): refuse detectable pre-lock `io_uring` resources and fail when inspection cannot complete. The maintainer selected this behavior on 2026-11-17. [CI on `da5cff2`](https://github.com/farming-labs/fsgate/actions/runs/44157981690) passed all 20 jobs, and the [fuzz run](https://github.com/farming-labs/fsgate/actions/runs/44157981500) passed all four. The new refusal, inspection-failure, and post-lock-ring tests each passed nine times across default and experimental features, the packaged crate, Rust 1.85.0, x86_64 and arm64, and Linux 6.6.162, 6.12.117, and 7.3.3. Both lock policies refuse before containment; the explicit opt-out preserves the measured bypass; new rings use confined credentials. Removing the guard makes the focused regression fail for the missing refusal. Hidden registered rings, descriptors in flight, and concurrent changes remain documented limits. Implemented and tested; not independently reviewed or released.
 
+## M11 — interception for unmodified programs
+
+Prioritized after the initial M6 static-binary profile. Design: [RFC 0015](docs/rfcs/0015-dynamic-interception.md), implemented and CI-tested in [#127](https://github.com/farming-labs/fsgate/pull/127) with explicit runtime grants selected by the maintainer. The compatibility targets are dynamically linked glibc programs on Linux x86_64. Local packaged release tests pass on Linux 6.18.60, and the declared CI kernel matrix passes. Merge and release are pending.
+
+- [ ] Inspect the interpreter in a held ELF image with bounded, non-executing parsing. Acceptance: native static/PIE and dynamic layouts are distinguished, malformed headers/interpreters are refused, and the existing launcher still refuses dynamic execution until the complete profile is ready. Implemented locally: eight focused host tests pass in the checkout and unpacked release-mode crate; all 145 host tests pass, and Linux x86_64 interception clippy passes. The parser is also covered by the local packaged Linux release tests; merge evidence is pending.
+- [ ] Settle runtime grants and loader identity. Acceptance: the selected policy, runtime/data overlap rules, symlink behavior, audit attribution, and lifecycle are documented; runtime resolution and interpreter replacement have real filesystem tests.
+- [ ] Implement measured loader and command syscall compatibility. Acceptance: focused fixtures cover every added syscall form, including metadata results, denials, cancellation, and invalid memory where applicable.
+- [ ] Launch unmodified dynamic programs through the API and CLI. Acceptance: the release build of the packaged source runs the dynamic C fixture and unmodified `cat`, `wc`, and `sha256sum` on the declared kernels, with exact output and no denied side effects. The static suite and unsupported-host checks still pass.
+
+Local M11 evidence (2026-11-17): 146 host tests pass; host and Linux x86_64
+interception clippy pass; the CLI fuzz oracle compiles. In a disposable Linux
+6.18.60-0-virt VM, the unpacked crate's optimized build passes 94 tests: 44 library
+unit tests, 12 interception tests, 30 static-launch tests, and eight dynamic-launch
+tests. Two existing static-worker refusal tests are ignored on this supported
+boot; both pass separately on the same kernel booted with `lsm=capability`,
+asserting API/CLI startup refusal and absent marker files. They are not counted
+in the 94 supported-kernel passes. Dynamic tests compare exact API/CLI output
+with unconfined GNU
+`cat`, `wc`, and `sha256sum`, and cover grant refusal, metadata copies, denied
+writes without side effects, revocation, child lifetime, and cleanup. See the
+[RFC's environment and remaining checks](docs/rfcs/0015-dynamic-interception.md#local-verification).
+
+CI acceptance on `f8adfdb`: all 20 [CI jobs](https://github.com/farming-labs/fsgate/actions/runs/44244752940)
+and four [fuzz jobs](https://github.com/farming-labs/fsgate/actions/runs/44244753071)
+passed. All eight dynamic-launch tests pass on the runner's kernel with stable
+Rust and Rust 1.85.0, and from the packaged release build on Linux 6.6.162,
+6.12.117, and 7.3.3. Each supported kernel also passes the new unreaped-worker
+exit regression and the existing refusal tests in a separate no-Landlock boot.
+The command tests identify GNU coreutils explicitly. The automated review check
+was neutral because its monthly quota was exhausted; it did not review this
+change. Boxes remain open until merge. The feature is not released or
+independently reviewed.
+
 ## Out of scope for v1
 
 Preload shim for unmodified binaries, Windows, quotas and rate budgets, network or non-filesystem capabilities.

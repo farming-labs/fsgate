@@ -37,6 +37,14 @@ pub enum AuditOp {
     Lock,
     /// A file open for reading.
     Open,
+    /// An explicit runtime read grant (RFC 0015).
+    RuntimeGrant,
+    /// A read through an explicit runtime grant.
+    RuntimeOpen,
+    /// Metadata through an explicit runtime grant.
+    RuntimeMetadata,
+    /// An explicit runtime grant was revoked.
+    RuntimeRevoke,
     /// A file create for writing.
     Create,
     /// A metadata read.
@@ -62,6 +70,10 @@ impl AuditOp {
             AuditOp::Narrow => "narrow",
             AuditOp::Lock => "lock",
             AuditOp::Open => "open",
+            AuditOp::RuntimeGrant => "runtime_grant",
+            AuditOp::RuntimeOpen => "runtime_open",
+            AuditOp::RuntimeMetadata => "runtime_metadata",
+            AuditOp::RuntimeRevoke => "runtime_revoke",
             AuditOp::Create => "create",
             AuditOp::Metadata => "metadata",
             AuditOp::ReadDir => "read_dir",
@@ -208,7 +220,8 @@ pub struct AuditEvent {
     /// OS error number when policy allowed but the syscall failed.
     pub errno: Option<i32>,
     /// For a request intercepted from a worker's syscall (RFC 0004), that
-    /// syscall: `open`, `openat`, or `openat2`. `None` otherwise.
+    /// syscall: `open`, `openat`, `openat2`, or grant-checked `newfstatat`.
+    /// `None` otherwise.
     pub syscall: Option<&'static str>,
     /// For an intercepted request, its seccomp notification ID. `None`
     /// otherwise.
