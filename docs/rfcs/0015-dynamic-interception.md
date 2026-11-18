@@ -81,6 +81,13 @@ cleanup. Startup requires the parent to retain children (`SIGCHLD` at its defaul
 disposition, without `SA_NOCLDWAIT`). The trusted embedder must not independently
 reap this owned child or change that signal policy while it is running.
 
+The supervisor holds a pidfd for this single-process worker and polls it beside
+the seccomp listener. Worker exit ends supervision without reaping the child.
+Relying only on listener hangup times out on Linux 6.6, which retains a zombie
+task's filters until it is reaped; the kernel changed that behavior in
+[the seccomp task-exit fix](https://lists.ubuntu.com/archives/kernel-team/2026-August/171099.html).
+The existing idle timeout and the join-before-reap lifetime contract remain.
+
 `newfstatat` is mediated for held descriptors (`""` with `AT_EMPTY_PATH`) and
 canonical absolute regular-file paths authorized by a READ grant. The latter is
 required by measured GNU wc 9.7 behavior: it reads the input size before opening
@@ -248,9 +255,29 @@ refused. Its trace showed a size query before the data open; granting metadata
 through the same READ resolver made that unchanged output comparison pass.
 
 Host `cargo test --locked` passes 146 tests; host and Linux x86_64 feature clippy,
-formatting, and the CLI argument fuzz target's compile check pass. A fuzz run,
-new-profile execution on the declared CI kernels, their full unsupported-host
-suite, a glibc-linked supervisor, and independent review have not been run for
-this change. Existing static cancellation tests pass, as does a deterministic
-metadata cancellation test that requires `EINTR` and an untouched result buffer.
+formatting, and the CLI argument fuzz target's compile check pass. A fuzz run
+and independent review have not been performed. Full acceptance on the declared
+CI kernels, their unsupported-host suite, and a glibc-linked supervisor remains
+pending the compatibility corrections below. Existing static cancellation tests
+pass, as does a deterministic metadata cancellation test that requires `EINTR`
+and an untouched result buffer.
 The feature remains experimental and unpublished.
+
+### CI compatibility corrections
+
+The first expanded CI run selected Ubuntu's uutils `cat` at `/usr/bin/cat`.
+That program attempted `readlink` on `/proc/self/exe`, outside this profile.
+The tests now require a `--version` response identifying GNU coreutils, checking
+both the ordinary name and Ubuntu's `gnu`-prefixed name. Missing GNU binaries
+fail with an installation instruction. The profile's syscall rules are unchanged.
+Ubuntu's [GNU package file list](https://packages.ubuntu.com/resolute-updates/amd64/gnu-coreutils/filelist)
+records the prefixed command paths.
+
+Linux 6.6 also exposed the listener lifetime described above: runtime cleanup
+waited for supervision, while listener hangup waited for the unreaped child.
+The regression `an_unreaped_worker_exit_ends_supervision_without_listener_hangup`
+uses a real exited child and pidfd beside a quiet, held socket to reproduce that
+lifecycle on newer kernels. In the Linux 6.18.60 VM it failed with `TimedOut`
+before pidfd polling and passed unchanged afterward, also asserting that the
+child was still waitable. This is focused regression evidence; the corrected
+full command suite and declared kernel matrix still require CI acceptance.

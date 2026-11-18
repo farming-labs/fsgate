@@ -59,6 +59,25 @@ impl Fixture {
     }
 }
 
+fn gnu_command(name: &str) -> PathBuf {
+    for path in [format!("/usr/bin/{name}"), format!("/usr/bin/gnu{name}")] {
+        let is_gnu = Command::new(&path)
+            .env_clear()
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("(GNU coreutils)")
+            });
+        if is_gnu {
+            return PathBuf::from(path);
+        }
+    }
+    panic!(
+        "GNU {name} is required; install coreutils (gnu-coreutils on Ubuntu with uutils) in /usr/bin"
+    );
+}
+
 fn runtime_paths(executable: &Path) -> Vec<PathBuf> {
     let loader = Launch::new(executable)
         .interpreter()
@@ -92,18 +111,26 @@ fn ordinary_glibc_commands_match_their_unconfined_output() {
     let fixture = Fixture::new();
     let input = fixture.data.join("input");
     for name in ["cat", "wc", "sha256sum"] {
-        let executable = PathBuf::from(format!("/usr/bin/{name}"));
+        let executable = gnu_command(name);
         let control = Command::new(&executable)
             .env_clear()
             .arg(&input)
             .output()
             .unwrap();
-        assert!(control.status.success(), "{name}: {:?}", control.stderr);
+        assert!(
+            control.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&control.stderr)
+        );
         let outcome = configured(&executable)
             .arg(&input)
             .run(fixture.gate())
             .unwrap();
-        assert!(outcome.status.success(), "{name}: {:?}", outcome.stderr);
+        assert!(
+            outcome.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&outcome.stderr)
+        );
         assert_eq!(outcome.stdout, control.stdout, "{name}");
         let mut cli = Command::new(env!("CARGO_BIN_EXE_fsgate-broker"));
         cli.args([
@@ -120,7 +147,11 @@ fn ordinary_glibc_commands_match_their_unconfined_output() {
             .arg(&input)
             .output()
             .unwrap();
-        assert!(outcome.status.success(), "CLI {name}: {:?}", outcome.stderr);
+        assert!(
+            outcome.status.success(),
+            "CLI {name}: {}",
+            String::from_utf8_lossy(&outcome.stderr)
+        );
         assert_eq!(outcome.stdout, control.stdout, "CLI {name}");
     }
 }
@@ -276,7 +307,7 @@ fn ungranted_data_is_not_delivered_to_a_dynamic_command() {
     let fixture = Fixture::new();
     let outside = fixture.root.path().join("secret");
     fs::write(&outside, b"private content").unwrap();
-    let outcome = configured(Path::new("/usr/bin/cat"))
+    let outcome = configured(&gnu_command("cat"))
         .arg(&outside)
         .run(fixture.gate())
         .unwrap();
@@ -288,7 +319,7 @@ fn ungranted_data_is_not_delivered_to_a_dynamic_command() {
 #[test]
 fn a_parent_that_discards_children_cannot_start_the_runtime_profile() {
     let fixture = Fixture::new();
-    let executable = Path::new("/usr/bin/cat");
+    let executable = gnu_command("cat");
     let mut command = Command::new(&fixture.worker);
     command
         .arg("ignore-sigchld")
@@ -298,7 +329,7 @@ fn a_parent_that_discards_children_cannot_start_the_runtime_profile() {
             "--grant",
             &format!("{}:r", fixture.data.display()),
         ]);
-    for path in runtime_paths(executable) {
+    for path in runtime_paths(&executable) {
         command.arg("--runtime").arg(path);
     }
     let outcome = command

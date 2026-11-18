@@ -18,6 +18,7 @@ use std::thread::{self, JoinHandle};
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fs::{FileType, Mode, OFlags};
 use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
+use rustix::process::{Pid, PidfdFlags};
 
 use super::runtime::Runtime;
 use super::{CopyFault, OPEN_HOW_SIZE, OpenCall, OpenHow, OpenRequest, PATH_MAX, filters, sys};
@@ -544,6 +545,12 @@ fn supervise(
     await_restricted(&socket)?;
     verify_listener(&listener)?;
     verify_child_memory(pid)?;
+    let runtime_exit = if runtime_profile {
+        let worker = Pid::from_raw(pid).ok_or_else(|| startup_error("invalid worker PID"))?;
+        Some(rustix::process::pidfd_open(worker, PidfdFlags::empty())?)
+    } else {
+        None
+    };
     match fault {
         Fault::ReplaceImage { with } => std::fs::rename(with, executable)?,
         Fault::ReplaceLoader { path, with } => std::fs::rename(with, path)?,
@@ -564,6 +571,7 @@ fn supervise(
         interrupt_first,
         runtime_profile.then_some(pid),
         interrupt_metadata,
+        runtime_exit.as_ref(),
     )
 }
 
@@ -649,14 +657,30 @@ fn serve(
     mut interrupt_next: bool,
     runtime_pid: Option<i32>,
     mut interrupt_metadata: bool,
+    runtime_exit: Option<&OwnedFd>,
 ) -> io::Result<()> {
+    let mut fds = vec![PollFd::new(listener, PollFlags::IN)];
+    if let Some(exited) = runtime_exit {
+        fds.push(PollFd::new(exited, PollFlags::IN));
+    }
     loop {
-        let mut fds = [PollFd::new(listener, PollFlags::IN)];
         if rustix::event::poll(&mut fds, Some(&IDLE_TIMEOUT))? == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "the supervisor saw no request and no worker exit for 30 s",
             ));
+        }
+        if let Some(exited) = fds.get(1) {
+            let events = exited.revents();
+            if events.intersects(PollFlags::ERR | PollFlags::NVAL) {
+                return Err(io::Error::other(
+                    "cannot poll the runtime worker exit descriptor",
+                ));
+            }
+            if events.intersects(PollFlags::IN | PollFlags::HUP) {
+                // The runtime profile cannot leave descendants holding the filter.
+                return Ok(());
+            }
         }
         let revents = fds[0].revents();
         if revents.contains(PollFlags::IN) {
@@ -1061,6 +1085,46 @@ mod tests {
         let mut running = spawn(executable, args, &[], gate, fault)?;
         drop(running.take_stdin());
         running.wait()
+    }
+
+    #[test]
+    fn an_unreaped_worker_exit_ends_supervision_without_listener_hangup() {
+        use rustix::process::{WaitId, WaitIdOptions, waitid};
+
+        let mut child = Command::new("/bin/true").spawn().unwrap();
+        let pid = Pid::from_child(&child);
+        let exited = rustix::process::pidfd_open(pid, PidfdFlags::empty()).unwrap();
+        waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+        )
+        .unwrap();
+        // Linux 6.6 keeps the seccomp listener open until the child is reaped.
+        let (listener, _keep_open) = UnixStream::pair().unwrap();
+        let listener: OwnedFd = listener.into();
+        let authority = Mutex::new(Authority {
+            data: Gate::new(),
+            runtime: Runtime::prepare(&[]).unwrap(),
+        });
+        let result = serve(
+            &listener,
+            &authority,
+            false,
+            Some(child.id() as i32),
+            false,
+            Some(&exited),
+        );
+        let retained = waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+        );
+        let status = child.wait().unwrap();
+        result.expect("the worker's exit must end supervision before it is reaped");
+        assert!(
+            retained.unwrap().is_some(),
+            "the child must remain waitable"
+        );
+        assert!(status.success());
     }
 
     #[test]

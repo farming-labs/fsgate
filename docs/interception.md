@@ -5,6 +5,11 @@ not released or independently reviewed. It supports read-only absolute file
 opens; it is not a general-purpose program sandbox. Landlock ABI 3 and seccomp
 user notifications are required. Missing support prevents startup.
 
+The command examples use GNU `cat`. Check `/usr/bin/cat --version` first. On
+Ubuntu systems where it identifies uutils, use `/usr/bin/gnucat` from the
+`gnu-coreutils` package in each example instead. uutils commands are outside the
+current compatibility profile.
+
 Build from the repository:
 
 ```sh
@@ -78,9 +83,10 @@ outside the profile. Without runtime grants, the original static profile remains
 An embedder must leave `SIGCHLD` at its default disposition without
 `SA_NOCLDWAIT`, and must not independently reap the owned worker. Startup checks
 that signal policy. Runtime cleanup joins the supervisor before reaping, keeping
-its PID reserved until all metadata copies finish. Dropping `Running` kills and
-reaps its worker. The supervisor still fails pending requests after 30 seconds
-without a request or worker exit.
+its PID reserved until all metadata copies finish. A held process descriptor
+reports worker exit even on kernels that keep the listener open until reaping.
+Dropping `Running` kills and reaps its worker. The supervisor still fails pending
+requests after 30 seconds without a request or worker exit.
 
 The first compatibility targets are a dynamic C fixture and unmodified GNU
 `cat`, `wc`, and `sha256sum`. The roadmap records execution and CI evidence;
