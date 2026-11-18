@@ -364,8 +364,11 @@ Local M11 evidence (2026-11-17): 146 host tests pass; host and Linux x86_64
 interception clippy pass; the CLI fuzz oracle compiles. In a disposable Linux
 6.18.60-0-virt VM, the unpacked crate's optimized build passes 94 tests: 44 library
 unit tests, 12 interception tests, 30 static-launch tests, and eight dynamic-launch
-tests. Two no-Landlock cases are ignored on this supported kernel and are not
-counted as passes. Dynamic tests compare exact API/CLI output with unconfined GNU
+tests. Two existing static-worker refusal tests are ignored on this supported
+boot; both pass separately on the same kernel booted with `lsm=capability`,
+asserting API/CLI startup refusal and absent marker files. They are not counted
+in the 94 supported-kernel passes. Dynamic tests compare exact API/CLI output
+with unconfined GNU
 `cat`, `wc`, and `sha256sum`, and cover grant refusal, metadata copies, denied
 writes without side effects, revocation, child lifetime, and cleanup. See the
 [RFC's environment and remaining checks](docs/rfcs/0015-dynamic-interception.md#local-verification).

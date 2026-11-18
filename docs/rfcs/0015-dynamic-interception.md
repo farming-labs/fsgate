@@ -233,7 +233,10 @@ musl-linked workers. No package install scripts run for the Debian files.
 
 Results from the unpacked crate: 44 library unit tests, 12 interception tests,
 30 static-launch tests, and eight dynamic-launch tests pass. Two tests requiring
-a kernel without Landlock remain explicitly ignored. The dynamic cases cover
+a kernel without Landlock are explicitly ignored on that boot. In a separate
+boot of the same kernel with `lsm=capability`, those two existing static-worker
+refusal tests pass: the API and CLI refuse startup, and no marker file is created.
+That boot compiles the static fixture against Alpine musl. The dynamic cases cover
 normal commands through API and CLI, exact output, metadata identity and invalid/
 read-only/partial destinations, denied paths and write side effects, runtime
 revocation with delivered descriptors retained, refused descendants, parent
@@ -246,8 +249,8 @@ through the same READ resolver made that unchanged output comparison pass.
 
 Host `cargo test --locked` passes 146 tests; host and Linux x86_64 feature clippy,
 formatting, and the CLI argument fuzz target's compile check pass. A fuzz run,
-new-profile execution on Linux 6.6 and the current CI kernel, execution without
-Landlock, a glibc-linked supervisor, and independent review have not been run for
+new-profile execution on the declared CI kernels, their full unsupported-host
+suite, a glibc-linked supervisor, and independent review have not been run for
 this change. Existing static cancellation tests pass, as does a deterministic
 metadata cancellation test that requires `EINTR` and an untouched result buffer.
 The feature remains experimental and unpublished.
