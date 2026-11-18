@@ -1,6 +1,6 @@
 # RFC 0015: intercept dynamically linked programs
 
-- Status: implemented locally; CI and merge pending; explicit runtime grants selected by the maintainer
+- Status: merged in [#127](https://github.com/farming-labs/fsgate/pull/127) and tested in CI, experimental in repository builds
 - Date: 2026-11-17
 - Roadmap: [M11](../../ROADMAP.md#m11--interception-for-unmodified-programs)
 
@@ -14,7 +14,7 @@ The next product milestone is a native Linux x86_64 program that uses the system
 glibc loader, starts without linking fsgate, and reads explicitly granted files
 through intercepted opens. The first compatibility targets are a dynamically
 linked C fixture and unmodified `cat`, `wc`, and `sha256sum`, using absolute data
-paths. These are acceptance targets, not claims about current support.
+paths. The [outcome](#outcome) records the programs and kernels that passed.
 
 Relative data paths, directory enumeration, writes, scripts, Python/Node
 runtimes, musl, other architectures, and arbitrary later execs remain separate
@@ -207,19 +207,15 @@ support and the program matrix. Keep roadmap tasks unchecked until their own
 acceptance criteria and merge evidence exist. None of these steps constitutes an
 independent review or a release.
 
-## Implementation status
+## Outcome
 
-The private image inspector is implemented locally with eight passing focused
-host tests, also passing from the unpacked crate in release mode. All 145 host
-tests pass. Host and Linux x86_64 interception clippy checks pass. The launcher
-still refuses dynamic images after inspection. Linux execution of this change,
-the runtime policy, and the remaining dynamic profile are not verified or complete.
-
-## Open questions
-
-- After measuring Linux fixtures, which exact metadata and runtime syscall forms
-  are required by the initial glibc target? This is an implementation experiment,
-  not permission to allow all path queries.
+[#127](https://github.com/farming-labs/fsgate/pull/127) merged the profile with
+explicit runtime grants. The glibc fixture passed through the API. GNU `cat`, `wc`, and
+`sha256sum` produced identical output through the API and CLI on Linux x86_64. GNU `wc` required read-authorized
+pathname metadata to reproduce its output. Linux 6.6 required a pidfd to
+detect worker exit before reaping. The static profile still accepts an empty
+runtime list. All eight dynamic-launch tests passed on Linux 6.6.162, 6.12.117,
+and 7.3.3 in [CI on the merge commit](https://github.com/farming-labs/fsgate/actions/runs/44396604505).
 
 ## Local verification
 
@@ -292,5 +288,5 @@ in a separate no-Landlock boot, the existing startup refusal tests. Ignored
 no-Landlock cases in a supported boot are not counted as passes.
 
 The automated review check was neutral because its monthly review quota was
-exhausted. This is tested implementation evidence, not an independent review,
-merge, release, or a claim of compatibility beyond the declared profile.
+exhausted. Independent review is still open. The feature is available only in
+repository builds.

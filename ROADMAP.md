@@ -353,12 +353,21 @@ Order: the model-based tests first, because they cover the most code on both pla
 
 ## M11 — interception for unmodified programs
 
-Prioritized after the initial M6 static-binary profile. Design: [RFC 0015](docs/rfcs/0015-dynamic-interception.md), implemented and CI-tested in [#127](https://github.com/farming-labs/fsgate/pull/127) with explicit runtime grants selected by the maintainer. The compatibility targets are dynamically linked glibc programs on Linux x86_64. Local packaged release tests pass on Linux 6.18.60, and the declared CI kernel matrix passes. Merge and release are pending.
+The experimental launcher runs dynamically linked glibc programs on Linux x86_64 with explicitly granted runtime files and directories. [RFC 0015](docs/rfcs/0015-dynamic-interception.md) records the design. [#127](https://github.com/farming-labs/fsgate/pull/127) merged the implementation at `d349cd2`.
 
-- [ ] Inspect the interpreter in a held ELF image with bounded, non-executing parsing. Acceptance: native static/PIE and dynamic layouts are distinguished, malformed headers/interpreters are refused, and the existing launcher still refuses dynamic execution until the complete profile is ready. Implemented locally: eight focused host tests pass in the checkout and unpacked release-mode crate; all 145 host tests pass, and Linux x86_64 interception clippy passes. The parser is also covered by the local packaged Linux release tests; merge evidence is pending.
-- [ ] Settle runtime grants and loader identity. Acceptance: the selected policy, runtime/data overlap rules, symlink behavior, audit attribution, and lifecycle are documented; runtime resolution and interpreter replacement have real filesystem tests.
-- [ ] Implement measured loader and command syscall compatibility. Acceptance: focused fixtures cover every added syscall form, including metadata results, denials, cancellation, and invalid memory where applicable.
-- [ ] Launch unmodified dynamic programs through the API and CLI. Acceptance: the release build of the packaged source runs the dynamic C fixture and unmodified `cat`, `wc`, and `sha256sum` on the declared kernels, with exact output and no denied side effects. The static suite and unsupported-host checks still pass.
+- [x] Inspect the interpreter in a held ELF image with bounded, non-executing parsing. Acceptance: native static/PIE and dynamic layouts are distinguished, malformed headers/interpreters are refused, and the existing launcher still refuses dynamic execution until the complete profile is ready.
+- [x] Settle runtime grants and loader identity. Acceptance: the selected policy, runtime/data overlap rules, symlink behavior, audit attribution, and lifecycle are documented; runtime resolution and interpreter replacement have real filesystem tests.
+- [x] Implement measured loader and command syscall compatibility. Acceptance: focused fixtures cover every added syscall form, including metadata results, denials, cancellation, and invalid memory where applicable.
+- [x] Launch unmodified dynamic programs through the API and CLI. Acceptance: the release build of the packaged source runs the dynamic C fixture and unmodified `cat`, `wc`, and `sha256sum` on the declared kernels, with exact output and no denied side effects. The static suite and unsupported-host checks still pass.
+
+  On `41b310d`, all nine dynamic-launch tests passed from the unpacked crate's
+  release build on [Linux 6.6.162](https://github.com/farming-labs/fsgate/actions/runs/44410968876/job/135178672378),
+  [6.12.117](https://github.com/farming-labs/fsgate/actions/runs/44410968876/job/135178672294),
+  and [7.3.3](https://github.com/farming-labs/fsgate/actions/runs/44410968876/job/135178672408).
+  The new test, `cli_runs_the_dynamic_c_fixture`, ran the C fixture through the
+  built CLI with explicit runtime grants and a read-only data grant. It checked
+  the exit status and the exact stdout, `ok\n`. The GNU command comparisons
+  passed through both the API and the CLI in the same runs.
 
 Local M11 evidence (2026-11-17): 146 host tests pass; host and Linux x86_64
 interception clippy pass; the CLI fuzz oracle compiles. In a disposable Linux
@@ -381,8 +390,11 @@ Rust and Rust 1.85.0, and from the packaged release build on Linux 6.6.162,
 exit regression and the existing refusal tests in a separate no-Landlock boot.
 The command tests identify GNU coreutils explicitly. The automated review check
 was neutral because its monthly quota was exhausted; it did not review this
-change. Boxes remain open until merge. The feature is not released or
-independently reviewed.
+change.
+
+All 20 [CI jobs on the merge commit](https://github.com/farming-labs/fsgate/actions/runs/44396604505)
+passed. Each of the three supported kernel jobs passed all eight dynamic-launch
+tests. The feature remains experimental and available only in repository builds.
 
 ## Out of scope for v1
 
