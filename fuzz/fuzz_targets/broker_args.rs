@@ -27,7 +27,7 @@ mod args;
 use args::{Args, Mode, Start};
 
 /// Arguments of one byte that stand for an option.
-const OPTIONS: [(u8, &str); 11] = [
+const OPTIONS: [(u8, &str); 12] = [
     (b'G', "--grant"),
     (b'D', "--direct"),
     (b'E', "--env"),
@@ -35,6 +35,7 @@ const OPTIONS: [(u8, &str); 11] = [
     (b'S', "--socket"),
     (b'U', "--unconfined"),
     (b'I', "--experimental-intercept"),
+    (b'R', "--runtime"),
     (b'A', "--apply"),
     (b'T', "--audit"),
     (b'H', "--help"),
@@ -83,6 +84,7 @@ struct Asked<'a> {
     intercept: bool,
     apply: bool,
     audit: bool,
+    runtime: Vec<&'a str>,
     command: &'a [String],
 }
 
@@ -113,6 +115,13 @@ fn expected_args(argv: &[String]) -> Option<Asked<'_>> {
             }
             "--terminal" => asked.terminal = true,
             "--unconfined" => asked.unconfined = true,
+            "--runtime" => {
+                let path = rest.next()?.as_str();
+                if !std::path::Path::new(path).is_absolute() {
+                    return None;
+                }
+                asked.runtime.push(path);
+            }
             "--experimental-intercept" => asked.intercept = true,
             "--apply" => asked.apply = true,
             "--audit" => asked.audit = true,
@@ -131,7 +140,10 @@ fn expected_args(argv: &[String]) -> Option<Asked<'_>> {
         && if asked.intercept {
             asked.socket.is_none() && !asked.unconfined && !shapes_confinement
         } else {
-            !asked.apply && !asked.audit && (asked.socket.is_none() || asked.unconfined)
+            !asked.apply
+                && !asked.audit
+                && asked.runtime.is_empty()
+                && (asked.socket.is_none() || asked.unconfined)
         };
     valid.then_some(asked)
 }
@@ -190,7 +202,15 @@ fn check_args(argv: &[String]) {
     assert_eq!(grants, asked_grants, "the grants of {argv:?}");
     assert_eq!(command, asked.command, "the command of {argv:?}");
     match mode {
-        Mode::Intercept { apply, audit } => {
+        Mode::Intercept {
+            apply,
+            audit,
+            runtime,
+        } => {
+            assert_eq!(
+                runtime,
+                asked.runtime.iter().map(PathBuf::from).collect::<Vec<_>>()
+            );
             assert!(asked.intercept, "{argv:?} became interception mode");
             assert_eq!((apply, audit), (asked.apply, asked.audit), "{argv:?}");
         }

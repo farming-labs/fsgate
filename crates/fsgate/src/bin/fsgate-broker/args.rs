@@ -19,7 +19,11 @@ pub(super) enum Mode {
     /// Serve the grants over a Unix socket at this path.
     Socket(PathBuf),
     /// Experimental: intercept the worker's file opens (RFC 0004).
-    Intercept { apply: bool, audit: bool },
+    Intercept {
+        apply: bool,
+        audit: bool,
+        runtime: Vec<PathBuf>,
+    },
 }
 
 /// How the command of [`Mode::Inherited`] starts.
@@ -59,6 +63,7 @@ pub(super) fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args,
     let mut grants = Vec::new();
     let mut socket = None;
     let mut intercept = false;
+    let mut runtime = Vec::new();
     let mut apply = false;
     let mut audit = false;
     let mut unconfined = false;
@@ -94,6 +99,16 @@ pub(super) fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args,
                 env.push(name);
             }
             "--terminal" => terminal = true,
+            "--runtime" => {
+                let path = args.next().ok_or("`--runtime` needs an absolute path")?;
+                if !Path::new(&path).is_absolute() {
+                    return Err(
+                        "`--runtime` needs an absolute path; name a runtime file or directory"
+                            .into(),
+                    );
+                }
+                runtime.push(PathBuf::from(path));
+            }
             "--experimental-intercept" => intercept = true,
             "--apply" => apply = true,
             "--audit" => audit = true,
@@ -133,9 +148,15 @@ pub(super) fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args,
                     .into(),
             );
         }
-        (true, None) => Mode::Intercept { apply, audit },
-        (false, _) if apply || audit => {
-            return Err("`--apply` and `--audit` need `--experimental-intercept`".into());
+        (true, None) => Mode::Intercept {
+            apply,
+            audit,
+            runtime,
+        },
+        (false, _) if apply || audit || !runtime.is_empty() => {
+            return Err(
+                "`--apply`, `--audit`, and `--runtime` need `--experimental-intercept`".into(),
+            );
         }
         (false, Some(_)) if !unconfined => {
             return Err(
@@ -208,4 +229,50 @@ pub(super) fn parse_direct(spec: &str) -> Result<(PathBuf, &str), String> {
         ));
     }
     Ok((PathBuf::from(path), letters))
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_grants_require_interception_and_absolute_paths() {
+        for options in [
+            vec!["--runtime", "/lib"],
+            vec!["--experimental-intercept", "--runtime", "lib"],
+        ] {
+            let argv = options
+                .into_iter()
+                .chain(["--grant", "/data:r", "--", "/bin/cat"])
+                .map(str::to_owned);
+            assert!(parse_args(argv).is_err());
+        }
+        let parsed = parse_args(
+            [
+                "--experimental-intercept",
+                "--runtime",
+                "/lib/loader",
+                "--runtime",
+                "/lib/libraries",
+                "--grant",
+                "/data:r",
+                "--",
+                "/bin/cat",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+        let Mode::Intercept { runtime, apply, .. } = parsed.mode else {
+            panic!("intercept mode")
+        };
+        assert!(!apply);
+        assert_eq!(
+            runtime,
+            [
+                PathBuf::from("/lib/loader"),
+                PathBuf::from("/lib/libraries")
+            ]
+        );
+    }
 }

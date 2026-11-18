@@ -24,16 +24,16 @@ Fields:
 
 - `v` — format version, starts at 1. The contract is versioned and only gains keys within a version; removing or retyping a key bumps `v`.
 - `ts` — RFC 3339 UTC with milliseconds.
-- `op` — `grant`, `revoke`, `narrow` (RFC 0005), `lock`, `open`, `create`, `metadata`, `read_dir`, and from a broker `connect` and `request` ([RFC 0011](0011-audit-broker-refusals.md)) (grows with the API).
+- `op` — `grant`, `revoke`, `narrow` (RFC 0005), `lock`, `open`, `create`, `metadata`, `read_dir`, and from a broker `connect` and `request` ([RFC 0011](0011-audit-broker-refusals.md)) (grows with the API). Experimental interception also emits `runtime_grant`, `runtime_open`, `runtime_metadata`, and `runtime_revoke` ([RFC 0015](0015-dynamic-interception.md)).
 - `path` — the normalized requested path. For `grant`/`revoke`/`narrow`, the grant's path. `null` for `lock`, which has no path.
 - `grant` — the matched grant's id, or `null` when none matched. `revoke` and `narrow` of an already revoked grant record the requested id; a grant from another gate is `null`, because its id names nothing in this gate.
-- `rights` — for `grant` and `narrow`, the rights the grant holds after the decision, as an array of `read`, `write`, `create`, `list` in that order; `[]` for a grant narrowed to no rights. A refused widening records the unchanged set. `null` when no grant was created or matched, and for every other `op`. Added within v1 (RFC 0005).
+- `rights` — for `grant`, `runtime_grant`, and `narrow`, the rights the grant holds after the decision, as an array of `read`, `write`, `create`, `list` in that order; `[]` for a grant narrowed to no rights. A refused widening records the unchanged set. `null` when no grant was created or matched, and for every other `op`. Added within v1 (RFC 0005).
 - `restrictions` — for a successful `lock`, the [RFC 0006](0006-lock-restrictions.md) restrictions that took effect, as an array of `ioctl_dev`, `abstract_unix_socket`, `signal`, `all_threads`, `resolve_unix` in that order; `[]` when none did. `null` for a refused `lock` and every other `op`. Added within v1.
 - `status` — for a successful `lock`, what the kernel enforced for the filesystem rules built from the grants: `fully_enforced`, `partially_enforced` (an older Landlock ABI), or `library_only` (nothing; only a `BestEffort` lock succeeds this way). `null` for a refused `lock` and every other `op`. Without it, a best-effort lock the kernel did not enforce read the same as an enforced one. Added within v1.
 - `decision` — `allow` or `deny`. An operation that passed policy but failed at the kernel is `allow` with a non-null `errno`: policy said yes, the OS said no, and both facts are recorded.
 - `reason` — `ok`, `no_grant`, `rights_exceeded` (for `narrow`: the requested set names a right the grant does not hold), `not_absolute`, `locked`, `unsupported` (a lock the kernel could not enforce), `io_uring` (pre-lock ring detection or inspection failure, [RFC 0014](0014-lock-io-uring-rings.md)), `unknown_grant` (revoking or narrowing a grant that does not exist), `nested_grant` (a grant or narrow that would leave a grant with fewer rights than one on the same directory or above it, [RFC 0012](0012-nested-grants.md)), `unsupported_input` (an intercepted request outside the RFC 0004 file-open contract: a relative or non-canonical path, a path that is not UTF-8, a write or other unsupported flag, or an unsupported `openat2` layout or resolve flag), `invalid_memory` (an intercepted request whose arguments could not be copied out of the worker), and for the broker's own decisions (RFC 0011) `peer_refused`, `connection_limit`, `no_thread`, `frame_too_large`, `malformed_frame`, `malformed_request`. Grows with the API.
 - `errno` — OS error number when the underlying syscall failed, else `null`.
-- `syscall` — for a request intercepted from a worker's syscall ([RFC 0004](0004-filesystem-interception.md)), that syscall: `open`, `openat`, or `openat2`. `null` otherwise. Added within v1.
+- `syscall` — for a request intercepted from a worker's syscall ([RFC 0004](0004-filesystem-interception.md)), that syscall: `open`, `openat`, `openat2`, or the runtime profile's grant-checked `newfstatat`. `null` otherwise. Added within v1.
 - `notification` — for an intercepted request, its seccomp notification ID, which ties the event to one blocked syscall; a restarted syscall gets a new ID. `null` otherwise. Added within v1.
 - `peer_uid` — for `connect`, and for `request` on a connection `Broker::serve_with` accepted, the peer's effective uid. `null` when it cannot be read, on a connection given to `Broker::serve_conn`, and for every other `op`. Added within v1 ([RFC 0011](0011-audit-broker-refusals.md)).
 
@@ -62,3 +62,20 @@ pub trait AuditSink: Send + Sync {
 ## Non-goals
 
 Signing or tamper-evidence of the log (the embedder's storage problem), rate limiting, and sampling. Nothing in the sink can veto or alter a decision; audit is observation only ([threat model](../threat-model.md#audit-is-observation-not-a-boundary)).
+
+## Explicit runtime authority (RFC 0015)
+
+Successful startup records each explicit runtime path as `runtime_grant` with
+`rights: ["read"]`. Runtime opens use `runtime_open`, keeping their syscall and
+notification ID. Runtime path metadata uses `runtime_metadata`; revocation uses `runtime_revoke`. These events have
+`grant: null`: data-grant IDs do not name runtime grants. The runtime path names
+the declaration to revoke. Startup failures are returned to the caller before
+these successful grant events; they do not claim authority was installed.
+
+Descriptor metadata uses `metadata`, `path: null`, and `grant: null`.
+Data path metadata records the requested path and matched data grant. A rejected
+path/flag combination is `deny` / `unsupported_input`; unreadable arguments are
+`deny` / `invalid_memory`. A permitted descriptor operation whose copy fails is
+`allow` with its errno, including `EFAULT` for a short or unwritable result buffer.
+Cancelled notifications need not produce an event. As with open events, a
+successful policy decision does not promise the worker received the result.

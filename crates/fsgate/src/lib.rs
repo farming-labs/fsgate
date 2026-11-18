@@ -47,6 +47,19 @@ mod broker_sys;
 mod containment;
 #[cfg(all(feature = "experimental-intercept", target_os = "linux"))]
 pub mod intercept;
+#[cfg(all(
+    unix,
+    any(
+        test,
+        all(
+            feature = "experimental-intercept",
+            target_os = "linux",
+            target_arch = "x86_64"
+        )
+    )
+))]
+#[path = "intercept/image.rs"]
+mod intercept_image;
 #[cfg(target_os = "linux")]
 mod uring_guard;
 

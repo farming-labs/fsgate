@@ -25,10 +25,14 @@ to update the manifest and lockfile together:
 cargo install cargo-edit --version 0.13.13 --locked --no-default-features --features set-version
 cargo set-version --package fsgate "$version" --dry-run --offline
 cargo set-version --package fsgate "$version" --offline
-git diff -- crates/fsgate/Cargo.toml Cargo.lock
+cargo update --manifest-path fuzz/Cargo.toml --offline -p fsgate
+git diff -- crates/fsgate/Cargo.toml Cargo.lock fuzz/Cargo.lock
 ```
 
-Only fsgate's version should change in the lockfile. Keep dependencies
+The fuzz targets are a separate workspace, so `cargo set-version` does
+not update their lockfile. Refresh its local fsgate entry as shown above;
+otherwise CI's locked fuzz build refuses the new version.
+Only fsgate's version should change in either lockfile. Keep dependencies
 and the Rust minimum unchanged. Prepare the changelog under
 `$version (unreleased)` until the tag exists. Mark roadmap items complete
 only with merged PR evidence.
@@ -47,6 +51,8 @@ and static libc.
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test --locked
+cargo fmt --manifest-path fuzz/Cargo.toml --check
+cargo clippy --locked --manifest-path fuzz/Cargo.toml -- -D warnings
 cargo +1.85.0 test --locked
 cargo deny check
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps

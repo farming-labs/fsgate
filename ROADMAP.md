@@ -38,6 +38,8 @@ Acceptance met: `tests/lock.rs` re-executes the test binary as a locked child an
 
 Acceptance met: `tests/broker.rs` covers socketpair and real-binary transports, typed denials crossing the wire with no side effects, and the kill test — after `fsgate-broker` dies, every client operation returns `GateError::Broker`. Verified on macOS and Linux (CI).
 
+- [x] Ship a [runnable broker quickstart](docs/quickstart.md) with a worker that reads, writes, and lists through `BrokerGate` ([#126](https://github.com/farming-labs/fsgate/pull/126), `3fde6c2`). Acceptance met: release binaries perform all three operations and demonstrate refused reads and writes without creating or truncating denied files; the example is included in the packaged crate. The macOS checkout and unpacked-crate binaries each passed 19 workflow scenarios, and the documented macOS commands ran successfully. On Linux 6.18.60 (Alpine 3.24.4, x86_64), release binaries built from the unpacked crate at `3fde6c2` passed the same 19 scenarios with default worker confinement and ran the documented Linux workflow. This Linux check used musl cross-built binaries in a QEMU VM, not a native Linux build or aarch64 execution.
+
 ## M4 — revocation and audit
 
 - [x] `revoke(grant)` takes effect for subsequent operations and is covered by tests (landed early, in M1)
@@ -235,7 +237,9 @@ Started. No part of fsgate has had an independent security review. These are the
 
   The signed tag `v0.5.0` (tag object `36a30bf`) points to `af142c4`, the squash commit of the release PR [#108](https://github.com/farming-labs/fsgate/pull/108). [CI](https://github.com/farming-labs/fsgate/actions/runs/43681931450) passed on `af142c4`, 20 of 20 jobs. The [release run](https://github.com/farming-labs/fsgate/actions/runs/43743468551), approved under the `crates-io` environment, passed `cargo test --locked`, the dry run, the trusted publish, and its verify step. The archive built locally from `af142c4`, the crates.io checksum, and the crate downloaded from `static.crates.io` all agree on `065197dada6f68124ee55555d9d3af88eb3bb3fc4bcd93a1e6d9c3e93d6531d5`, and `.cargo_vcs_info.json` records `af142c4ad2c38c862a8fa5ff01463c6fd1d551ad`. crates.io records the GitHub trusted publisher for `farming-labs/fsgate` at that commit and run. Locally on macOS with Rust 1.99.1, 136 tests passed from the crate downloaded from crates.io; `cargo install fsgate --version 0.5.0 --locked` builds it and `fsgate-broker` prints its usage; a program depending on `fsgate = "=0.5.0"` reads inside a grant, is refused outside it, gets `EISDIR` for a directory, lists a directory as names and types, and is refused a nested grant with fewer rights; and the same dependency with `experimental-intercept` stops at the compile error. GitHub marks `v0.5.0` verified. No GitHub release or binary asset was created.
 
-Order: M8 first, because it changes what `lock()` means for existing users and its `LockStatus` change needs a minor release anyway. Then the threat model and fuzzing, then RFC 0007, then 0.2.0, then RFC 0008 so the reviewer sees the final broker, then 0.3.0 for the `Gate::open` fix, then RFCs 0009 to 0011 and 0.4.0, then 0.4.1 for the raw socket pair, then the internal review's fixes and 0.5.0, then the review. M6's tasks are all done ([#35](https://github.com/farming-labs/fsgate/pull/35) closed the last); it remains unreviewed and unreleased.
+- [ ] Release 0.6.0 through the trusted-publishing workflow. It carries the output-only terminal default ([#117](https://github.com/farming-labs/fsgate/pull/117)), refusal of ambiguous broker peer identities ([#121](https://github.com/farming-labs/fsgate/pull/121)), and inspection of visible pre-lock `io_uring` resources ([#123](https://github.com/farming-labs/fsgate/pull/123), [RFC 0014](docs/rfcs/0014-lock-io-uring-rings.md)). These breaking defaults make it a minor release; [the changelog](CHANGELOG.md) records migration and the procfs requirements. Acceptance: the release candidate passes the source and packaged-crate checks on macOS and Linux, and the signed tag's release job verifies matching uploaded, crates.io, and downloaded checksums and the `.cargo_vcs_info.json` commit. Preparation is not a completed release. `experimental-intercept` remains excluded, and no independent security review is claimed.
+
+Order: M8 first, because it changes what `lock()` means for existing users and its `LockStatus` change needs a minor release anyway. Then the threat model and fuzzing, then RFC 0007, then 0.2.0, then RFC 0008 so the reviewer sees the final broker, then 0.3.0 for the `Gate::open` fix, then RFCs 0009 to 0011 and 0.4.0, then 0.4.1 for the raw socket pair, then the internal review's fixes and 0.5.0, then the terminal and peer checks and RFC 0014 in 0.6.0, then the review. M6's tasks are all done ([#35](https://github.com/farming-labs/fsgate/pull/35) closed the last); it remains unreviewed and unreleased.
 
 ## M10 — battle-tested tests
 
@@ -348,6 +352,39 @@ Started. Today each attack in the threat model has a test written for it, and on
 Order: the model-based tests first, because they cover the most code on both platforms and need no new CI machinery. Then the kernel comparison, which reuses them, then mutation testing to find what all the tests miss, then fuzzing, kernels, and distributions.
 
 - [x] Implement the accepted option B from [RFC 0014](docs/rfcs/0014-lock-io-uring-rings.md) ([#123](https://github.com/farming-labs/fsgate/pull/123)): refuse detectable pre-lock `io_uring` resources and fail when inspection cannot complete. The maintainer selected this behavior on 2026-11-17. [CI on `da5cff2`](https://github.com/farming-labs/fsgate/actions/runs/44157981690) passed all 20 jobs, and the [fuzz run](https://github.com/farming-labs/fsgate/actions/runs/44157981500) passed all four. The new refusal, inspection-failure, and post-lock-ring tests each passed nine times across default and experimental features, the packaged crate, Rust 1.85.0, x86_64 and arm64, and Linux 6.6.162, 6.12.117, and 7.3.3. Both lock policies refuse before containment; the explicit opt-out preserves the measured bypass; new rings use confined credentials. Removing the guard makes the focused regression fail for the missing refusal. Hidden registered rings, descriptors in flight, and concurrent changes remain documented limits. Implemented and tested; not independently reviewed or released.
+
+## M11 — interception for unmodified programs
+
+Prioritized after the initial M6 static-binary profile. Design: [RFC 0015](docs/rfcs/0015-dynamic-interception.md), implemented and CI-tested in [#127](https://github.com/farming-labs/fsgate/pull/127) with explicit runtime grants selected by the maintainer. The compatibility targets are dynamically linked glibc programs on Linux x86_64. Local packaged release tests pass on Linux 6.18.60, and the declared CI kernel matrix passes. Merge and release are pending.
+
+- [ ] Inspect the interpreter in a held ELF image with bounded, non-executing parsing. Acceptance: native static/PIE and dynamic layouts are distinguished, malformed headers/interpreters are refused, and the existing launcher still refuses dynamic execution until the complete profile is ready. Implemented locally: eight focused host tests pass in the checkout and unpacked release-mode crate; all 145 host tests pass, and Linux x86_64 interception clippy passes. The parser is also covered by the local packaged Linux release tests; merge evidence is pending.
+- [ ] Settle runtime grants and loader identity. Acceptance: the selected policy, runtime/data overlap rules, symlink behavior, audit attribution, and lifecycle are documented; runtime resolution and interpreter replacement have real filesystem tests.
+- [ ] Implement measured loader and command syscall compatibility. Acceptance: focused fixtures cover every added syscall form, including metadata results, denials, cancellation, and invalid memory where applicable.
+- [ ] Launch unmodified dynamic programs through the API and CLI. Acceptance: the release build of the packaged source runs the dynamic C fixture and unmodified `cat`, `wc`, and `sha256sum` on the declared kernels, with exact output and no denied side effects. The static suite and unsupported-host checks still pass.
+
+Local M11 evidence (2026-11-17): 146 host tests pass; host and Linux x86_64
+interception clippy pass; the CLI fuzz oracle compiles. In a disposable Linux
+6.18.60-0-virt VM, the unpacked crate's optimized build passes 94 tests: 44 library
+unit tests, 12 interception tests, 30 static-launch tests, and eight dynamic-launch
+tests. Two existing static-worker refusal tests are ignored on this supported
+boot; both pass separately on the same kernel booted with `lsm=capability`,
+asserting API/CLI startup refusal and absent marker files. They are not counted
+in the 94 supported-kernel passes. Dynamic tests compare exact API/CLI output
+with unconfined GNU
+`cat`, `wc`, and `sha256sum`, and cover grant refusal, metadata copies, denied
+writes without side effects, revocation, child lifetime, and cleanup. See the
+[RFC's environment and remaining checks](docs/rfcs/0015-dynamic-interception.md#local-verification).
+
+CI acceptance on `f8adfdb`: all 20 [CI jobs](https://github.com/farming-labs/fsgate/actions/runs/44244752940)
+and four [fuzz jobs](https://github.com/farming-labs/fsgate/actions/runs/44244753071)
+passed. All eight dynamic-launch tests pass on the runner's kernel with stable
+Rust and Rust 1.85.0, and from the packaged release build on Linux 6.6.162,
+6.12.117, and 7.3.3. Each supported kernel also passes the new unreaped-worker
+exit regression and the existing refusal tests in a separate no-Landlock boot.
+The command tests identify GNU coreutils explicitly. The automated review check
+was neutral because its monthly quota was exhausted; it did not review this
+change. Boxes remain open until merge. The feature is not released or
+independently reviewed.
 
 ## Out of scope for v1
 
