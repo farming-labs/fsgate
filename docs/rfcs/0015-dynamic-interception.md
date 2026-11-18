@@ -255,13 +255,11 @@ refused. Its trace showed a size query before the data open; granting metadata
 through the same READ resolver made that unchanged output comparison pass.
 
 Host `cargo test --locked` passes 146 tests; host and Linux x86_64 feature clippy,
-formatting, and the CLI argument fuzz target's compile check pass. A fuzz run
-and independent review have not been performed. Full acceptance on the declared
-CI kernels, their unsupported-host suite, and a glibc-linked supervisor remains
-pending the compatibility corrections below. Existing static cancellation tests
-pass, as does a deterministic metadata cancellation test that requires `EINTR`
-and an untouched result buffer.
-The feature remains experimental and unpublished.
+formatting, and the CLI argument fuzz target's compile check pass. Subsequent
+CI execution, including fuzz jobs, is recorded below. An independent review has
+not been performed. Existing static cancellation tests pass, as does a
+deterministic metadata cancellation test that requires `EINTR` and an untouched
+result buffer. The feature remains experimental and unpublished.
 
 ### CI compatibility corrections
 
@@ -279,5 +277,20 @@ The regression `an_unreaped_worker_exit_ends_supervision_without_listener_hangup
 uses a real exited child and pidfd beside a quiet, held socket to reproduce that
 lifecycle on newer kernels. In the Linux 6.18.60 VM it failed with `TimedOut`
 before pidfd polling and passed unchanged afterward, also asserting that the
-child was still waitable. This is focused regression evidence; the corrected
-full command suite and declared kernel matrix still require CI acceptance.
+child was still waitable. The corrected full command suite and declared kernel
+matrix subsequently passed as recorded below.
+
+### CI acceptance
+
+On `f8adfdb`, all 20 [CI jobs](https://github.com/farming-labs/fsgate/actions/runs/44244752940)
+and four [fuzz jobs](https://github.com/farming-labs/fsgate/actions/runs/44244753071)
+passed. The GNU command comparisons and all eight dynamic-launch tests pass
+with the glibc-linked supervisor on the runner's kernel under stable Rust and
+Rust 1.85.0, and from the packaged release build on Linux 6.6.162, 6.12.117, and
+7.3.3. Each of those kernel jobs also passes the unreaped-worker regression and,
+in a separate no-Landlock boot, the existing startup refusal tests. Ignored
+no-Landlock cases in a supported boot are not counted as passes.
+
+The automated review check was neutral because its monthly review quota was
+exhausted. This is tested implementation evidence, not an independent review,
+merge, release, or a claim of compatibility beyond the declared profile.
