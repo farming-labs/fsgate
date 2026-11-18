@@ -358,7 +358,16 @@ The experimental launcher runs dynamically linked glibc programs on Linux x86_64
 - [x] Inspect the interpreter in a held ELF image with bounded, non-executing parsing. Acceptance: native static/PIE and dynamic layouts are distinguished, malformed headers/interpreters are refused, and the existing launcher still refuses dynamic execution until the complete profile is ready.
 - [x] Settle runtime grants and loader identity. Acceptance: the selected policy, runtime/data overlap rules, symlink behavior, audit attribution, and lifecycle are documented; runtime resolution and interpreter replacement have real filesystem tests.
 - [x] Implement measured loader and command syscall compatibility. Acceptance: focused fixtures cover every added syscall form, including metadata results, denials, cancellation, and invalid memory where applicable.
-- [ ] Launch unmodified dynamic programs through the API and CLI. Acceptance: the release build of the packaged source runs the dynamic C fixture and unmodified `cat`, `wc`, and `sha256sum` on the declared kernels, with exact output and no denied side effects. The static suite and unsupported-host checks still pass. The C fixture passed through the API. Its CLI output check, `cli_runs_the_dynamic_c_fixture`, still needs a passing packaged run on the supported kernels.
+- [x] Launch unmodified dynamic programs through the API and CLI. Acceptance: the release build of the packaged source runs the dynamic C fixture and unmodified `cat`, `wc`, and `sha256sum` on the declared kernels, with exact output and no denied side effects. The static suite and unsupported-host checks still pass.
+
+  On `41b310d`, all nine dynamic-launch tests passed from the unpacked crate's
+  release build on [Linux 6.6.162](https://github.com/farming-labs/fsgate/actions/runs/44410968876/job/135178672378),
+  [6.12.117](https://github.com/farming-labs/fsgate/actions/runs/44410968876/job/135178672294),
+  and [7.3.3](https://github.com/farming-labs/fsgate/actions/runs/44410968876/job/135178672408).
+  The new test, `cli_runs_the_dynamic_c_fixture`, ran the C fixture through the
+  built CLI with explicit runtime grants and a read-only data grant. It checked
+  the exit status and the exact stdout, `ok\n`. The GNU command comparisons
+  passed through both the API and the CLI in the same runs.
 
 Local M11 evidence (2026-11-17): 146 host tests pass; host and Linux x86_64
 interception clippy pass; the CLI fuzz oracle compiles. In a disposable Linux
