@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.6.0 (unreleased)
+## 0.6.0 (2026-11-19)
 
-Prepared for the next minor release; not yet tagged or published. Not independently reviewed. Three defaults change: Linux locks inspect visible pre-existing `io_uring` resources, confined workers receive terminals for output only, and socket brokers refuse ambiguous peer identities. The entries below describe migration and the new procfs requirements. Everything behind `experimental-intercept` remains outside the release: its source is packaged, but the feature refuses to compile outside the repository.
+[`fsgate` 0.6.0](https://crates.io/crates/fsgate/0.6.0) was published from the signed tag [`v0.6.0`](https://github.com/farming-labs/fsgate/tree/v0.6.0) at `61cf0dc`. Independent security review remains open. Linux locks inspect visible pre-existing `io_uring` resources, confined workers receive terminals for output only, and socket brokers refuse ambiguous peer identities. The entries below describe migration and the new procfs requirements. Everything behind `experimental-intercept` remains outside the release: its source is packaged, but the feature refuses to compile outside the repository.
 
 ### Changed
 
