@@ -14,9 +14,9 @@ fsgate scopes a process's filesystem authority to directories granted up front. 
 
 ## Scope
 
-The prepared review target is [`d349cd248c702bede8db29272f61c7fba6c69d2d`](https://github.com/farming-labs/fsgate/commit/d349cd248c702bede8db29272f61c7fba6c69d2d) on `main`. Record that full SHA in the report. If the reviewer selects a later commit, record the new scope and evidence rather than treating this handoff as a review of it. It has all four of the broker's designs: the worker confinement of [RFC 0008](rfcs/0008-confine-broker-worker.md), the worker's Unix socket filter before Linux 7.1 ([RFC 0009](rfcs/0009-worker-unix-sockets.md)), its process group ([RFC 0010](rfcs/0010-worker-process-group.md)), and the audit of what the broker refuses ([RFC 0011](rfcs/0011-audit-broker-refusals.md)). It also has the fixes from an internal review at `ea159a6` ([#100](https://github.com/farming-labs/fsgate/pull/100) to [#106](https://github.com/farming-labs/fsgate/pull/106)), two of which change the API: a nested grant must hold every right of the grant around it ([RFC 0012](rfcs/0012-nested-grants.md)), and `read_dir` returns names and types ([RFC 0013](rfcs/0013-read-dir-entries.md)). They are released in 0.5.0: the signed tag `v0.5.0` on `af142c4` has the four designs and those fixes. 0.4.1 has the four designs and not those fixes. 0.3.0 has only the first design. 0.4.0 has all four, but its socket filter let a raw Unix socket pair through, which 0.4.1 fixes ([#93](https://github.com/farming-labs/fsgate/pull/93)). `3eaf312` adds one more change to the confined worker, not released yet: it gets a terminal on its standard streams for output only, unless `fsgate-broker` is given `--terminal` ([#117](https://github.com/farming-labs/fsgate/pull/117), [RFC 0008](rfcs/0008-confine-broker-worker.md#the-terminal)). `b4d56e5` also makes a socket broker refuse to serve when it would admit the overflow uid in a user namespace with unmapped uids ([#121](https://github.com/farming-labs/fsgate/pull/121), [RFC 0007](rfcs/0007-broker-peers.md#changes-after-release)). That change is unreleased too, and requires readable procfs files and a kernel built with `CONFIG_USER_NS=y` when checking peer identities on Linux or Android. Read the threat model from the commit under review.
+Review the published [`fsgate` 0.6.0](https://crates.io/crates/fsgate/0.6.0) at commit [`61cf0dc58e3bbb2ccce489850b807e483fa5db32`](https://github.com/farming-labs/fsgate/commit/61cf0dc58e3bbb2ccce489850b807e483fa5db32), the commit signed as [`v0.6.0`](https://github.com/farming-labs/fsgate/tree/v0.6.0). Record that full SHA in the report. If the reviewer selects a later commit, record the new scope and evidence rather than treating this handoff as a review of it. It has all four of the broker's designs: the worker confinement of [RFC 0008](rfcs/0008-confine-broker-worker.md), the worker's Unix socket filter before Linux 7.1 ([RFC 0009](rfcs/0009-worker-unix-sockets.md)), its process group ([RFC 0010](rfcs/0010-worker-process-group.md)), and the audit of what the broker refuses ([RFC 0011](rfcs/0011-audit-broker-refusals.md)). It also has the fixes from an internal review at `ea159a6` ([#100](https://github.com/farming-labs/fsgate/pull/100) to [#106](https://github.com/farming-labs/fsgate/pull/106)), two of which change the API: a nested grant must hold every right of the grant around it ([RFC 0012](rfcs/0012-nested-grants.md)), and `read_dir` returns names and types ([RFC 0013](rfcs/0013-read-dir-entries.md)). They are released in 0.5.0: the signed tag `v0.5.0` on `af142c4` has the four designs and those fixes. 0.4.1 has the four designs and not those fixes. 0.3.0 has only the first design. 0.4.0 has all four, but its socket filter let a raw Unix socket pair through, which 0.4.1 fixes ([#93](https://github.com/farming-labs/fsgate/pull/93)). In 0.6.0 a confined worker gets a terminal on its standard streams for output only, unless `fsgate-broker` is given `--terminal` ([#117](https://github.com/farming-labs/fsgate/pull/117), [RFC 0008](rfcs/0008-confine-broker-worker.md#the-terminal)). `b4d56e5` also makes a socket broker refuse to serve when it would admit the overflow uid in a user namespace with unmapped uids ([#121](https://github.com/farming-labs/fsgate/pull/121), [RFC 0007](rfcs/0007-broker-peers.md#changes-after-release)). This check shipped in 0.6.0 and requires readable procfs files and a kernel built with `CONFIG_USER_NS=y` when checking peer identities on Linux or Android. Read the threat model from the commit under review.
 
-The target also includes the unreleased pre-lock `io_uring` inspection
+The target also includes the pre-lock `io_uring` inspection
 ([#123](https://github.com/farming-labs/fsgate/pull/123),
 [RFC 0014](rfcs/0014-lock-io-uring-rings.md)). Both Linux lock policies
 refuse detectable existing rings and inspection failures before applying
@@ -24,8 +24,7 @@ containment, unless the caller explicitly opts out. This is a trusted-setup
 precondition, not another kernel restriction. The target includes the signal-scope tests from
 [#116](https://github.com/farming-labs/fsgate/pull/116).
 
-The 0.6.0 candidate includes the prepared version and changelog
-([#125](https://github.com/farming-labs/fsgate/pull/125)), the broker quickstart
+The release includes the broker quickstart
 ([#126](https://github.com/farming-labs/fsgate/pull/126)), and dynamic program
 support for the experimental launcher ([#127](https://github.com/farming-labs/fsgate/pull/127)).
 The launcher is outside this review's scope. Its changes in shared files add
@@ -67,7 +66,7 @@ Needs Rust 1.85 or later, and [cargo-deny](https://github.com/EmbarkStudios/carg
 ```sh
 git clone https://github.com/farming-labs/fsgate
 cd fsgate
-git switch --detach d349cd248c702bede8db29272f61c7fba6c69d2d
+git switch --detach 61cf0dc58e3bbb2ccce489850b807e483fa5db32
 git rev-parse HEAD
 cargo fmt --all --check
 cargo test --locked
@@ -86,7 +85,12 @@ The `kernels` job in [`ci.yml`](../.github/workflows/ci.yml) boots Linux 6.1.192
 
 ## Existing evidence for the prepared target
 
-[CI on the target commit](https://github.com/farming-labs/fsgate/actions/runs/44396604505)
+The [release workflow](https://github.com/farming-labs/fsgate/actions/runs/44438265600)
+verified the uploaded and downloaded crate against the registry checksum,
+`52eb31b3c7b79d4ebfb1253bd083a4c895e33f382ca97f4a9de552ee0b99496e`.
+The archive's `.cargo_vcs_info.json` records the review target above.
+
+[CI on the target commit](https://github.com/farming-labs/fsgate/actions/runs/44421385273)
 passed all 20 jobs. It includes the default and experimental-feature
 suites, Rust 1.85.0, macOS, Linux x86_64 and arm64, dependency policy,
 workflow checks, distro smoke tests, and the declared kernel matrix.

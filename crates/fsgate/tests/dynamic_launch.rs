@@ -57,6 +57,18 @@ impl Fixture {
         launch.arg(op).arg(path);
         launch
     }
+
+    fn cli(&self, executable: &Path) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fsgate-broker"));
+        command
+            .args(["--experimental-intercept", "--grant"])
+            .arg(format!("{}:r", self.data.display()));
+        for path in runtime_paths(executable) {
+            command.arg("--runtime").arg(path);
+        }
+        command.args(["--apply", "--"]).arg(executable);
+        command
+    }
 }
 
 fn gnu_command(name: &str) -> PathBuf {
@@ -132,21 +144,7 @@ fn ordinary_glibc_commands_match_their_unconfined_output() {
             String::from_utf8_lossy(&outcome.stderr)
         );
         assert_eq!(outcome.stdout, control.stdout, "{name}");
-        let mut cli = Command::new(env!("CARGO_BIN_EXE_fsgate-broker"));
-        cli.args([
-            "--experimental-intercept",
-            "--grant",
-            &format!("{}:r", fixture.data.display()),
-        ]);
-        for path in runtime_paths(&executable) {
-            cli.arg("--runtime").arg(path);
-        }
-        let outcome = cli
-            .args(["--apply", "--"])
-            .arg(&executable)
-            .arg(&input)
-            .output()
-            .unwrap();
+        let outcome = fixture.cli(&executable).arg(&input).output().unwrap();
         assert!(
             outcome.status.success(),
             "CLI {name}: {}",
@@ -154,6 +152,23 @@ fn ordinary_glibc_commands_match_their_unconfined_output() {
         );
         assert_eq!(outcome.stdout, control.stdout, "CLI {name}");
     }
+}
+
+#[test]
+fn cli_runs_the_dynamic_c_fixture() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .cli(&fixture.worker)
+        .arg("metadata")
+        .arg(fixture.data.join("input"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"ok\n");
 }
 
 #[test]

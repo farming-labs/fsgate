@@ -192,7 +192,7 @@ Started. No part of fsgate has had an independent security review. These are the
 
   Maintainer decision (2026-11-10): the review is set aside for now, and work moves to [M10](#m10--battle-tested-tests). This item stays open, and the README keeps saying fsgate is unreviewed.
 
-  Preparation resumed (2026-11-17): the maintainer requested the independent-review handoff. The prepared target is `d349cd248c702bede8db29272f61c7fba6c69d2d`, the 0.6.0 candidate, including the pre-lock `io_uring` inspection and the signal-scope tests. The review brief names the current source, existing CI evidence, known limits, and required findings record. No reviewer is assigned and no independent findings or dispositions exist yet, so this item remains open.
+  The independent-review handoff targets the signed [`v0.6.0`](https://github.com/farming-labs/fsgate/tree/v0.6.0) release at `61cf0dc58e3bbb2ccce489850b807e483fa5db32`, including the pre-lock `io_uring` inspection and the signal-scope tests. The review brief names the current source, existing CI evidence, known limits, and required findings record. No reviewer is assigned and no independent findings or dispositions exist yet, so this item remains open.
 - [x] Release 0.2.0 through the trusted-publishing workflow, its first real run (signed tag [`v0.2.0`](https://github.com/farming-labs/fsgate/tree/v0.2.0), [`fsgate` 0.2.0](https://crates.io/crates/fsgate/0.2.0); preparation in [PR #50](https://github.com/farming-labs/fsgate/pull/50)). Acceptance: the release job's verify step matches the uploaded, crates.io, and downloaded checksums and the `.cargo_vcs_info.json` commit. Before tagging, record two maintainer decisions here: whether 0.2.0 waits for M6 and the review, and whether it includes the `experimental-intercept` feature.
 
   Maintainer decisions:
@@ -355,12 +355,21 @@ Order: the model-based tests first, because they cover the most code on both pla
 
 ## M11 — interception for unmodified programs
 
-Prioritized after the initial M6 static-binary profile. Design: [RFC 0015](docs/rfcs/0015-dynamic-interception.md), implemented and CI-tested in [#127](https://github.com/farming-labs/fsgate/pull/127) with explicit runtime grants selected by the maintainer. The compatibility targets are dynamically linked glibc programs on Linux x86_64. Local packaged release tests pass on Linux 6.18.60, and the declared CI kernel matrix passes. Merge and release are pending.
+The experimental launcher runs dynamically linked glibc programs on Linux x86_64 with explicitly granted runtime files and directories. [RFC 0015](docs/rfcs/0015-dynamic-interception.md) records the design. [#127](https://github.com/farming-labs/fsgate/pull/127) merged the implementation at `d349cd2`.
 
-- [ ] Inspect the interpreter in a held ELF image with bounded, non-executing parsing. Acceptance: native static/PIE and dynamic layouts are distinguished, malformed headers/interpreters are refused, and the existing launcher still refuses dynamic execution until the complete profile is ready. Implemented locally: eight focused host tests pass in the checkout and unpacked release-mode crate; all 145 host tests pass, and Linux x86_64 interception clippy passes. The parser is also covered by the local packaged Linux release tests; merge evidence is pending.
-- [ ] Settle runtime grants and loader identity. Acceptance: the selected policy, runtime/data overlap rules, symlink behavior, audit attribution, and lifecycle are documented; runtime resolution and interpreter replacement have real filesystem tests.
-- [ ] Implement measured loader and command syscall compatibility. Acceptance: focused fixtures cover every added syscall form, including metadata results, denials, cancellation, and invalid memory where applicable.
-- [ ] Launch unmodified dynamic programs through the API and CLI. Acceptance: the release build of the packaged source runs the dynamic C fixture and unmodified `cat`, `wc`, and `sha256sum` on the declared kernels, with exact output and no denied side effects. The static suite and unsupported-host checks still pass.
+- [x] Inspect the interpreter in a held ELF image with bounded, non-executing parsing. Acceptance: native static/PIE and dynamic layouts are distinguished, malformed headers/interpreters are refused, and the existing launcher still refuses dynamic execution until the complete profile is ready.
+- [x] Settle runtime grants and loader identity. Acceptance: the selected policy, runtime/data overlap rules, symlink behavior, audit attribution, and lifecycle are documented; runtime resolution and interpreter replacement have real filesystem tests.
+- [x] Implement measured loader and command syscall compatibility. Acceptance: focused fixtures cover every added syscall form, including metadata results, denials, cancellation, and invalid memory where applicable.
+- [x] Launch unmodified dynamic programs through the API and CLI. Acceptance: the release build of the packaged source runs the dynamic C fixture and unmodified `cat`, `wc`, and `sha256sum` on the declared kernels, with exact output and no denied side effects. The static suite and unsupported-host checks still pass.
+
+  On `41b310d`, all nine dynamic-launch tests passed from the unpacked crate's
+  release build on [Linux 6.6.162](https://github.com/farming-labs/fsgate/actions/runs/44410968876/job/135178672378),
+  [6.12.117](https://github.com/farming-labs/fsgate/actions/runs/44410968876/job/135178672294),
+  and [7.3.3](https://github.com/farming-labs/fsgate/actions/runs/44410968876/job/135178672408).
+  The new test, `cli_runs_the_dynamic_c_fixture`, ran the C fixture through the
+  built CLI with explicit runtime grants and a read-only data grant. It checked
+  the exit status and the exact stdout, `ok\n`. The GNU command comparisons
+  passed through both the API and the CLI in the same runs.
 
 Local M11 evidence (2026-11-17): 146 host tests pass; host and Linux x86_64
 interception clippy pass; the CLI fuzz oracle compiles. In a disposable Linux
@@ -383,8 +392,11 @@ Rust and Rust 1.85.0, and from the packaged release build on Linux 6.6.162,
 exit regression and the existing refusal tests in a separate no-Landlock boot.
 The command tests identify GNU coreutils explicitly. The automated review check
 was neutral because its monthly quota was exhausted; it did not review this
-change. Boxes remain open until merge. The feature is not released or
-independently reviewed.
+change.
+
+All 20 [CI jobs on the merge commit](https://github.com/farming-labs/fsgate/actions/runs/44396604505)
+passed. Each of the three supported kernel jobs passed all eight dynamic-launch
+tests. The feature remains experimental and available only in repository builds.
 
 ## Out of scope for v1
 
