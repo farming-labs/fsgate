@@ -1,6 +1,6 @@
 # RFC 0014: `io_uring` rings set up before `lock()`
 
-- Status: accepted; implemented and tested; not independently reviewed or released
+- Status: accepted, tested, and released in [0.6.0](../../CHANGELOG.md#060-2026-11-19). Independent review is pending.
 - Date: 2026-11-17
 - Roadmap: [M10](../../ROADMAP.md#m10--battle-tested-tests)
 - Builds on: [RFC 0006](0006-lock-restrictions.md) (restrictions at `lock()`), [ADR 0002](../decisions/0002-landlock-not-seccomp-for-paths.md) (seccomp's job), [RFC 0009](0009-worker-unix-sockets.md) (the worker's seccomp filter), the [threat model](../threat-model.md#2-the-locked-process-linux)
@@ -170,9 +170,9 @@ limit. B does not prove that the process holds no pre-lock credentials.
 
 The implementation uses the separate options setting above to preserve
 RFC 0006's distinction between kernel restrictions and preconditions.
-The old proposal to skip an unavailable procfs check is withdrawn. This is
-a breaking default and must ship in a minor release with migration notes;
-this decision does not authorize a release.
+The maintainer withdrew the proposal to skip the check when procfs is
+unavailable and required a minor release with migration notes. Release
+approval was a separate decision.
 
 ## Testing
 
@@ -231,6 +231,5 @@ Locally on macOS, `cargo fmt --all --check`, host and Linux cross-target
 Clippy with warnings denied, and Linux rustdoc with warnings denied passed.
 `cargo test --locked --target-dir /private/tmp/fsgate-deathsig-verify`
 passed 137 tests. Linux behavior was executed in CI, not on this host.
-Hidden-ring cases and deliberately misleading procfs mounts remain limits,
-not verified containment claims. No independent security review or release
-has occurred for this change.
+Hidden-ring cases and deliberately misleading procfs mounts remain outside
+the verified containment claims.
