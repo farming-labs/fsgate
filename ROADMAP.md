@@ -191,6 +191,8 @@ Started. No part of fsgate has had an independent security review. These are the
   Preparation: [docs/security-review.md](docs/security-review.md) gives a reviewer the scope, the commands, and what the review has to leave behind. [SECURITY.md](SECURITY.md) and GitHub's private vulnerability reporting give anyone a private way to report a bug. No reviewer has been chosen.
 
   Maintainer decision (2026-11-10): the review is set aside for now, and work moves to [M10](#m10--battle-tested-tests). This item stays open, and the README keeps saying fsgate is unreviewed.
+
+  The independent-review handoff targets the signed [`v0.6.0`](https://github.com/farming-labs/fsgate/tree/v0.6.0) release at `61cf0dc58e3bbb2ccce489850b807e483fa5db32`, including the pre-lock `io_uring` inspection and the signal-scope tests. The review brief names the current source, existing CI evidence, known limits, and required findings record. No reviewer is assigned and no independent findings or dispositions exist yet, so this item remains open.
 - [x] Release 0.2.0 through the trusted-publishing workflow, its first real run (signed tag [`v0.2.0`](https://github.com/farming-labs/fsgate/tree/v0.2.0), [`fsgate` 0.2.0](https://crates.io/crates/fsgate/0.2.0); preparation in [PR #50](https://github.com/farming-labs/fsgate/pull/50)). Acceptance: the release job's verify step matches the uploaded, crates.io, and downloaded checksums and the `.cargo_vcs_info.json` commit. Before tagging, record two maintainer decisions here: whether 0.2.0 waits for M6 and the review, and whether it includes the `experimental-intercept` feature.
 
   Maintainer decisions:
