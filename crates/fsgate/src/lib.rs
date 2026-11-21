@@ -1277,10 +1277,13 @@ impl Gate {
             rel.to_path_buf()
         };
         // `normalize` drops a trailing `/` or `/.`, which tells the kernel
-        // the path names a directory. Keep it, so a file there fails as it
-        // would without the gate, and `create` makes no file.
+        // the path names a directory. Keep it as given, so a file there
+        // fails with the errno it would get without the gate (`file/` and
+        // `file/.` differ under `O_CREAT`), and `create` makes no file.
         let bytes = path.as_os_str().as_encoded_bytes();
-        let rel = if bytes.ends_with(b"/") || bytes.ends_with(b"/.") {
+        let rel = if bytes.ends_with(b"/.") {
+            rel.join(".")
+        } else if bytes.ends_with(b"/") {
             rel.join("")
         } else {
             rel

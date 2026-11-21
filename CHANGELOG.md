@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- A path that ends in `/` or `/.` names a directory through the gate, as it does without it. Through 0.6.0 the gate's lexical normalization dropped the ending, so `Gate::open("…/file/")` read the file and `Gate::create("…/new/")` created a regular file named `new`, where `open(2)` fails with `ENOTDIR` or `EISDIR`. Now `open` and `metadata` fail as `std::fs` does on the same path. `create` fails and makes nothing: with `std`'s errno on Linux, and with `EINVAL` from cap-std on macOS. Found in an internal review of 0.6.0.
+- A path that ends in `/` or `/.` names a directory through the gate, as it does without it. Through 0.6.0 the gate's lexical normalization dropped the ending, so `Gate::open("…/file/")` read the file and `Gate::create("…/new/")` created a regular file named `new`, where `open(2)` fails with `ENOTDIR` or `EISDIR`. Now `open` and `metadata` fail as `std::fs` does on the same path. `create` fails and makes nothing, with `std`'s errno, except that on macOS cap-std fails `create("…/new/")` with `EINVAL`. Found in an internal review of 0.6.0.
 
 ## 0.6.0 (2026-11-19)
 

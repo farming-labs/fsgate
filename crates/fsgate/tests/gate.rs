@@ -1004,9 +1004,9 @@ fn a_trailing_slash_names_a_directory() {
             let expected = std_create(path);
             eprintln!("create {}: {created:?}, std {expected:?}", path.display());
             // Linux's `openat2` fails as `open` does. On macOS cap-std
-            // resolves the path itself and fails a create that names a
-            // directory with `EINVAL`.
-            if cfg!(target_os = "linux") {
+            // resolves the path itself and fails a create whose path ends
+            // in `/` with `EINVAL`.
+            if cfg!(target_os = "linux") || tail == "/." {
                 assert_eq!(created, expected, "create {}", path.display());
             } else {
                 assert!(created.is_some(), "create {}", path.display());
