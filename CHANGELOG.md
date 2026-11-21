@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A lock that fails in a Landlock syscall records that call's errno in its audit event, as [RFC 0002](docs/rfcs/0002-audit-events.md) specifies for a failed syscall. Through 0.6.0 the event read `reason: unsupported` with `errno: null` whether the kernel lacked Landlock or `landlock_restrict_self` failed, for example with `E2BIG` past 16 stacked rulesets. `GateError::LockFailed` was unaffected and always carried the error. Found in an internal review of 0.6.0.
+
 ## 0.6.0 (2026-11-19)
 
 [`fsgate` 0.6.0](https://crates.io/crates/fsgate/0.6.0) was published from the signed tag [`v0.6.0`](https://github.com/farming-labs/fsgate/tree/v0.6.0) at `61cf0dc`. Independent security review remains open. Linux locks inspect visible pre-existing `io_uring` resources, confined workers receive terminals for output only, and socket brokers refuse ambiguous peer identities. The entries below describe migration and the new procfs requirements. Everything behind `experimental-intercept` remains outside the release: its source is packaged, but the feature refuses to compile outside the repository.

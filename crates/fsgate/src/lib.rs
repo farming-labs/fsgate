@@ -831,6 +831,9 @@ impl Gate {
                     GateError::IoUringInspection { source, .. } => {
                         (AuditReason::IoUring, source.raw_os_error())
                     }
+                    GateError::LockFailed { source } => {
+                        (AuditReason::Unsupported, os_errno(source.as_ref()))
+                    }
                     _ => (AuditReason::Unsupported, None),
                 };
                 self.emit(
@@ -1455,6 +1458,23 @@ fn with_escape_errno(err: io::Error) -> io::Error {
     } else {
         err
     }
+}
+
+/// The OS error number behind `err`, from the first [`io::Error`] in its
+/// source chain that has one. A lock that fails in a syscall wraps that
+/// call's `io::Error` in the `landlock` crate's own error types.
+fn os_errno(err: &(dyn std::error::Error + 'static)) -> Option<i32> {
+    let mut next = Some(err);
+    while let Some(err) = next {
+        if let Some(errno) = err
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::raw_os_error)
+        {
+            return Some(errno);
+        }
+        next = err.source();
+    }
+    None
 }
 
 /// The identities of `dir` and of each directory above it, nearest first,
