@@ -559,3 +559,61 @@ fn a_refused_nested_grant_or_narrow_is_one_deny_event() {
         assert_eq!(value["reason"], "nested_grant");
     }
 }
+
+/// A sink that panics on every event of one operation.
+struct PanicsOn(AuditOp);
+
+impl AuditSink for PanicsOn {
+    fn event(&self, event: &AuditEvent) {
+        if event.op == self.0 {
+            panic!("the sink failed on {:?}", event.op);
+        }
+    }
+}
+
+/// A sink's panic unwinds out of the gate call. A grant is added only after
+/// its event returns, so a panic there leaves no grant behind that the
+/// caller has no handle for and could never revoke. A revoke or narrow has
+/// already taken effect when its event goes out, which only removes
+/// authority.
+#[test]
+fn a_sink_that_panics_leaves_no_authority_without_a_handle() {
+    let (_root, granted, _) = setup();
+    let all = Rights::READ | Rights::WRITE | Rights::CREATE;
+    let created = granted.join("created.txt");
+    let panics = |gate: &mut Gate, call: &mut dyn FnMut(&mut Gate)| {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(gate)));
+        assert!(result.is_err(), "the sink did not panic");
+    };
+
+    let mut gate = Gate::new();
+    gate.set_audit_sink(Arc::new(PanicsOn(AuditOp::Grant)));
+    panics(&mut gate, &mut |gate| {
+        let _ = gate.grant(&granted, all);
+    });
+    let err = gate.create(&created).unwrap_err();
+    assert!(matches!(err, GateError::NoGrant { .. }), "got {err:?}");
+    assert!(!created.exists(), "the grant survived the panic");
+
+    let mut gate = Gate::new();
+    gate.set_audit_sink(Arc::new(PanicsOn(AuditOp::Revoke)));
+    let grant = gate.grant(&granted, all).unwrap();
+    panics(&mut gate, &mut |gate| {
+        let _ = gate.revoke(grant);
+    });
+    let err = gate.create(&created).unwrap_err();
+    assert!(matches!(err, GateError::NoGrant { .. }), "got {err:?}");
+
+    let mut gate = Gate::new();
+    gate.set_audit_sink(Arc::new(PanicsOn(AuditOp::Narrow)));
+    let grant = gate.grant(&granted, all).unwrap();
+    panics(&mut gate, &mut |gate| {
+        let _ = gate.narrow(grant, Rights::READ);
+    });
+    let err = gate.create(&created).unwrap_err();
+    assert!(
+        matches!(err, GateError::RightsExceeded { .. }),
+        "got {err:?}"
+    );
+    assert!(!created.exists(), "a narrowed grant created a file");
+}
