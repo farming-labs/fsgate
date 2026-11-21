@@ -867,3 +867,106 @@ fn interception_mode_is_a_usage_error_without_the_feature() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("interception mode"));
     assert!(output.stdout.is_empty());
 }
+
+/// A worker that sends a request and hangs up before the answer ends only
+/// its own connection, and a broker that has gone fails only the worker's
+/// request, even in a process where `SIGPIPE` kills, as an embedder may
+/// set it. The Rust runtime ignores `SIGPIPE`, so the checks run in a
+/// child of this test that sets it back to its default action.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_peer_that_hangs_up_does_not_kill_the_other_side() {
+    use std::os::unix::process::ExitStatusExt;
+
+    if std::env::var_os("FSGATE_TEST_SIGPIPE").is_some() {
+        return sigpipe::run();
+    }
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "a_peer_that_hangs_up_does_not_kill_the_other_side",
+            "--nocapture",
+        ])
+        .env("FSGATE_TEST_SIGPIPE", "1")
+        .output()
+        .expect("run the child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "the child ended with {:?} (signal {:?}): {stdout}\n{}",
+        output.status,
+        output.status.signal(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod sigpipe {
+    use super::*;
+
+    /// Restores `SIGPIPE`'s default action, which ends the process.
+    #[allow(unsafe_code)]
+    fn kill_on_sigpipe() {
+        // SAFETY: `signal` with `SIG_DFL` installs no handler; it only
+        // changes this child's disposition for `SIGPIPE`, and nothing in
+        // the child relies on that signal being ignored.
+        let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+        assert_ne!(previous, libc::SIG_ERR, "signal failed");
+    }
+
+    pub(super) fn run() {
+        kill_on_sigpipe();
+        let (_root, granted, _) = setup();
+        let gate = || {
+            let mut gate = Gate::new();
+            gate.grant(&granted, Rights::READ | Rights::LIST).unwrap();
+            gate
+        };
+
+        // An `open` answer carries a descriptor and a `metadata` answer
+        // does not, so they are sent differently.
+        for op in ["open", "metadata"] {
+            let body = serde_json::json!({ "op": op, "path": granted.join("a.txt") }).to_string();
+            let (served, mut worker) = UnixStream::pair().unwrap();
+            worker
+                .write_all(&frame(u32::try_from(body.len()).unwrap(), body.as_bytes()))
+                .unwrap();
+            drop(worker);
+            let err = Broker::new(gate()).serve_conn(served).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::BrokenPipe, "{op}: {err}");
+        }
+
+        // A worker that hangs up in the middle of a listing larger than the
+        // socket's buffer: the broker is already sending when it goes.
+        let big = granted.join("big");
+        fs::create_dir(&big).unwrap();
+        for i in 0..3000 {
+            fs::write(big.join(format!("{i:0>200}")), b"").unwrap();
+        }
+        let body = serde_json::json!({ "op": "read_dir", "path": &big }).to_string();
+        let (served, mut worker) = UnixStream::pair().unwrap();
+        let broker = thread::spawn({
+            let gate = gate();
+            move || Broker::new(gate).serve_conn(served)
+        });
+        worker
+            .write_all(&frame(u32::try_from(body.len()).unwrap(), body.as_bytes()))
+            .unwrap();
+        let mut length = [0; 4];
+        worker.read_exact(&mut length).unwrap();
+        assert!(
+            u32::from_le_bytes(length) > 500_000,
+            "the listing is too small"
+        );
+        drop(worker);
+        let err = broker.join().unwrap().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::BrokenPipe, "mid-answer: {err}");
+
+        let (client, broker) = UnixStream::pair().unwrap();
+        drop(broker);
+        let err = BrokerGate::from_stream(client)
+            .metadata(granted.join("a.txt"))
+            .unwrap_err();
+        assert!(matches!(err, GateError::Broker { .. }), "got {err:?}");
+    }
+}

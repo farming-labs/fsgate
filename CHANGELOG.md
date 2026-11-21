@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- No broker send raises `SIGPIPE`. Through 0.6.0, `Broker` and `BrokerGate` wrote frames with `write`, so in a process where `SIGPIPE` has its default action, which Rust programs change but C hosts and some embedders keep, a worker that hung up before its answer killed the whole broker, and every other worker's connection with it. A peer that hangs up now fails only its connection with `BrokenPipe`: Linux sends with `MSG_NOSIGNAL`, and macOS sets `SO_NOSIGPIPE` on the socket. Found in an internal review of 0.6.0.
+
 ## 0.6.0 (2026-11-19)
 
 [`fsgate` 0.6.0](https://crates.io/crates/fsgate/0.6.0) was published from the signed tag [`v0.6.0`](https://github.com/farming-labs/fsgate/tree/v0.6.0) at `61cf0dc`. Independent security review remains open. Linux locks inspect visible pre-existing `io_uring` resources, confined workers receive terminals for output only, and socket brokers refuse ambiguous peer identities. The entries below describe migration and the new procfs requirements. Everything behind `experimental-intercept` remains outside the release: its source is packaged, but the feature refuses to compile outside the repository.
