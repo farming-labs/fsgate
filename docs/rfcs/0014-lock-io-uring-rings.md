@@ -157,10 +157,12 @@ caller explicitly opts out. Missing, inaccessible, or unreadable procfs
 fails before applying containment. `BestEffort` still governs only the
 Landlock filesystem floor. Non-Linux behavior does not change.
 
-The check inspects each visible thread's descriptors as well as its name,
-so a thread with a separate descriptor table is covered. It holds procfs
-directory descriptors while walking, verifies that opened entries belong
-to procfs, and treats an incomplete scan as a failure. Callers must keep
+The check inspects each visible thread's descriptors as well as its `stat`
+flags and name, so a thread with a separate descriptor table is covered.
+It holds procfs directory descriptors while walking, verifies that opened
+entries belong to procfs, and fails if it cannot read an entry it listed,
+such as a thread that exits during the scan. A thread or descriptor made
+after its directory was listed is not seen. Callers must keep
 threads and descriptor tables stable during `lock()`; the check is not
 atomic with concurrent ring creation or registration.
 
