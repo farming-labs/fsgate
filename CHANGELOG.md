@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- On Linux, the pre-lock `io_uring` check recognizes an `SQPOLL` thread by the kernel's `PF_IO_WORKER` flag in `/proc/self/task/<tid>/stat`, not by its `iou-sqp-` name. A new polling thread keeps the name of the thread that set the ring up until it first runs, so a registered `SQPOLL` ring whose descriptor was closed just before `lock()` could pass the check, and its thread then opened files outside the grants with the pre-lock credentials. An io-wq worker that has named itself `iou-wrk-<pid>` still does not refuse the lock; one that has not run yet does. `IoUringPresent` now names the thread's `stat` file instead of its `comm`. Found in an internal review of 0.6.0.
+
 ## 0.6.0 (2026-11-19)
 
 [`fsgate` 0.6.0](https://crates.io/crates/fsgate/0.6.0) was published from the signed tag [`v0.6.0`](https://github.com/farming-labs/fsgate/tree/v0.6.0) at `61cf0dc`. Independent security review remains open. Linux locks inspect visible pre-existing `io_uring` resources, confined workers receive terminals for output only, and socket brokers refuse ambiguous peer identities. The entries below describe migration and the new procfs requirements. Everything behind `experimental-intercept` remains outside the release: its source is packaged, but the feature refuses to compile outside the repository.
