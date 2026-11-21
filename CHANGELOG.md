@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `fsgate-broker --socket` passes the socket's absolute path in `FSGATE_BROKER_SOCKET`, and binds that path. Through 0.6.0 a relative `--socket` was passed as given, so a worker that changed directory before connecting reached whatever socket had that name in its new directory, which could be another user's. If the absolute path is too long for a socket address, the broker now exits 1 before starting its command and says to use a shorter path. Found in an internal review of 0.6.0.
+
 ## 0.6.0 (2026-11-19)
 
 [`fsgate` 0.6.0](https://crates.io/crates/fsgate/0.6.0) was published from the signed tag [`v0.6.0`](https://github.com/farming-labs/fsgate/tree/v0.6.0) at `61cf0dc`. Independent security review remains open. Linux locks inspect visible pre-existing `io_uring` resources, confined workers receive terminals for output only, and socket brokers refuse ambiguous peer identities. The entries below describe migration and the new procfs requirements. Everything behind `experimental-intercept` remains outside the release: its source is packaged, but the feature refuses to compile outside the repository.

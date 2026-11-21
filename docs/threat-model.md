@@ -98,7 +98,7 @@ Beyond these chosen cases, `gate_model.rs::the_gate_matches_the_model_and_never_
 
 ## 3. The broker and its worker
 
-A trusted broker holds the `Gate` and serves `BrokerGate` requests over a Unix socket, returning opened files over `SCM_RIGHTS` ([RFC 0003](rfcs/0003-broker-protocol.md)). Without `--socket`, `fsgate-broker` passes the command an inherited connection and names it in `FSGATE_BROKER_FD`. With `--unconfined --socket`, it binds an owner-only socket at that path, starts the command with `FSGATE_BROKER_SOCKET` set, and removes the socket when the command exits. Unless given `--unconfined`, it confines the command on Linux ([RFC 0008](rfcs/0008-confine-broker-worker.md)) and refuses to start it elsewhere.
+A trusted broker holds the `Gate` and serves `BrokerGate` requests over a Unix socket, returning opened files over `SCM_RIGHTS` ([RFC 0003](rfcs/0003-broker-protocol.md)). Without `--socket`, `fsgate-broker` passes the command an inherited connection and names it in `FSGATE_BROKER_FD`. With `--unconfined --socket`, it binds an owner-only socket at that path, starts the command with `FSGATE_BROKER_SOCKET` set to its absolute path, and removes the socket when the command exits. Unless given `--unconfined`, it confines the command on Linux ([RFC 0008](rfcs/0008-confine-broker-worker.md)) and refuses to start it elsewhere.
 
 **Trusts:**
 
