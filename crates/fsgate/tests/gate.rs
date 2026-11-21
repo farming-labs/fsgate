@@ -951,3 +951,61 @@ fn rights_combine_and_print_as_a_set() {
     );
     assert_eq!(format!("{:?}", Rights::from_bits_truncate(0)), "(none)");
 }
+
+/// On macOS `/dev/fd/N` is a devfs entry, not a symlink: opening it
+/// duplicates the process's own descriptor `N`, with that descriptor's file
+/// and access mode. A grant covering `/dev` must not hand out a descriptor
+/// the process holds for a file outside every grant, or one open for more
+/// than the gate asked for.
+#[cfg(target_os = "macos")]
+#[test]
+fn dev_fd_beneath_a_grant_does_not_hand_out_a_held_descriptor() {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    let outside = tempfile::tempdir().unwrap();
+    let path = outside.path().join("state.txt");
+    fs::write(&path, b"untouched").unwrap();
+    let read_write = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let read_only = fs::File::open(&path).unwrap();
+
+    let mut gate = Gate::new();
+    gate.grant("/dev", Rights::READ | Rights::WRITE | Rights::CREATE)
+        .unwrap();
+
+    for held in [read_write.as_raw_fd(), read_only.as_raw_fd()] {
+        let node = format!("/dev/fd/{held}");
+        // Before the fix, this returned a descriptor for the file outside,
+        // writable when the held one was.
+        if let Ok(mut file) = gate.open(&node) {
+            let _ = file.write_all(b"OVERWRIT");
+            panic!("open handed out descriptor {held}");
+        }
+        assert_is_escape(&gate.open(&node).unwrap_err());
+    }
+    assert_is_escape(
+        &gate
+            .create(format!("/dev/fd/{}", read_write.as_raw_fd()))
+            .unwrap_err(),
+    );
+    // The kernel itself refuses to open a read-only descriptor for writing.
+    let GateError::Io { source, .. } = gate
+        .create(format!("/dev/fd/{}", read_only.as_raw_fd()))
+        .unwrap_err()
+    else {
+        panic!("expected an I/O error");
+    };
+    assert_eq!(
+        source.raw_os_error(),
+        Some(rustix::io::Errno::ACCESS.raw_os_error())
+    );
+    assert_eq!(fs::read(&path).unwrap(), b"untouched");
+
+    // The control: a device opened by its own name still works.
+    gate.open("/dev/null").unwrap();
+    gate.create("/dev/null").unwrap();
+}
