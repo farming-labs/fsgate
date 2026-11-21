@@ -1338,7 +1338,11 @@ mod kernel {
             let mut gate = granted_gate();
             let audit = std::sync::Arc::new(RingAudit::default());
             gate.set_audit_sink(audit.clone());
-            match gate.lock() {
+            // After the first lock, procfs is outside the grants, so the
+            // `io_uring` check that reads it would refuse every later lock
+            // before the kernel is asked. This process has no ring.
+            let options = LockOptions::default().allow_existing_io_uring(layers > 0);
+            match gate.lock_with(options) {
                 Ok(status) => assert_eq!(status, LockStatus::FullyEnforced),
                 Err(err) => break (err, gate, audit),
             }
