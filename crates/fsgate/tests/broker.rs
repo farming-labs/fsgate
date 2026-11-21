@@ -695,6 +695,9 @@ fn a_relative_socket_path_reaches_the_broker_from_any_directory() {
     // address, the broker says so and starts nothing.
     let deep = base.join("d".repeat(100));
     fs::create_dir(&deep).unwrap();
+    // Under `umask 000`, as in CI's VMs, a new directory is writable by
+    // others, and the broker would refuse it for that first.
+    fs::set_permissions(&deep, fs::Permissions::from_mode(0o700)).unwrap();
     let output = run(&deep);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
