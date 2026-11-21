@@ -1276,6 +1276,15 @@ impl Gate {
         } else {
             rel.to_path_buf()
         };
+        // `normalize` drops a trailing `/` or `/.`, which tells the kernel
+        // the path names a directory. Keep it, so a file there fails as it
+        // would without the gate, and `create` makes no file.
+        let bytes = path.as_os_str().as_encoded_bytes();
+        let rel = if bytes.ends_with(b"/") || bytes.ends_with(b"/.") {
+            rel.join("")
+        } else {
+            rel
+        };
         Ok((index, entry, rel, full))
     }
 
@@ -1483,8 +1492,10 @@ fn dir_id(stat: &rustix::fs::Stat) -> DirId {
 }
 
 /// Normalizes an absolute path lexically: resolves `.` and `..` without
-/// touching the filesystem. Symlink behavior is deliberately not modeled
-/// here; the kernel's beneath-handle resolution is what prevents escapes.
+/// touching the filesystem, and drops a trailing `/`, which
+/// [`resolve`](Gate::resolve) puts back. Symlink behavior is deliberately
+/// not modeled here; the kernel's beneath-handle resolution is what
+/// prevents escapes.
 fn normalize(path: &Path) -> Result<PathBuf, GateError> {
     if !path.is_absolute() {
         return Err(GateError::NotAbsolute {
