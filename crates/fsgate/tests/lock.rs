@@ -1571,7 +1571,13 @@ mod kernel {
 
     #[test]
     fn visible_io_uring_resources_are_refused_before_locking() {
-        for mode in ["plain", "personality", "sqpoll", "registered-sqpoll"] {
+        for mode in [
+            "plain",
+            "personality",
+            "sqpoll",
+            "registered-sqpoll",
+            "renamed-sqpoll",
+        ] {
             let (_root, granted, outside) = dirs();
             run_child(
                 "io_uring_refusal_child",
@@ -1595,7 +1601,7 @@ mod kernel {
             ring.register_personality().unwrap();
         }
         let secret = format!("{}/secret.txt", std::env::var("FSGATE_OUTSIDE").unwrap());
-        let ring = if mode == "registered-sqpoll" {
+        let ring = if mode.ends_with("-sqpoll") {
             // Completion proves that the polling thread has started and
             // named itself before its descriptor disappears.
             drop(
@@ -1603,6 +1609,18 @@ mod kernel {
                     .unwrap(),
             );
             ring.register_and_close().unwrap();
+            if mode == "renamed-sqpoll" {
+                // From when the polling thread becomes visible until it
+                // first runs, it has the name of the thread that set the
+                // ring up. Giving it that name again shows the same state
+                // without racing it.
+                let own = fs::read("/proc/thread-self/comm").unwrap();
+                let own = own.strip_suffix(b"\n").unwrap_or(&own);
+                let polling = tasks_named(b"iou-sqp-");
+                assert_eq!(polling.len(), 1, "one polling thread");
+                fs::write(polling[0].join("comm"), own).unwrap();
+                assert!(tasks_named(b"iou-sqp-").is_empty());
+            }
             None
         } else {
             Some(ring)
@@ -1636,6 +1654,44 @@ mod kernel {
             lock_and_prove(&mut gate);
         }
         eprintln!("io_uring_refusal_child: checked {mode}");
+    }
+
+    /// This process's threads whose name starts with `prefix`.
+    fn tasks_named(prefix: &[u8]) -> Vec<PathBuf> {
+        fs::read_dir("/proc/self/task")
+            .unwrap()
+            .map(|task| task.unwrap().path())
+            .filter(|task| fs::read(task.join("comm")).unwrap().starts_with(prefix))
+            .collect()
+    }
+
+    /// An io-wq worker runs each request with the credentials of whoever
+    /// submitted it, and one can stay idle after its ring is closed. It
+    /// does not keep `lock()` from succeeding.
+    #[test]
+    fn an_idle_io_wq_worker_does_not_prevent_locking() {
+        let (_root, granted, outside) = dirs();
+        run_locked("idle_worker_child", &granted, &outside);
+    }
+
+    #[test]
+    fn idle_worker_child() {
+        if child_mode("idle_worker_child").is_none() {
+            return;
+        }
+        let ring = raw_uring::Ring::new(false).expect("io_uring enabled for this test");
+        let secret = format!("{}/secret.txt", std::env::var("FSGATE_OUTSIDE").unwrap());
+        // The worker names itself before it runs the open.
+        drop(
+            ring.open_with(&std::ffi::CString::new(secret).unwrap(), None, true)
+                .unwrap(),
+        );
+        drop(ring);
+        let workers = tasks_named(b"iou-wrk-").len();
+        eprintln!("idle_worker_child: {workers} io-wq workers after the ring closed");
+        assert!(workers > 0, "no io-wq worker stayed after the ring closed");
+        let mut gate = granted_gate();
+        lock_and_prove(&mut gate);
     }
 
     #[test]
@@ -1767,9 +1823,9 @@ mod kernel {
         use rustix::io::Errno;
         use rustix::io_uring::{
             IORING_OFF_CQ_RING, IORING_OFF_SQ_RING, IORING_OFF_SQES, IoringEnterFlags, IoringOp,
-            IoringRegisterOp, IoringSetupFlags, addr_or_splice_off_in_union, io_uring_cqe,
-            io_uring_enter, io_uring_params, io_uring_ptr, io_uring_register, io_uring_setup,
-            io_uring_sqe, op_flags_union,
+            IoringRegisterOp, IoringSetupFlags, IoringSqeFlags, addr_or_splice_off_in_union,
+            io_uring_cqe, io_uring_enter, io_uring_params, io_uring_ptr, io_uring_register,
+            io_uring_setup, io_uring_sqe, op_flags_union,
         };
         use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
 
@@ -1901,6 +1957,17 @@ mod kernel {
                 path: &CStr,
                 personality: Option<u16>,
             ) -> Result<OwnedFd, Errno> {
+                self.open_with(path, personality, false)
+            }
+
+            /// [`open`](Ring::open), handed to an io-wq worker with
+            /// `IOSQE_ASYNC` if `worker`.
+            pub(super) fn open_with(
+                &self,
+                path: &CStr,
+                personality: Option<u16>,
+                worker: bool,
+            ) -> Result<OwnedFd, Errno> {
                 let sq_off = &self.params.sq_off;
                 let cq_off = &self.params.cq_off;
 
@@ -1914,6 +1981,11 @@ mod kernel {
                         open_flags: OFlags::RDONLY | OFlags::CLOEXEC,
                     },
                     personality: personality.unwrap_or(0),
+                    flags: if worker {
+                        IoringSqeFlags::ASYNC
+                    } else {
+                        IoringSqeFlags::empty()
+                    },
                     ..Default::default()
                 };
 
