@@ -668,7 +668,8 @@ impl Gate {
     /// from the held descriptors, so a symlink or another spelling of the
     /// path does not hide it. Each grant's place is recorded when it is
     /// made: a directory moved into another grant later, or reached through
-    /// a bind mount, is not caught.
+    /// a bind mount or a macOS firmlink (such as `/Users` from a grant on
+    /// `/System/Volumes/Data`), is not caught.
     ///
     /// [RFC 0012]: https://github.com/farming-labs/fsgate/blob/main/docs/rfcs/0012-nested-grants.md
     pub fn grant(&mut self, path: impl AsRef<Path>, rights: Rights) -> Result<Grant, GateError> {

@@ -584,6 +584,58 @@ fn a_directory_moved_into_another_grant_later_is_not_rechecked() {
     assert!(granted.join("moved/new.txt").exists());
 }
 
+/// macOS keeps user data on a volume mounted at `/System/Volumes/Data` and
+/// firmlinks directories such as `/private` and `/Users` from it into `/`.
+/// `..` from a firmlinked directory leads to `/`, so a grant on the data
+/// volume never appears among the directories above a grant beneath a
+/// firmlink, and its rights reach that grant's directory by the other path.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_grant_on_the_data_volume_reaches_a_firmlinked_grant_inside_it() {
+    use std::os::unix::fs::MetadataExt;
+
+    let data = Path::new("/System/Volumes/Data");
+    for data_first in [false, true] {
+        let (_root, granted, _) = setup();
+        let real = fs::canonicalize(&granted).unwrap();
+        let mut aliased = data.as_os_str().to_owned();
+        aliased.push(real.as_os_str());
+        let aliased = PathBuf::from(aliased);
+        // Without the alias this test would prove nothing, so fail instead.
+        let (a, b) = (
+            fs::metadata(&real).unwrap(),
+            fs::metadata(&aliased).unwrap(),
+        );
+        assert_eq!(
+            (a.dev(), a.ino()),
+            (b.dev(), b.ino()),
+            "{} is not {} on this machine",
+            aliased.display(),
+            real.display()
+        );
+
+        let mut gate = Gate::new();
+        let outer = Rights::READ | Rights::WRITE | Rights::CREATE;
+        if data_first {
+            gate.grant(data, outer).unwrap();
+            gate.grant(&real, Rights::READ).unwrap();
+        } else {
+            gate.grant(&real, Rights::READ).unwrap();
+            gate.grant(data, outer).unwrap();
+        }
+
+        let err = gate.create(real.join("direct.txt")).unwrap_err();
+        assert!(
+            matches!(err, GateError::RightsExceeded { .. }),
+            "got {err:?}"
+        );
+        assert!(!real.join("direct.txt").exists());
+
+        gate.create(aliased.join("aliased.txt")).unwrap();
+        assert!(real.join("aliased.txt").exists());
+    }
+}
+
 #[test]
 fn relative_paths_are_rejected() {
     let (_root, granted, _) = setup();
