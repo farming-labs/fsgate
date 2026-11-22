@@ -658,6 +658,69 @@ fn a_socket_is_owner_only_whatever_the_umask() {
     assert_eq!(mode, 0o600, "socket mode was {mode:o}");
 }
 
+/// A relative `--socket` names a file in the broker's directory, but a
+/// worker may change directory before it connects, and would then reach
+/// whatever socket has that name where it is. The broker passes the
+/// absolute path, so the worker reaches the broker from anywhere.
+#[test]
+fn a_relative_socket_path_reaches_the_broker_from_any_directory() {
+    let (root, granted, _) = setup();
+    let base = root.path().canonicalize().unwrap();
+    let elsewhere = base.join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    let run = |dir: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_fsgate-broker"))
+            .current_dir(dir)
+            .arg("--unconfined")
+            .args(["--grant", &format!("{}:r", granted.display())])
+            .args(["--socket", "broker.sock", "--"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "relative_socket_worker", "--nocapture"])
+            .env("FSGATE_TEST_ELSEWHERE", &elsewhere)
+            .env("FSGATE_TEST_GRANTED", &granted)
+            .output()
+            .expect("run fsgate-broker")
+    };
+
+    let output = run(&base);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "the worker failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!base.join("broker.sock").exists(), "the socket was left");
+
+    // From a directory whose absolute path is too long for a socket
+    // address, the broker says so and starts nothing.
+    let deep = base.join("d".repeat(100));
+    fs::create_dir(&deep).unwrap();
+    // Under `umask 000`, as in CI's VMs, a new directory is writable by
+    // others, and the broker would refuse it for that first.
+    fs::set_permissions(&deep, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = run(&deep);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("use a shorter one"), "{stderr}");
+    // The worker, this test binary, prints `running 1 test` as it starts.
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("running"));
+}
+
+/// The worker for `a_relative_socket_path_reaches_the_broker_from_any_directory`,
+/// which `fsgate-broker` starts. In a normal test run it does nothing.
+#[test]
+fn relative_socket_worker() {
+    let Some(elsewhere) = std::env::var_os("FSGATE_TEST_ELSEWHERE") else {
+        return;
+    };
+    let granted = PathBuf::from(std::env::var_os("FSGATE_TEST_GRANTED").unwrap());
+    let socket = PathBuf::from(std::env::var_os("FSGATE_BROKER_SOCKET").unwrap());
+    std::env::set_current_dir(elsewhere).unwrap();
+    let mut client = BrokerGate::connect(&socket).unwrap();
+    assert!(client.metadata(granted.join("a.txt")).unwrap().is_file);
+    assert!(socket.is_absolute(), "{}", socket.display());
+}
+
 /// Workers find the broker by its socket path, so a directory along it that
 /// another user can change would let them put their own socket there. The
 /// broker refuses such a path before it binds or starts its command. A

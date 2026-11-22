@@ -18,8 +18,10 @@ server-side and fails closed when the broker is gone.
 A `SOCK_STREAM` Unix domain socket. Without `--socket`, the `fsgate-broker`
 binary passes the child an inherited socketpair and names it in
 `FSGATE_BROKER_FD` ([RFC 0007](0007-broker-peers.md)). With `--socket`, it
-publishes the socket's path in `FSGATE_BROKER_SOCKET`. Embedders may pass
-their own socketpair to `BrokerGate::from_stream`.
+publishes the socket's absolute path in `FSGATE_BROKER_SOCKET`, so a worker
+that changes directory still finds it. Through 0.6.0 a relative path was
+passed as given; an internal review at `61cf0dc` found it. Embedders may
+pass their own socketpair to `BrokerGate::from_stream`.
 
 ### Framing
 

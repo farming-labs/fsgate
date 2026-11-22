@@ -27,8 +27,9 @@
 //!
 //! `--unconfined` starts the child with this process's own environment and
 //! filesystem access. `--socket`, which needs it, creates an owner-only
-//! socket at that path and passes the path in `FSGATE_BROKER_SOCKET`. It
-//! refuses a path through a directory another user could change.
+//! socket at that path and passes its absolute path in
+//! `FSGATE_BROKER_SOCKET`. It refuses a path through a directory another
+//! user could change.
 //!
 //! Experimental interception mode (RFC 0004; built with the
 //! `experimental-intercept` feature, Linux x86_64 only, unsupported):
@@ -387,10 +388,19 @@ fn run(args: SocketArgs) -> Result<ExitCode, String> {
     let gate = gate_from(&args.grants)?;
 
     check_socket_path(&args.socket)?;
-    let listener = bind_owner_only(&args.socket).map_err(|err| {
+    // A worker may change directory before it connects, so it gets the
+    // absolute path, and the broker binds that same path.
+    let socket = std::path::absolute(&args.socket)
+        .map_err(|err| format!("`--socket {}`: {err}", args.socket.display()))?;
+    let listener = bind_owner_only(&socket).map_err(|err| {
+        let remedy = if err.raw_os_error() == Some(rustix::io::Errno::NAMETOOLONG.raw_os_error()) {
+            "workers get the absolute path, so use a shorter one"
+        } else {
+            "remove a stale socket file first"
+        };
         format!(
-            "binding socket `{}` failed: {err}; remove a stale socket file first",
-            args.socket.display()
+            "binding socket `{}` failed: {err}; {remedy}",
+            socket.display()
         )
     })?;
 
@@ -403,27 +413,27 @@ fn run(args: SocketArgs) -> Result<ExitCode, String> {
                 if let Err(err) = broker.serve(&listener) {
                     eprintln!(
                         "fsgate-broker: serving `{}` failed: {err}; workers now fail closed",
-                        args.socket.display()
+                        socket.display()
                     );
-                    let _ = fs::remove_file(&args.socket);
+                    let _ = fs::remove_file(&socket);
                     std::process::exit(1);
                 }
             })
             .map_err(|err| {
-                let _ = fs::remove_file(&args.socket);
+                let _ = fs::remove_file(&socket);
                 format!(
                     "starting the thread that serves `{}` failed: {err}",
-                    args.socket.display()
+                    socket.display()
                 )
             })?;
 
         let status = Command::new(&args.command[0])
             .args(&args.command[1..])
-            .env("FSGATE_BROKER_SOCKET", &args.socket)
+            .env("FSGATE_BROKER_SOCKET", &socket)
             .status()
             .map_err(|err| format!("spawning `{}` failed: {err}", args.command[0]));
 
-        let _ = std::fs::remove_file(&args.socket);
+        let _ = std::fs::remove_file(&socket);
         match status {
             // The serve thread still blocks in accept(); exit now that the
             // child is done, taking its code.
