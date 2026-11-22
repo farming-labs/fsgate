@@ -753,10 +753,18 @@ fn a_socket_path_others_could_replace_is_refused() {
     let open = dir(base.join("open"), 0o777);
     let group = dir(base.join("group"), 0o770);
     let beneath = dir(open.join("mine"), 0o700);
+    // `safe/entry` leads through `open/hop` back to `safe/real`. Neither
+    // the path as written nor where it ends up names `open`, but whoever
+    // can write to `open` can point `hop` at their own socket.
+    let safe = dir(base.join("safe"), 0o700);
+    let real = dir(safe.join("real"), 0o700);
+    std::os::unix::fs::symlink(&real, open.join("hop")).unwrap();
+    std::os::unix::fs::symlink("../open/hop", safe.join("entry")).unwrap();
     for (socket, named) in [
         (open.join("broker.sock"), &open),
         (group.join("broker.sock"), &group),
         (beneath.join("broker.sock"), &open),
+        (safe.join("entry/broker.sock"), &open),
     ] {
         let output = run(&socket);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -774,14 +782,74 @@ fn a_socket_path_others_could_replace_is_refused() {
         assert!(!marker.exists(), "the broker started its command");
     }
 
+    // A sticky directory, and a link of this user's in one that leads to
+    // a directory only this user can change, are fine.
     let sticky = dir(base.join("sticky"), 0o1777);
-    let output = run(&sticky.join("broker.sock"));
+    std::os::unix::fs::symlink(&real, sticky.join("link")).unwrap();
+    for socket in [sticky.join("broker.sock"), sticky.join("link/broker.sock")] {
+        let output = run(&socket);
+        assert!(
+            output.status.success(),
+            "{}: {}",
+            socket.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(marker.exists(), "the broker did not start its command");
+        fs::remove_file(&marker).unwrap();
+    }
+}
+
+/// In a sticky directory, as `/tmp` is, whoever owns an entry can delete
+/// it and make another in its place. A socket path through a symlink that
+/// another user owns there is refused, even when the link leads to a
+/// directory only this user can change. Making that link needs root.
+#[test]
+#[ignore = "needs passwordless `sudo`; CI's check and macos jobs run it"]
+fn a_socket_path_through_another_users_link_is_refused() {
+    let (root, granted, outside) = setup();
+    let base = root.path().canonicalize().unwrap();
+    let marker = outside.join("ran");
+    let sticky = base.join("sticky");
+    let safe = base.join("safe");
+    fs::create_dir(&sticky).unwrap();
+    fs::set_permissions(&sticky, fs::Permissions::from_mode(0o1777)).unwrap();
+    fs::create_dir(&safe).unwrap();
+    let link = sticky.join("theirs");
+    let sudo = |args: &[&std::ffi::OsStr]| {
+        let status = Command::new("sudo")
+            .arg("--non-interactive")
+            .args(args)
+            .status()
+            .expect("run `sudo`");
+        assert!(status.success(), "sudo {args:?}: {status}");
+    };
+    sudo(&["ln".as_ref(), "-s".as_ref(), safe.as_ref(), link.as_ref()]);
+    sudo(&[
+        "chown".as_ref(),
+        "-h".as_ref(),
+        "nobody".as_ref(),
+        link.as_ref(),
+    ]);
+
+    let socket = link.join("broker.sock");
+    let output = Command::new(env!("CARGO_BIN_EXE_fsgate-broker"))
+        .arg("--unconfined")
+        .args(["--grant", &format!("{}:r", granted.display())])
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--")
+        .arg("touch")
+        .arg(&marker)
+        .output()
+        .expect("run fsgate-broker");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        stderr.contains(&format!("`{}`", link.display())),
+        "{stderr}"
     );
-    assert!(marker.exists(), "the broker did not start its command");
+    assert!(!safe.join("broker.sock").exists(), "the broker bound it");
+    assert!(!marker.exists(), "the broker started its command");
 }
 
 /// macOS keeps an access list beside a file's mode bits, and an entry in
