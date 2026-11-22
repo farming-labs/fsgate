@@ -246,72 +246,121 @@ fn run_inherited(
 
 /// Refuses a socket path that another user could replace. Workers find the
 /// broker by this path, so whoever can rename an entry along it can put
-/// their own socket there. Every directory the path passes through, before
-/// and after resolving symlinks, must belong to this user or root, and
-/// must not be writable by others unless it is sticky, as `/tmp` is. On
-/// macOS its access list must not allow anyone to add, delete, or rename
-/// entries, or to change the list, mode, or owner, since the mode bits do
-/// not show that list. On Linux an access list's mask is the group bits,
-/// which the mode check reads.
+/// their own socket there. The path is resolved one entry at a time, as
+/// the kernel does, so a directory reached only partway through a chain
+/// of symlinks is checked too. Every directory and symlink it passes
+/// through must belong to this user or root: in a sticky directory, an
+/// entry's owner can replace it. Every directory must not be writable by
+/// others unless it is sticky, as `/tmp` is. On macOS its access list must
+/// not allow anyone to add, delete, or rename entries, or to change the
+/// list, mode, or owner, since the mode bits do not show that list. On
+/// Linux an access list's mask is the group bits, which the mode check
+/// reads.
 fn check_socket_path(socket: &Path) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
 
-    let refuse = |dir: &Path, why: &str| {
+    // Linux's limit on the symlinks one lookup follows.
+    const MAX_LINKS: usize = 40;
+
+    let refuse = |entry: &Path, why: &str| {
         format!(
             "`--socket {}`: `{}` {why}, so another user could replace the socket; \
              use a directory that only you and root can change",
             socket.display(),
-            dir.display()
+            entry.display()
         )
     };
+    let failed = |entry: &Path, err: io::Error| {
+        format!(
+            "`--socket {}`: `{}`: {err}",
+            socket.display(),
+            entry.display()
+        )
+    };
+    let me = rustix::process::geteuid().as_raw();
+    let mut checked: Vec<PathBuf> = Vec::new();
+    let mut check_dir = |dir: &Path, meta: &fs::Metadata| -> Result<(), String> {
+        if checked.iter().any(|seen| seen == dir) {
+            return Ok(());
+        }
+        if meta.uid() != me && meta.uid() != 0 {
+            return Err(refuse(dir, "belongs to another user"));
+        }
+        if meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0 {
+            return Err(refuse(dir, "is writable by other users and not sticky"));
+        }
+        #[cfg(target_os = "macos")]
+        if acl::lets_anyone_change_entries(dir).map_err(|err| {
+            format!(
+                "`--socket {}`: reading the access list of `{}` failed: {err}",
+                socket.display(),
+                dir.display()
+            )
+        })? {
+            return Err(refuse(
+                dir,
+                "has an access list that lets others change its entries (`chmod -N` removes it)",
+            ));
+        }
+        checked.push(dir.to_path_buf());
+        Ok(())
+    };
+
     let absolute = std::path::absolute(socket)
         .map_err(|err| format!("`--socket {}`: {err}", socket.display()))?;
     let parent = absolute
         .parent()
         .ok_or_else(|| format!("`--socket {}` names no file", socket.display()))?;
-    let me = rustix::process::geteuid().as_raw();
-    let mut checked = Vec::new();
-    for prefix in parent.ancestors() {
-        let resolved = fs::canonicalize(prefix).map_err(|err| {
-            format!(
-                "`--socket {}`: `{}`: {err}",
-                socket.display(),
-                prefix.display()
-            )
-        })?;
-        for dir in resolved.ancestors() {
-            if checked.iter().any(|seen: &PathBuf| seen == dir) {
-                continue;
+    // `dir` is where the walk has reached, with no symlink in it, and
+    // `rest` is what is left to resolve from there.
+    let mut dir = PathBuf::new();
+    let mut rest = parent.to_path_buf();
+    let mut links = 0;
+    loop {
+        let mut components = rest.components();
+        let Some(component) = components.next() else {
+            break;
+        };
+        let remaining = components.as_path().to_path_buf();
+        match component {
+            Component::RootDir => {
+                dir = PathBuf::from("/");
+                let meta = fs::symlink_metadata(&dir).map_err(|err| failed(&dir, err))?;
+                check_dir(&dir, &meta)?;
             }
-            let meta = fs::metadata(dir).map_err(|err| {
-                format!(
-                    "`--socket {}`: `{}`: {err}",
-                    socket.display(),
-                    dir.display()
-                )
-            })?;
-            if meta.uid() != me && meta.uid() != 0 {
-                return Err(refuse(dir, "belongs to another user"));
+            Component::ParentDir => {
+                dir.pop();
             }
-            if meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0 {
-                return Err(refuse(dir, "is writable by other users and not sticky"));
+            Component::Normal(name) => {
+                let entry = dir.join(name);
+                let meta = fs::symlink_metadata(&entry).map_err(|err| failed(&entry, err))?;
+                if meta.file_type().is_symlink() {
+                    if meta.uid() != me && meta.uid() != 0 {
+                        return Err(refuse(&entry, "is a symlink that belongs to another user"));
+                    }
+                    links += 1;
+                    if links > MAX_LINKS {
+                        return Err(failed(&entry, rustix::io::Errno::LOOP.into()));
+                    }
+                    let target = fs::read_link(&entry).map_err(|err| failed(&entry, err))?;
+                    if target.as_os_str().is_empty() {
+                        return Err(failed(&entry, io::ErrorKind::NotFound.into()));
+                    }
+                    // A relative target resolves from the link's directory,
+                    // which `dir` still is.
+                    rest = target.join(remaining);
+                    continue;
+                }
+                if !meta.is_dir() {
+                    return Err(failed(&entry, io::ErrorKind::NotADirectory.into()));
+                }
+                check_dir(&entry, &meta)?;
+                dir = entry;
             }
-            #[cfg(target_os = "macos")]
-            if acl::lets_anyone_change_entries(dir).map_err(|err| {
-                format!(
-                    "`--socket {}`: reading the access list of `{}` failed: {err}",
-                    socket.display(),
-                    dir.display()
-                )
-            })? {
-                return Err(refuse(
-                    dir,
-                    "has an access list that lets others change its entries (`chmod -N` removes \
-                     it)",
-                ));
-            }
-            checked.push(dir.to_path_buf());
+            Component::CurDir | Component::Prefix(_) => {}
         }
+        rest = remaining;
     }
     Ok(())
 }
