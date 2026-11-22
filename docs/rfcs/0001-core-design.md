@@ -45,7 +45,7 @@ Naming follows fixed verb jobs: `grant` confers authority, `lock` applies contai
 
 ### Resolution
 
-1. Normalize the requested path lexically (no filesystem access).
+1. Normalize the requested path lexically (no filesystem access). A trailing `/` or `/.` is kept for step 4, where it makes the open require a directory, as it would without the gate. Through 0.6.0 it was dropped, so `open("file/")` read the file and `create("new/")` made a file named `new`; an internal review at `61cf0dc` found it.
 2. Find the longest granted prefix. No grant → `GateError::NoGrant`.
 3. Check the operation against the grant's `Rights`. Insufficient → `GateError::RightsExceeded`.
 4. Open the remainder relative to the grant's descriptor with `openat2(2)` and `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS` (via cap-std). The kernel, not the prefix match in step 2, is what prevents escapes: a symlink or `..` that leaves the grant fails at the syscall.
