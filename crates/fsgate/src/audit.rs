@@ -126,7 +126,8 @@ pub enum AuditReason {
     NotAbsolute,
     /// The gate was already locked.
     Locked,
-    /// Kernel containment was unavailable or failed to apply.
+    /// Kernel containment was unavailable or failed to apply. When a
+    /// syscall failed, the event's `errno` holds its error number.
     Unsupported,
     /// A pre-lock io_uring resource was found or inspection failed.
     IoUring,

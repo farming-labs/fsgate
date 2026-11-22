@@ -1319,6 +1319,52 @@ mod kernel {
         (std::env::var("FSGATE_GRANTED").unwrap(), secret)
     }
 
+    /// Landlock stacks at most 16 rulesets on a thread, so a lock past that
+    /// fails at its last call, `landlock_restrict_self`, with `E2BIG`. RFC
+    /// 0002 records a failed syscall's errno in the event.
+    #[test]
+    fn a_lock_the_kernel_refuses_records_its_errno() {
+        let (_root, granted, outside) = dirs();
+        run_locked("stacked_lock_child", &granted, &outside);
+    }
+
+    #[test]
+    fn stacked_lock_child() {
+        if child_mode("stacked_lock_child").is_none() {
+            return;
+        }
+        let mut layers = 0;
+        let (err, gate, audit) = loop {
+            let mut gate = granted_gate();
+            let audit = std::sync::Arc::new(RingAudit::default());
+            gate.set_audit_sink(audit.clone());
+            // After the first lock, procfs is outside the grants, so the
+            // `io_uring` check that reads it would refuse every later lock
+            // before the kernel is asked. This process has no ring.
+            let options = LockOptions::default().allow_existing_io_uring(layers > 0);
+            match gate.lock_with(options) {
+                Ok(status) => assert_eq!(status, LockStatus::FullyEnforced),
+                Err(err) => break (err, gate, audit),
+            }
+            layers += 1;
+            assert!(layers <= 16, "Landlock took more than 16 rulesets");
+        };
+        eprintln!("stacked_lock_child: {layers} locks succeeded, then {err:?}");
+        assert!(layers > 0, "the first lock failed: {err:?}");
+        assert!(matches!(err, GateError::LockFailed { .. }), "{err:?}");
+        assert_eq!(gate.restrictions(), None);
+        let events = audit.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].op, fsgate::AuditOp::Lock);
+        assert_eq!(events[0].decision, fsgate::AuditDecision::Deny);
+        assert_eq!(events[0].reason, fsgate::AuditReason::Unsupported);
+        assert_eq!(events[0].errno, Some(Errno::TOOBIG.raw_os_error()));
+        // Every earlier ruleset still holds.
+        let secret = format!("{}/secret.txt", std::env::var("FSGATE_OUTSIDE").unwrap());
+        let err = fs::read(&secret).expect_err("read outside the grants");
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    }
+
     /// `lock()` requests every restriction and requires none, so it applies
     /// each one this kernel has and skips the rest. The tests above require
     /// the restriction they check, which applies it whatever is requested.
