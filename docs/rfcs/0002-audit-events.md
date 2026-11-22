@@ -48,6 +48,7 @@ pub trait AuditSink: Send + Sync {
 ```
 
 - Delivery is synchronous in the calling thread; the embedder owns buffering and backpressure. fsgate never drops an event itself and never blocks on anything but the sink the embedder installed.
+- A sink that panics unwinds out of the call that made the decision. A grant is added only after its event returns, so the panic leaves no grant the caller holds no handle for. A revoke, narrow, or lock has already taken effect when its event goes out, and each only removes authority. Through 0.6.0 a grant was added first; an internal review at `61cf0dc` found it.
 - The default sink is a no-op. Auditing is opt-in and costs one branch when off.
 - Events are emitted after the decision and before the result returns, so a sink always sees a denial even if the caller swallows the error.
 

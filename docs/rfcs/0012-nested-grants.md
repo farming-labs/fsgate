@@ -50,8 +50,8 @@ the worst outcome was an operation the policy meant to refuse.
 
 ## Non-goals
 
-- Catching a directory that reaches another grant through a bind mount,
-  or one moved into another grant after both were made. Grants record
+- Catching a directory that reaches another grant through a bind mount or
+  a macOS firmlink, or one moved into another grant after both were made. Grants record
   where their directories are when they are made.
 - Enforcing a nested grant's lesser rights. That needs routing by the
   object a path reaches, which RFC 0001 leaves to the kernel and which
@@ -106,7 +106,12 @@ filesystem, gives the same list.
 
 `..` at the root of a mount leads to the directory it is mounted on. So a
 bind mount of `/proj/.git` at `/mnt/git` lists `/mnt` and `/`, not
-`/proj`, and is not caught. A walk deeper than the platform's path limit
+`/proj`, and is not caught. macOS keeps user data on a volume mounted at
+`/System/Volumes/Data` and firmlinks directories such as `/Users` and
+`/private` from it into `/`. `..` from a firmlinked directory leads to `/`
+whichever path opened it, so `/Users/me` lists `/Users` and `/`, and a
+grant on `/System/Volumes/Data`, `/System/Volumes`, or `/System` is not
+caught around it. An internal review at `61cf0dc` found this. A walk deeper than the platform's path limit
 fails with `ENAMETOOLONG`, and the grant fails with it.
 
 ### Audit
@@ -132,8 +137,8 @@ grant the parent read-only and the writable parts beneath it.
 
 ## What this does not stop
 
-- A directory reached through a bind mount, or moved into another grant
-  after both were made.
+- A directory reached through a bind mount or a macOS firmlink, or moved
+  into another grant after both were made.
 - A hard link to a file in an inner grant, made inside the outer grant.
   It is a file in the outer grant, with the outer grant's rights.
 - Through a symlink that stays in a grant, a path can reach a nested

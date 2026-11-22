@@ -15,6 +15,11 @@ use crate::{LockStatus, Restrictions, Rights};
 ///
 /// The embedder owns buffering and backpressure; fsgate calls `event`
 /// inline and never drops an event itself.
+///
+/// If `event` panics, the panic unwinds out of the `Gate` call that made
+/// the decision. A grant is added only after its event returns, so the
+/// panic leaves no grant behind. A revoke, narrow, or lock has already
+/// taken effect when its event goes out, and each only removes authority.
 pub trait AuditSink: Send + Sync {
     /// Called once per decision.
     fn event(&self, event: &AuditEvent);
