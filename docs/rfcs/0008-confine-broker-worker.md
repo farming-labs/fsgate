@@ -184,6 +184,14 @@ as it is, so piped input still reaches the worker. The worker cannot open
 the terminal itself: it has no controlling terminal, so `/dev/tty` fails,
 and its ruleset leaves out `/dev/pts`.
 
+Output only does not cover the terminal's settings. The kernel checks
+`tcsetattr` against the terminal, not the descriptor's mode, and stops a
+background process only from changing its own controlling terminal. So the
+worker can still turn off echo, or turn off `ISIG` so that Ctrl-C and
+Ctrl-Z stop reaching the broker, and the settings outlast it. A terminal
+relay ([alternatives](#alternatives-considered)) would close this. An
+internal review at `61cf0dc` found it.
+
 `--terminal` passes the terminal as it is, for an interactive program the
 user trusts with the keyboard. Like `--direct` and `--env`, it describes a
 confined worker and is refused with `--unconfined`. If a terminal cannot be
@@ -237,6 +245,8 @@ command line keeps working with one added flag. The library and
 - With `--terminal`, the worker's use of the terminal it inherited. It
   leads its own session, so job control does not stop it
   ([above](#the-terminal)).
+- Without `--terminal`, the settings of a terminal passed for output, such
+  as echo and the keys that send signals ([above](#the-terminal)).
 - Any containment on macOS.
 
 ## Testing

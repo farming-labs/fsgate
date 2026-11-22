@@ -263,6 +263,7 @@ mod kernel {
     use fsgate::BrokerGate;
     use rustix::io::FdFlags;
     use rustix::process::{Pid, Signal};
+    use rustix::termios::{LocalModes, OptionalActions};
 
     use super::{assert_ran, broker, confined, fixture, in_child, unconfined};
 
@@ -643,6 +644,11 @@ mod kernel {
     /// could do before. In the unconfined control, the worker shares the
     /// broker's background group, so its read stops that group with
     /// `SIGTTIN` and reads nothing.
+    ///
+    /// Output only does not cover the terminal's settings, a gap the threat
+    /// model lists: the confined worker turns off `ECHO` and `ISIG` through
+    /// its write-only standard output, and they stay off after it exits. In
+    /// the other modes the worker leaves them alone, and they stay on.
     #[test]
     fn a_confined_worker_gets_its_terminal_for_output_only() {
         for mode in ["output-only", "terminal", "unconfined"] {
@@ -755,6 +761,15 @@ mod kernel {
             assert!(exit.success(), "{report}");
             assert!(shown.contains("1 passed"), "{report}");
         }
+        // On a pseudo-terminal's master, `tcgetattr` reads the terminal's own
+        // settings.
+        let keys = LocalModes::ECHO | LocalModes::ISIG;
+        let modes = rustix::termios::tcgetattr(&*master).unwrap().local_modes;
+        if mode == "output-only" {
+            assert!(!modes.intersects(keys), "{modes:?}\n{report}");
+        } else {
+            assert!(modes.contains(keys), "{modes:?}\n{report}");
+        }
     }
 
     #[test]
@@ -779,6 +794,13 @@ mod kernel {
                     "the stream can be read"
                 );
             }
+            // The kernel checks the terminal, not the descriptor's mode, and
+            // only a controlling terminal's settings are kept from a
+            // background process.
+            let mut settings = rustix::termios::tcgetattr(stdout.as_fd()).unwrap();
+            settings.local_modes -= LocalModes::ECHO | LocalModes::ISIG;
+            rustix::termios::tcsetattr(stdout.as_fd(), OptionalActions::Now, &settings)
+                .expect("change the settings of an output-only terminal");
         } else {
             assert_eq!(line, TYPED);
         }
