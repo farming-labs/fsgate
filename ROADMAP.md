@@ -285,6 +285,10 @@ Started. No part of fsgate has had an independent security review. These are the
 
   Evidence: [CI](https://github.com/farming-labs/fsgate/actions/runs/44947839077) on `7e99a3d` passed all 20 jobs; the change is docs only, so the fuzz workflow did not run. Not independently reviewed.
 
+- [x] Document that ioctls on files beneath a grant are not restricted after `lock()` ([#144](https://github.com/farming-labs/fsgate/pull/144)). Found in an internal review at `61cf0dc`: Landlock's `IOCTL_DEV` covers only character and block devices, and the file system checks any other ioctl against the file's owner and mode, not the grant's rights, so the owner of a file beneath a `READ` grant can change its attribute flags through a read-only descriptor. Nothing said so. Acceptance: the threat model and the README name it, and a test shows it.
+
+  Evidence: [CI](https://github.com/farming-labs/fsgate/actions/runs/44948090235) on `105e381` passed all 20 jobs. `lock.rs::kernel::ioctls_on_files_beneath_a_grant_are_not_restricted` passed in `check`, `msrv`, `arm64`, and on Linux 6.6.162, 6.12.117, and 7.3.3: the locked child is refused a write open of the file, sets `FS_NODUMP_FL` with `FS_IOC_SETFLAGS`, and the parent reads the flag back. `IOCTL_DEV` was applied in every job but 6.6, which is below Landlock ABI v5. The change is a test and docs, so the fuzz workflow did not run. Only `FS_IOC_SETFLAGS` is tested. Not independently reviewed.
+
 Order: M8 first, because it changes what `lock()` means for existing users and its `LockStatus` change needs a minor release anyway. Then the threat model and fuzzing, then RFC 0007, then 0.2.0, then RFC 0008 so the reviewer sees the final broker, then 0.3.0 for the `Gate::open` fix, then RFCs 0009 to 0011 and 0.4.0, then 0.4.1 for the raw socket pair, then the internal review's fixes and 0.5.0, then the terminal and peer checks and RFC 0014 in 0.6.0, then the review. M6's tasks are all done ([#35](https://github.com/farming-labs/fsgate/pull/35) closed the last); it remains unreviewed and unreleased.
 
 ## M10 — battle-tested tests

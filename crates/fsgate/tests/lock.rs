@@ -2115,6 +2115,55 @@ mod kernel {
         fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
+    /// Landlock's `IOCTL_DEV` covers character and block devices only. The
+    /// filesystem alone checks an ioctl on a regular file, against the
+    /// file's owner rather than the grant's rights, so the owner can change
+    /// its attribute flags through a descriptor opened read-only beneath a
+    /// `READ` grant.
+    #[test]
+    fn ioctls_on_files_beneath_a_grant_are_not_restricted() {
+        use rustix::fs::{IFlags, ioctl_getflags};
+
+        let (_root, granted, outside) = dirs();
+        let file = granted.join("a.txt");
+        fs::write(&file, b"a").unwrap();
+        let before = ioctl_getflags(fs::File::open(&file).unwrap())
+            .expect("FS_IOC_GETFLAGS on the temporary directory's file system");
+        assert!(!before.contains(IFlags::NODUMP));
+
+        run_locked("file_ioctl_child", &granted, &outside);
+
+        let after = ioctl_getflags(fs::File::open(&file).unwrap()).unwrap();
+        assert_eq!(
+            after,
+            before | IFlags::NODUMP,
+            "the locked child set NODUMP"
+        );
+        assert_eq!(fs::read(&file).unwrap(), b"a");
+    }
+
+    #[test]
+    fn file_ioctl_child() {
+        use rustix::fs::{IFlags, ioctl_getflags, ioctl_setflags};
+
+        if child_mode("file_ioctl_child").is_none() {
+            return;
+        }
+        let mut gate = granted_gate();
+        let (granted, _) = lock_and_prove(&mut gate);
+        eprintln!("file_ioctl_child: applied {:?}", gate.restrictions());
+        let path = format!("{granted}/a.txt");
+        let err = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect_err("a write beneath a READ grant");
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+
+        let file = fs::File::open(&path).unwrap();
+        let flags = ioctl_getflags(&file).unwrap();
+        ioctl_setflags(&file, flags | IFlags::NODUMP).expect("FS_IOC_SETFLAGS after the lock");
+    }
+
     /// Mounts beneath a grant, which the threat model lists among the gaps:
     /// - A file system mounted beneath a grant after `grant()` is reached
     ///   through the gate, which does not refuse crossing a mount point, and
