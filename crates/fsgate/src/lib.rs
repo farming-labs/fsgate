@@ -668,7 +668,8 @@ impl Gate {
     /// from the held descriptors, so a symlink or another spelling of the
     /// path does not hide it. Each grant's place is recorded when it is
     /// made: a directory moved into another grant later, or reached through
-    /// a bind mount, is not caught.
+    /// a bind mount or a macOS firmlink (such as `/Users` from a grant on
+    /// `/System/Volumes/Data`), is not caught.
     ///
     /// [RFC 0012]: https://github.com/farming-labs/fsgate/blob/main/docs/rfcs/0012-nested-grants.md
     pub fn grant(&mut self, path: impl AsRef<Path>, rights: Rights) -> Result<Grant, GateError> {
@@ -739,24 +740,23 @@ impl Gate {
             );
             return Err(err);
         }
+        // The event goes out before the grant is added, so a sink that
+        // panics leaves no grant that the caller has no handle to revoke.
+        let index = self.grants.len();
+        self.emit_rights(
+            AuditOp::Grant,
+            Some(&path),
+            Some(index),
+            rights,
+            AuditDecision::Allow,
+            AuditReason::Ok,
+        );
         self.grants.push(Some(GrantEntry {
             path,
             dir,
             rights,
             ancestry,
         }));
-        let index = self.grants.len() - 1;
-        self.emit_rights(
-            AuditOp::Grant,
-            self.grants[index]
-                .as_ref()
-                .map(|entry| entry.path.clone())
-                .as_deref(),
-            Some(index),
-            rights,
-            AuditDecision::Allow,
-            AuditReason::Ok,
-        );
         Ok(Grant {
             gate: self.id,
             index,
@@ -830,6 +830,9 @@ impl Gate {
                     GateError::IoUringPresent { .. } => (AuditReason::IoUring, None),
                     GateError::IoUringInspection { source, .. } => {
                         (AuditReason::IoUring, source.raw_os_error())
+                    }
+                    GateError::LockFailed { source } => {
+                        (AuditReason::Unsupported, os_errno(source.as_ref()))
                     }
                     _ => (AuditReason::Unsupported, None),
                 };
@@ -1031,7 +1034,8 @@ impl Gate {
         self.gated(AuditOp::Open, path.as_ref(), Rights::READ, |entry, rel| {
             let mut options = cap_std::fs::OpenOptions::new();
             options.read(true);
-            let file = open_without_waiting(&entry.dir, rel, &mut options)?;
+            let file =
+                open_without_waiting(&entry.dir, rel, &mut options, rustix::fs::OFlags::RDONLY)?;
             if file.metadata()?.is_dir() {
                 return Err(rustix::io::Errno::ISDIR.into());
             }
@@ -1127,7 +1131,7 @@ impl Gate {
             |entry, rel| {
                 let mut options = cap_std::fs::OpenOptions::new();
                 options.write(true).create(true).truncate(true);
-                open_without_waiting(&entry.dir, rel, &mut options)
+                open_without_waiting(&entry.dir, rel, &mut options, rustix::fs::OFlags::WRONLY)
             },
         )
     }
@@ -1275,6 +1279,18 @@ impl Gate {
             PathBuf::from(".")
         } else {
             rel.to_path_buf()
+        };
+        // `normalize` drops a trailing `/` or `/.`, which tells the kernel
+        // the path names a directory. Keep it as given, so a file there
+        // fails with the errno it would get without the gate (`file/` and
+        // `file/.` differ under `O_CREAT`), and `create` makes no file.
+        let bytes = path.as_os_str().as_encoded_bytes();
+        let rel = if bytes.ends_with(b"/.") {
+            rel.join(".")
+        } else if bytes.ends_with(b"/") {
+            rel.join("")
+        } else {
+            rel
         };
         Ok((index, entry, rel, full))
     }
@@ -1424,20 +1440,59 @@ struct Notified {
 
 /// Opens `rel` beneath `dir` without waiting, then restores blocking mode.
 /// Opening a FIFO waits for its other end, which would hold the caller, or
-/// a broker's serve thread, until some other process opened it.
+/// a broker's serve thread, until some other process opened it. `access` is
+/// the access mode `options` asks for.
 fn open_without_waiting(
     dir: &cap_std::fs::Dir,
     rel: &Path,
     options: &mut cap_std::fs::OpenOptions,
+    access: rustix::fs::OFlags,
 ) -> io::Result<File> {
     use cap_std::fs::OpenOptionsExt;
     use rustix::fs::OFlags;
 
     let nonblocking = options.custom_flags(OFlags::NONBLOCK.bits() as i32);
     let file = dir.open_with(rel, nonblocking)?.into_std();
+    #[cfg(target_os = "macos")]
+    refuse_held_descriptor(dir, rel, &file, access)?;
+    #[cfg(not(target_os = "macos"))]
+    let _ = access;
     let flags = rustix::fs::fcntl_getfl(&file)?;
     rustix::fs::fcntl_setfl(&file, flags - OFlags::NONBLOCK)?;
     Ok(file)
+}
+
+/// Refuses a descriptor the process already held, reached through macOS's
+/// `/dev/fd/N`, which `/dev/stdin` and the like link to.
+///
+/// `/dev/fd/N` is a devfs entry, not a symlink, so the component walk sees
+/// an ordinary entry beneath the grant. Opening it duplicates descriptor
+/// `N`: the same file, wherever it is, with that descriptor's access mode
+/// and not the one asked for. So the opened file must be the one the path
+/// names when stat'd, which for such an entry reports devfs's device, and
+/// must be open for exactly the access asked for. Either difference is an
+/// escape, `EXDEV`. A device duplicated this way passes the first check,
+/// but only with the access mode a direct open beneath the grant gives.
+#[cfg(target_os = "macos")]
+fn refuse_held_descriptor(
+    dir: &cap_std::fs::Dir,
+    rel: &Path,
+    file: &File,
+    access: rustix::fs::OFlags,
+) -> io::Result<()> {
+    use cap_std::fs::MetadataExt;
+    use rustix::fs::OFlags;
+
+    let opened = rustix::fs::fstat(file)?;
+    let named = dir.metadata(rel)?;
+    // `st_dev` is an `i32` on macOS.
+    let same_file = opened.st_dev as u64 == named.dev() && opened.st_ino == named.ino();
+    let opened_access = rustix::fs::fcntl_getfl(file)? & OFlags::ACCMODE;
+    if same_file && opened_access == access {
+        Ok(())
+    } else {
+        Err(rustix::io::Errno::XDEV.into())
+    }
 }
 
 /// Gives cap-std's refusal of a path that leaves its grant the errno
@@ -1455,6 +1510,23 @@ fn with_escape_errno(err: io::Error) -> io::Error {
     } else {
         err
     }
+}
+
+/// The OS error number behind `err`, from the first [`io::Error`] in its
+/// source chain that has one. A lock that fails in a syscall wraps that
+/// call's `io::Error` in the `landlock` crate's own error types.
+fn os_errno(err: &(dyn std::error::Error + 'static)) -> Option<i32> {
+    let mut next = Some(err);
+    while let Some(err) = next {
+        if let Some(errno) = err
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::raw_os_error)
+        {
+            return Some(errno);
+        }
+        next = err.source();
+    }
+    None
 }
 
 /// The identities of `dir` and of each directory above it, nearest first,
@@ -1483,8 +1555,10 @@ fn dir_id(stat: &rustix::fs::Stat) -> DirId {
 }
 
 /// Normalizes an absolute path lexically: resolves `.` and `..` without
-/// touching the filesystem. Symlink behavior is deliberately not modeled
-/// here; the kernel's beneath-handle resolution is what prevents escapes.
+/// touching the filesystem, and drops a trailing `/`, which
+/// [`resolve`](Gate::resolve) puts back. Symlink behavior is deliberately
+/// not modeled here; the kernel's beneath-handle resolution is what
+/// prevents escapes.
 fn normalize(path: &Path) -> Result<PathBuf, GateError> {
     if !path.is_absolute() {
         return Err(GateError::NotAbsolute {
