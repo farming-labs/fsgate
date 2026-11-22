@@ -739,24 +739,23 @@ impl Gate {
             );
             return Err(err);
         }
+        // The event goes out before the grant is added, so a sink that
+        // panics leaves no grant that the caller has no handle to revoke.
+        let index = self.grants.len();
+        self.emit_rights(
+            AuditOp::Grant,
+            Some(&path),
+            Some(index),
+            rights,
+            AuditDecision::Allow,
+            AuditReason::Ok,
+        );
         self.grants.push(Some(GrantEntry {
             path,
             dir,
             rights,
             ancestry,
         }));
-        let index = self.grants.len() - 1;
-        self.emit_rights(
-            AuditOp::Grant,
-            self.grants[index]
-                .as_ref()
-                .map(|entry| entry.path.clone())
-                .as_deref(),
-            Some(index),
-            rights,
-            AuditDecision::Allow,
-            AuditReason::Ok,
-        );
         Ok(Grant {
             gate: self.id,
             index,
