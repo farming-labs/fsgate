@@ -545,7 +545,8 @@ fn a_request_over_the_size_limit_fails_only_itself() {
 }
 
 /// A body that is not exactly one known request fails the connection
-/// instead of being guessed at, including a path that is not UTF-8.
+/// instead of being guessed at, including a path that is not UTF-8, a
+/// field the protocol does not have, and a field given twice.
 #[test]
 fn a_malformed_request_fails_the_connection_closed() {
     let (_root, granted, _) = setup();
@@ -554,12 +555,22 @@ fn a_malformed_request_fails_the_connection_closed() {
     let mut not_utf8 = valid.clone();
     let inside_path = not_utf8.len() - 3; // the last `t` of `planted.txt`
     not_utf8[inside_path] = 0xff;
+    let unknown_field = serde_json::json!({ "op": "create", "path": &planted, "junk": [[], {}] })
+        .to_string()
+        .into_bytes();
+    let twice = format!(
+        r#"{{"op":"create","path":"/","path":{}}}"#,
+        serde_json::json!(&planted)
+    )
+    .into_bytes();
 
-    let bodies: [&[u8]; 4] = [
+    let bodies: [&[u8]; 6] = [
         &valid[..valid.len() - 1],
         br#"{"op":"unlink","path":"/tmp"}"#,
         br#"{"path":"/tmp"}"#,
         &not_utf8,
+        &unknown_field,
+        &twice,
     ];
     for body in bodies {
         let declared = u32::try_from(body.len()).unwrap();

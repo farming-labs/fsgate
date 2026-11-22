@@ -54,12 +54,44 @@ const RECV_FLAGS: rustix::net::RecvFlags = rustix::net::RecvFlags::CMSG_CLOEXEC;
 const RECV_FLAGS: rustix::net::RecvFlags = rustix::net::RecvFlags::empty();
 
 #[derive(Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", from = "WireRequest")]
 enum Request {
     Open { path: String },
     Create { path: String },
     Metadata { path: String },
     ReadDir { path: String },
+}
+
+/// How the broker reads a [`Request`]. An internally tagged enum buffers
+/// the whole object, unknown fields included, before it reads the tag,
+/// which let one frame of nested junk cost the broker many times its size
+/// in memory. A struct stops at the first field the protocol does not
+/// have.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireRequest {
+    op: Op,
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Op {
+    Open,
+    Create,
+    Metadata,
+    ReadDir,
+}
+
+impl From<WireRequest> for Request {
+    fn from(WireRequest { op, path }: WireRequest) -> Request {
+        match op {
+            Op::Open => Request::Open { path },
+            Op::Create => Request::Create { path },
+            Op::Metadata => Request::Metadata { path },
+            Op::ReadDir => Request::ReadDir { path },
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]

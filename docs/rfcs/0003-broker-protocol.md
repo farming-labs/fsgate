@@ -57,6 +57,12 @@ fails every later request closed.
 Requests (`op` tag): `open`, `create`, `metadata`, `read_dir`, each with
 a `path` string. Paths and directory entry names must be valid UTF-8 on
 this transport; anything else is refused with an error, never transcoded.
+A request with any other field, or a field twice, fails the connection
+closed. The broker reads a request as a plain struct, which stops at the
+first unknown field. Through 0.6.0 it read requests as an internally tagged
+enum, which accepted unknown fields and first buffered the whole object:
+one 1 MiB frame of nested junk cost 24 MiB of heap to decode. An internal
+review at `61cf0dc` found it.
 
 Responses (`result` tag):
 
