@@ -127,6 +127,19 @@ jobs:
           fi
           printf '%s\n' "$output"
           grep --quiet '^test result: ok\. 1 passed' <<<"$output"
+      # Ignored elsewhere: a link another user owns needs root to make, so
+      # the test runs `sudo`, which the runner has without a password. The
+      # count fails a filter that matches nothing.
+      - name: Test a socket path through another user's link
+        shell: bash
+        run: |
+          if ! output=$(cargo test --locked -p fsgate --test broker -- --ignored \
+              --exact a_socket_path_through_another_users_link_is_refused 2>&1); then
+            printf '%s\n' "$output"
+            exit 1
+          fi
+          printf '%s\n' "$output"
+          grep --quiet '^test result: ok\. 1 passed' <<<"$output"
       - run: cargo package --locked -p fsgate
       - name: Test the packaged crate
         shell: bash
@@ -187,6 +200,19 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy -p fsgate --all-targets --features experimental-intercept -- -D warnings
       - run: cargo test --locked
+      # Ignored elsewhere: a link another user owns needs root to make, so
+      # the test runs `sudo`, which the runner has without a password. The
+      # count fails a filter that matches nothing.
+      - name: Test a socket path through another user's link
+        shell: bash
+        run: |
+          if ! output=$(cargo test --locked -p fsgate --test broker -- --ignored \
+              --exact a_socket_path_through_another_users_link_is_refused 2>&1); then
+            printf '%s\n' "$output"
+            exit 1
+          fi
+          printf '%s\n' "$output"
+          grep --quiet '^test result: ok\. 1 passed' <<<"$output"
 
   # The Linux tests on arm64, on the runner's own kernel. `check` runs them
   # on x86_64, and the `experimental-intercept` ones, whose launcher is
