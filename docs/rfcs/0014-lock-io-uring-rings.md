@@ -74,8 +74,20 @@ Before `restrict_self`, `lock()` reads `/proc/self/task` and each
 visible thread's `fd` directory:
 
 - a descriptor whose link reads `anon_inode:[io_uring]` is a ring;
-- a thread named `iou-sqp-<pid>` is an `SQPOLL` thread, which finds a
-  ring whose descriptor was closed after registering it.
+- a thread the kernel marks `PF_IO_WORKER` in its `stat` flags, unless
+  it is an io-wq worker named `iou-wrk-<pid>`, is taken for an `SQPOLL`
+  thread, which finds a ring whose descriptor was closed after
+  registering it.
+
+The kernel sets `PF_IO_WORKER` before the thread is visible. A new
+`SQPOLL` thread keeps the name of the thread that set the ring up until
+it first runs and names itself `iou-sqp-<pid>`, so through 0.6.0, when
+the check went by that name, a ring set up, registered, closed, and
+locked straight away could pass it. An internal review at `61cf0dc`
+found it. An io-wq worker runs each request with the credentials of
+whoever submitted it, and one can stay idle after its rings are closed,
+so a worker that has named itself does not refuse the lock; one that
+has not run yet does, until it has.
 
 If either exists, `lock()` returns a new `GateError` variant before
 anything is applied. The message names the descriptor or thread and
@@ -145,10 +157,12 @@ caller explicitly opts out. Missing, inaccessible, or unreadable procfs
 fails before applying containment. `BestEffort` still governs only the
 Landlock filesystem floor. Non-Linux behavior does not change.
 
-The check inspects each visible thread's descriptors as well as its name,
-so a thread with a separate descriptor table is covered. It holds procfs
-directory descriptors while walking, verifies that opened entries belong
-to procfs, and treats an incomplete scan as a failure. Callers must keep
+The check inspects each visible thread's descriptors as well as its `stat`
+flags and name, so a thread with a separate descriptor table is covered.
+It holds procfs directory descriptors while walking, verifies that opened
+entries belong to procfs, and fails if it cannot read an entry it listed,
+such as a thread that exits during the scan. A thread or descriptor made
+after its directory was listed is not seen. Callers must keep
 threads and descriptor tables stable during `lock()`; the check is not
 atomic with concurrent ring creation or registration.
 
@@ -181,10 +195,12 @@ contract; the runtime guard uses only safe Rust. Kernel tests in
 `tests/lock.rs` cover:
 
 - Ordinary rings, registered personalities, `SQPOLL` rings, and a
-  registered `SQPOLL` ring whose descriptor was closed: both policies
+  registered `SQPOLL` ring whose descriptor was closed, with its polling
+  thread under its own name and under its creator's: both policies
   refuse before containment, leave the gate grantable, and emit one
   denied audit event. An outside read still succeeds after refusal.
   Closing ordinary or personality rings permits a successful retry.
+- An idle io-wq worker left after its ring closed: the lock succeeds.
 - The explicit opt-out: `allow_existing_io_uring(true)` preserves the
   measured personality and `SQPOLL` bypasses, while a raw outside read
   is denied by the locked credentials.

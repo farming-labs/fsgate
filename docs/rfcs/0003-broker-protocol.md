@@ -18,8 +18,10 @@ server-side and fails closed when the broker is gone.
 A `SOCK_STREAM` Unix domain socket. Without `--socket`, the `fsgate-broker`
 binary passes the child an inherited socketpair and names it in
 `FSGATE_BROKER_FD` ([RFC 0007](0007-broker-peers.md)). With `--socket`, it
-publishes the socket's path in `FSGATE_BROKER_SOCKET`. Embedders may pass
-their own socketpair to `BrokerGate::from_stream`.
+publishes the socket's absolute path in `FSGATE_BROKER_SOCKET`, so a worker
+that changes directory still finds it. Through 0.6.0 a relative path was
+passed as given; an internal review at `61cf0dc` found it. Embedders may
+pass their own socketpair to `BrokerGate::from_stream`.
 
 ### Framing
 
@@ -49,12 +51,24 @@ the descriptors that fit (both seen on macOS).
 The client is strictly lockstep: one request, then its response. A client
 that loses a response can no longer match later ones to requests, so it
 fails every later request closed.
+No send on either side raises `SIGPIPE`: Linux passes `MSG_NOSIGNAL`, and
+macOS sets `SO_NOSIGPIPE` on the socket before each frame. A peer that hangs
+up fails only that connection with `BrokenPipe`, even in a process where
+`SIGPIPE` kills. Through 0.6.0 the rest of a frame went out with `write`, so
+there a worker that hung up before its answer ended the whole broker; an
+internal review at `61cf0dc` found it.
 
 ### Messages
 
 Requests (`op` tag): `open`, `create`, `metadata`, `read_dir`, each with
 a `path` string. Paths and directory entry names must be valid UTF-8 on
 this transport; anything else is refused with an error, never transcoded.
+A request with any other field, or a field twice, fails the connection
+closed. The broker reads a request as a plain struct, which stops at the
+first unknown field. Through 0.6.0 it read requests as an internally tagged
+enum, which accepted unknown fields and first buffered the whole object:
+one 1 MiB frame of nested junk cost 24 MiB of heap to decode. An internal
+review at `61cf0dc` found it.
 
 Responses (`result` tag):
 

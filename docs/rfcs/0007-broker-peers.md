@@ -96,12 +96,14 @@ command.
 
 Workers find the broker by that path, so a mode on the socket is not
 enough: whoever can rename an entry along the path can put their own
-socket in its place. Before binding, the broker checks every directory
-the path passes through, before and after resolving symlinks. Each must
-belong to the broker's user or root, and must not be writable by others
-unless it is sticky, as `/tmp` is. On macOS, its access list must not
-allow anyone to change its entries either ([changes after
-release](#changes-after-release)). Otherwise it exits 1 before binding.
+socket in its place. Before binding, the broker resolves the path one
+entry at a time, as the kernel does, and checks every directory and
+symlink it passes through, including each directory a chain of symlinks
+leads through on the way. Each must belong to the broker's user or root,
+and each directory must not be writable by others unless it is sticky, as
+`/tmp` is. On macOS, its access list must not allow anyone to change its
+entries either ([changes after release](#changes-after-release)).
+Otherwise it exits 1 before binding.
 
 ### A peer check in `Broker::serve`
 
@@ -253,3 +255,18 @@ open questions answered:
    the source before later checks. A build or setup failure does not count.
    The VM kernel configuration enables user namespaces so the same broker
    check runs there.
+3. **Directories partway through a symlink chain.** Through 0.6.0, the
+   directory check resolved each prefix of the path with `canonicalize`
+   and checked where it ended up. A directory that only a symlink in the
+   middle of a chain passed through was never checked: with
+   `safe/entry -> open/hop -> safe/real` and `open` writable by anyone,
+   `--socket safe/entry/broker.sock` was accepted, and any user could
+   point `open/hop` at their own socket. Nor did it check a symlink's own
+   owner, who can replace it in a sticky directory such as `/tmp`. The
+   broker now resolves the path one entry at a time with `lstat`, checks
+   every directory it reaches, and refuses a symlink that belongs to
+   another user. It follows at most 40 symlinks, Linux's limit. Found in
+   an internal review at `61cf0dc`.
+   `a_socket_path_others_could_replace_is_refused` covers the chain, and
+   `a_socket_path_through_another_users_link_is_refused`, which makes the
+   link with `sudo`, runs in CI's `check` and `macos` jobs.
