@@ -518,6 +518,16 @@ fn expect(op: FsOp, base: &Path, rel: &Path) -> Expect {
         Walk::Refused(why) => Expect::Fail(Some(why)),
         _ => Expect::Fail(None),
     };
+    // A trailing `/` names a directory: the last symlink is followed, and
+    // anything but a directory fails, as does any `open` or `create`.
+    if rel.as_os_str().as_encoded_bytes().ends_with(b"/") {
+        return match walk(base, rel, true) {
+            Walk::Found(path) if is_dir(&path) && matches!(op, FsOp::Metadata | FsOp::ReadDir) => {
+                Expect::Reach(path)
+            }
+            other => refused(other),
+        };
+    }
     match op {
         FsOp::Open => match walk(base, rel, true) {
             Walk::Found(path) if !is_dir(&path) => Expect::Reach(path),
@@ -542,6 +552,17 @@ fn expect(op: FsOp, base: &Path, rel: &Path) -> Expect {
             Walk::MissingLast(dir, name) => Expect::Reach(dir.join(name)),
             other => refused(other),
         },
+    }
+}
+
+/// `rel` with the trailing `/` or `/.` of `requested` kept, which RFC 0001
+/// passes on to the open so that it requires a directory.
+fn keep_dir_ending(requested: &Path, rel: PathBuf) -> PathBuf {
+    let bytes = requested.as_os_str().as_encoded_bytes();
+    if bytes.ends_with(b"/") || bytes.ends_with(b"/.") {
+        rel.join("")
+    } else {
+        rel
     }
 }
 
@@ -1232,6 +1253,7 @@ fn predict(grants: &[Option<ModelGrant>], op: FsOp, requested: &Path) -> Predict
     } else {
         rel.to_path_buf()
     };
+    let rel = keep_dir_ending(requested, rel);
     let expected = expect(op, &base, &rel);
     Predicted::Allowed {
         full,
@@ -1797,6 +1819,7 @@ mod kernel {
                         .expect("route returns live grants")
                         .path;
                     let rel = relative(full.strip_prefix(base).expect("routed").components());
+                    let rel = keep_dir_ending(requested, rel);
                     let would = match expect(op, base, &rel) {
                         Expect::Reach(target) | Expect::Either(target) => id_if_present(&target),
                         Expect::Fail(_) => None,

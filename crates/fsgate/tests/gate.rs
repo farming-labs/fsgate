@@ -1009,3 +1009,80 @@ fn dev_fd_beneath_a_grant_does_not_hand_out_a_held_descriptor() {
     gate.open("/dev/null").unwrap();
     gate.create("/dev/null").unwrap();
 }
+
+/// A path that ends in `/` or `/.` names a directory, as the kernel reads
+/// it. The gate keeps that ending through its lexical normalization, so
+/// each call fails as `std::fs` does on the same path, and `create` makes
+/// no file.
+#[test]
+fn a_trailing_slash_names_a_directory() {
+    let (_root, granted, _) = setup();
+    fs::write(granted.join("file"), b"untouched").unwrap();
+    fs::create_dir(granted.join("dir")).unwrap();
+    let mut gate = Gate::new();
+    gate.grant(
+        &granted,
+        Rights::READ | Rights::WRITE | Rights::CREATE | Rights::LIST,
+    )
+    .unwrap();
+    let errno = |result: Result<(), GateError>| match result {
+        Err(GateError::Io { source, .. }) => source.raw_os_error(),
+        other => panic!("got {other:?}"),
+    };
+    let std_create = |path: &Path| {
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .map(drop)
+            .unwrap_err()
+            .raw_os_error()
+    };
+    let slashed = |name: &str, tail: &str| {
+        let mut path = granted.join(name).into_os_string();
+        path.push(tail);
+        PathBuf::from(path)
+    };
+
+    for tail in ["/", "/."] {
+        let file = slashed("file", tail);
+        let shown = file.display();
+        let opened = fs::File::open(&file).map(drop).unwrap_err().raw_os_error();
+        assert!(opened.is_some(), "std opened {shown}");
+        assert_eq!(errno(gate.open(&file).map(drop)), opened, "open {shown}");
+        assert_eq!(
+            errno(gate.metadata(&file).map(drop)),
+            fs::metadata(&file).unwrap_err().raw_os_error(),
+            "metadata {shown}"
+        );
+        let new = slashed("new", tail);
+        for path in [&file, &new] {
+            let created = errno(gate.create(path).map(drop));
+            let expected = std_create(path);
+            eprintln!("create {}: {created:?}, std {expected:?}", path.display());
+            // Linux's `openat2` fails as `open` does. On macOS cap-std
+            // resolves the path itself and fails a create whose path ends
+            // in `/` with `EINVAL`.
+            if cfg!(target_os = "linux") || tail == "/." {
+                assert_eq!(created, expected, "create {}", path.display());
+            } else {
+                assert!(created.is_some(), "create {}", path.display());
+            }
+        }
+        assert!(
+            !granted.join("new").exists(),
+            "create {} made a file",
+            new.display()
+        );
+    }
+    assert_eq!(fs::read(granted.join("file")).unwrap(), b"untouched");
+
+    // A directory named with a slash still lists, and the file without one
+    // still opens.
+    assert!(gate.read_dir(slashed("dir", "/")).unwrap().is_empty());
+    assert_eq!(
+        read_to_string(gate.open(granted.join("file")).unwrap()),
+        "untouched"
+    );
+}
