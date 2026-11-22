@@ -1031,7 +1031,8 @@ impl Gate {
         self.gated(AuditOp::Open, path.as_ref(), Rights::READ, |entry, rel| {
             let mut options = cap_std::fs::OpenOptions::new();
             options.read(true);
-            let file = open_without_waiting(&entry.dir, rel, &mut options)?;
+            let file =
+                open_without_waiting(&entry.dir, rel, &mut options, rustix::fs::OFlags::RDONLY)?;
             if file.metadata()?.is_dir() {
                 return Err(rustix::io::Errno::ISDIR.into());
             }
@@ -1127,7 +1128,7 @@ impl Gate {
             |entry, rel| {
                 let mut options = cap_std::fs::OpenOptions::new();
                 options.write(true).create(true).truncate(true);
-                open_without_waiting(&entry.dir, rel, &mut options)
+                open_without_waiting(&entry.dir, rel, &mut options, rustix::fs::OFlags::WRONLY)
             },
         )
     }
@@ -1424,20 +1425,59 @@ struct Notified {
 
 /// Opens `rel` beneath `dir` without waiting, then restores blocking mode.
 /// Opening a FIFO waits for its other end, which would hold the caller, or
-/// a broker's serve thread, until some other process opened it.
+/// a broker's serve thread, until some other process opened it. `access` is
+/// the access mode `options` asks for.
 fn open_without_waiting(
     dir: &cap_std::fs::Dir,
     rel: &Path,
     options: &mut cap_std::fs::OpenOptions,
+    access: rustix::fs::OFlags,
 ) -> io::Result<File> {
     use cap_std::fs::OpenOptionsExt;
     use rustix::fs::OFlags;
 
     let nonblocking = options.custom_flags(OFlags::NONBLOCK.bits() as i32);
     let file = dir.open_with(rel, nonblocking)?.into_std();
+    #[cfg(target_os = "macos")]
+    refuse_held_descriptor(dir, rel, &file, access)?;
+    #[cfg(not(target_os = "macos"))]
+    let _ = access;
     let flags = rustix::fs::fcntl_getfl(&file)?;
     rustix::fs::fcntl_setfl(&file, flags - OFlags::NONBLOCK)?;
     Ok(file)
+}
+
+/// Refuses a descriptor the process already held, reached through macOS's
+/// `/dev/fd/N`, which `/dev/stdin` and the like link to.
+///
+/// `/dev/fd/N` is a devfs entry, not a symlink, so the component walk sees
+/// an ordinary entry beneath the grant. Opening it duplicates descriptor
+/// `N`: the same file, wherever it is, with that descriptor's access mode
+/// and not the one asked for. So the opened file must be the one the path
+/// names when stat'd, which for such an entry reports devfs's device, and
+/// must be open for exactly the access asked for. Either difference is an
+/// escape, `EXDEV`. A device duplicated this way passes the first check,
+/// but only with the access mode a direct open beneath the grant gives.
+#[cfg(target_os = "macos")]
+fn refuse_held_descriptor(
+    dir: &cap_std::fs::Dir,
+    rel: &Path,
+    file: &File,
+    access: rustix::fs::OFlags,
+) -> io::Result<()> {
+    use cap_std::fs::MetadataExt;
+    use rustix::fs::OFlags;
+
+    let opened = rustix::fs::fstat(file)?;
+    let named = dir.metadata(rel)?;
+    // `st_dev` is an `i32` on macOS.
+    let same_file = opened.st_dev as u64 == named.dev() && opened.st_ino == named.ino();
+    let opened_access = rustix::fs::fcntl_getfl(file)? & OFlags::ACCMODE;
+    if same_file && opened_access == access {
+        Ok(())
+    } else {
+        Err(rustix::io::Errno::XDEV.into())
+    }
 }
 
 /// Gives cap-std's refusal of a path that leaves its grant the errno

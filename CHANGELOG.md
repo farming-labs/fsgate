@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- On macOS, a grant that covers `/dev`, including one on `/`, handed out descriptors the process already held. `/dev/fd/N`, which `/dev/stdin`, `/dev/stdout`, and `/dev/stderr` link to, is a devfs entry rather than a symlink, and opening it duplicates descriptor `N`: the same file, wherever it is, open the way it was. So `Gate::open("/dev/fd/3")` returned a file outside every grant, writable through a read-only grant when the process held it for writing, and a `Broker`'s worker could get the broker's own sockets and files the same way. `open` and `create` now refuse such a descriptor with `EXDEV`, audited as `allow` with that errno like any other escape: the opened file must be the one the path names, and open for exactly the access asked for. A device the process holds still opens, with the access a direct open beneath the grant gives. `metadata` through `/dev/fd/N` still reports the held file's metadata, which the threat model lists. Linux was not affected: its `/dev/fd` is a symlink to `/proc/self/fd`, and `openat2` refuses both. Found in an internal review of 0.6.0.
+
 - `fsgate-broker --socket` checks every directory a symlink chain leads through, and refuses a symlink that another user owns. Through 0.6.0 it checked only where each prefix of the path ended up, so with `safe/entry -> open/hop -> safe/real` and `open` writable by anyone, `--socket safe/entry/broker.sock` was accepted, and any user could point `open/hop` at their own socket and answer the worker's requests. A link another user owned in a sticky directory, such as `/tmp`, passed the same way. Found in an internal review of 0.6.0.
 
 ## 0.6.0 (2026-11-19)
