@@ -14,7 +14,7 @@
 //! message. Paths must be valid UTF-8 on this transport.
 
 use std::fs::File;
-use std::io::{self, IoSlice, IoSliceMut, Write};
+use std::io::{self, IoSlice, IoSliceMut};
 use std::num::NonZeroUsize;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -848,8 +848,18 @@ fn remote_error(error: WireError) -> GateError {
     }
 }
 
+/// Flags for every send. A peer that has hung up must end only this
+/// connection, even in a process where `SIGPIPE` kills, as an embedder may
+/// set it, so a send never raises it. macOS has no flag for that, and
+/// [`write_frame`] sets `SO_NOSIGPIPE` on the socket instead.
+#[cfg(not(target_vendor = "apple"))]
+const SEND_FLAGS: rustix::net::SendFlags = rustix::net::SendFlags::NOSIGNAL;
+#[cfg(target_vendor = "apple")]
+const SEND_FLAGS: rustix::net::SendFlags = rustix::net::SendFlags::empty();
+
 /// Writes one frame, attaching `fd` as ancillary data when present. The
-/// ancillary payload rides on the first byte of the frame.
+/// ancillary payload rides on the first byte of the frame. A peer that has
+/// gone fails it with `BrokenPipe`, without `SIGPIPE`.
 fn write_frame(stream: &mut UnixStream, body: &[u8], fd: Option<BorrowedFd>) -> io::Result<()> {
     if body.len() > MAX_FRAME_BYTES {
         return Err(io::Error::new(
@@ -861,6 +871,16 @@ fn write_frame(stream: &mut UnixStream, body: &[u8], fd: Option<BorrowedFd>) -> 
     frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
     frame.extend_from_slice(body);
 
+    // macOS refuses the option, with `EINVAL`, only once the peer has gone.
+    // Nothing is sent without it.
+    #[cfg(target_vendor = "apple")]
+    rustix::net::sockopt::set_socket_nosigpipe(&*stream, true).map_err(|err| {
+        if err == rustix::io::Errno::INVAL {
+            io::Error::from(io::ErrorKind::BrokenPipe)
+        } else {
+            io::Error::from(err)
+        }
+    })?;
     let mut sent = 0;
     if let Some(fd) = fd {
         let fds = [fd];
@@ -873,11 +893,19 @@ fn write_frame(stream: &mut UnixStream, body: &[u8], fd: Option<BorrowedFd>) -> 
                 &*stream,
                 &[IoSlice::new(&frame)],
                 &mut ancillary,
-                rustix::net::SendFlags::empty(),
+                SEND_FLAGS,
             )
         })?;
     }
-    stream.write_all(&frame[sent..])
+    while sent < frame.len() {
+        let n =
+            rustix::io::retry_on_intr(|| rustix::net::send(&*stream, &frame[sent..], SEND_FLAGS))?;
+        if n == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        sent += n;
+    }
+    Ok(())
 }
 
 /// Reads one frame, collecting any file descriptors delivered alongside

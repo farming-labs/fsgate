@@ -51,6 +51,12 @@ the descriptors that fit (both seen on macOS).
 The client is strictly lockstep: one request, then its response. A client
 that loses a response can no longer match later ones to requests, so it
 fails every later request closed.
+No send on either side raises `SIGPIPE`: Linux passes `MSG_NOSIGNAL`, and
+macOS sets `SO_NOSIGPIPE` on the socket before each frame. A peer that hangs
+up fails only that connection with `BrokenPipe`, even in a process where
+`SIGPIPE` kills. Through 0.6.0 the rest of a frame went out with `write`, so
+there a worker that hung up before its answer ended the whole broker; an
+internal review at `61cf0dc` found it.
 
 ### Messages
 
